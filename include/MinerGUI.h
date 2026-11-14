@@ -1294,8 +1294,10 @@ private:
     bool loadoutOpen_ = false;
     std::string craftedEntry_;          // what is being typed into the % field
     bool craftedEditing_ = false;
+    bool laserPickerOpen_ = false;      // the laser field's list, over the card
     struct LoadoutHit { Gdiplus::RectF rect; int kind; int value; };
-    // kind 0 laser, 1 module slot, 2 gadget, 3 the crafted field, 4 close
+    // kind 0 a laser in the dropped list, 1 a module, 2 a gadget, 3 the crafted
+    // field, 4 close, 5 a head, 6 the title, 7 remove, 8 the laser field
     std::vector<LoadoutHit> loadoutHits_;
 
     void drawRockCard(Gdiplus::Graphics& g, int clientW);

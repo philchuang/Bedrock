@@ -3335,6 +3335,11 @@ LRESULT MinerGUI::handleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         }
 
         case WM_KEYDOWN:
+            if (loadoutOpen_ && laserPickerOpen_ && wParam == VK_ESCAPE) {
+                laserPickerOpen_ = false;
+                InvalidateRect(hwnd, nullptr, TRUE);
+                return 0;
+            }
             if (lookingOpen_ && (wParam == VK_ESCAPE || wParam == VK_RETURN)) {
                 setLookingOpen(false);
                 return 0;
@@ -3590,6 +3595,31 @@ LRESULT MinerGUI::handleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 return 0;
             }
             if (loadoutOpen_) {
+                // The laser list lies over the card. While it is down it takes
+                // the click: a head in it is fitted, and anywhere else - the
+                // field included - only puts the list away. A phone's picture
+                // draws the field closed, so a tap there is the card's.
+                if (laserPickerOpen_ && !phoneTapping_) {
+                    for (const auto& hit : loadoutHits_) {
+                        if (hit.kind != 0 || !hit.rect.Contains(px, py)) continue;
+                        putHeadLaser(&MINING_LASERS[hit.value]);
+                        craftedEntry_.clear();
+                        if (loadout_.craftedPower != 0.0f) {
+                            char buf[32];
+                            std::snprintf(buf, sizeof(buf), "%.2f", loadout_.craftedPower);
+                            craftedEntry_ = buf;
+                        }
+                        storeHead();
+                        saveLoadout();
+                        break;
+                    }
+                    laserPickerOpen_ = false;
+                    craftedEditing_ = false;
+                    endNameEditing(true);
+                    removeArmed_ = false;
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                    return 0;
+                }
                 for (const auto& hit : loadoutHits_) {
                     if (!hit.rect.Contains(px, py)) continue;
                     // A title being typed is kept by a click anywhere else,
@@ -3628,6 +3658,12 @@ LRESULT MinerGUI::handleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                         if (phoneTapping_) return 0;
                         craftedEditing_ = true;
                         SetFocus(hwnd);   // the digits have to land here
+                    } else if (hit.kind == 8) {
+                        if (phoneTapping_) return 0;
+                        craftedEditing_ = false;
+                        laserPickerOpen_ = true;
+                        InvalidateRect(hwnd, nullptr, TRUE);
+                        return 0;
                     } else if (hit.kind == 4) {
                         storeHead();
                         showLoadout(false);
@@ -5408,13 +5444,13 @@ void MinerGUI::useHead(int index) {
     if (index < 0 || index >= (int)heads_.size()) return;
     storeHead();
     headShown_ = index;
+    laserPickerOpen_ = false;
     loadout_ = heads_[index];
     craftedEntry_.clear();
     if (loadout_.craftedPower != 0.0f) {
-        wchar_t buf[32];
-        std::swprintf(buf, 32, L"%.2f", loadout_.craftedPower);
-        const std::wstring wide(buf);
-        craftedEntry_.assign(wide.begin(), wide.end());
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.2f", loadout_.craftedPower);
+        craftedEntry_ = buf;
     }
     craftedEditing_ = false;
 }
@@ -5457,6 +5493,7 @@ void MinerGUI::showLoadout(bool open) {
     endNameEditing(true);    // a title half typed is kept, as a click elsewhere keeps it
     removeArmed_ = false;
     loadoutOpen_ = open;
+    laserPickerOpen_ = false;
     craftedEditing_ = false;
     layoutControls();   // the four buttons go under the card, and come back
     // The card's one text field is painted, not a real edit control, so it
@@ -5465,10 +5502,9 @@ void MinerGUI::showLoadout(bool open) {
     // crafted-% field. The ore list takes the focus for the same reason.
     if (open) SetFocus(hwnd_);
     if (open && loadout_.craftedPower != 0.0f) {
-        wchar_t buf[32];
-        std::swprintf(buf, 32, L"%.2f", loadout_.craftedPower);
-        const std::wstring wide(buf);
-        craftedEntry_.assign(wide.begin(), wide.end());
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.2f", loadout_.craftedPower);
+        craftedEntry_ = buf;
     } else if (open) {
         craftedEntry_.clear();
     }
@@ -5713,6 +5749,19 @@ void MinerGUI::drawLoadoutCard(Gdiplus::Graphics& g, int cw, int ch) {
     }
 
     // --- the head
+    // A field, not a standing list: six heads open took the room the stats
+    // need. The list drops under the field, drawn last so it lies over the
+    // card, and a click anywhere else puts it away. A phone's picture keeps
+    // the field closed: the head is picked at the PC, as the crafted figure is typed there.
+    auto laserStock = [](const MiningLaser& l) {
+        wchar_t stats[96];
+        std::swprintf(stats, 96, L"%.0f  ·  %.0f m  ·  %d slot%s", l.fracture, l.fullRange, l.slots,
+                      l.slots == 1 ? L"" : L"s");
+        return std::wstring(stats);
+    };
+    Gdiplus::RectF laserField;
+    std::vector<int> laserChoices;
+    const bool laserListOpen = laserPickerOpen_ && !phonePainting_;
     g.DrawString(L"LASER HEAD", -1, &labelFont, Gdiplus::PointF(left, y), &faintBrush);
     // A one-seat ship shows what it carries on its mining HUD, and what is
     // read there is this fit's from then on (setSeenLoadout) - said here, or
@@ -5723,30 +5772,37 @@ void MinerGUI::drawLoadoutCard(Gdiplus::Graphics& g, int cw, int ch) {
     }
     y += scaleF(17);
     if (ship_) {
-        const float rowH = scaleF(24);
         for (int i = 0; i < MINING_LASER_COUNT; i++) {
-            const MiningLaser& l = MINING_LASERS[i];
-            if (!laserFits(l, *ship_)) continue;
-            Gdiplus::RectF row(left, y, wide, rowH);
-            const bool chosen = (loadout_.laser == &l);
-            if (chosen) {
-                selectionFrame(g, row, scaleF(R_CONTROL));
-            } else if (isHot(hoverMain_, row)) {
-                fillRoundRect(g, row, scaleF(R_CONTROL), COL_HOVER);
-            }
-            g.DrawString(toW(l.name).c_str(), -1, &rowFont,
-                         Gdiplus::PointF(left + scaleF(12), y + scaleF(4)),
-                         chosen ? &accentBrush : &textBrush);
-            wchar_t stats[96];
-            std::swprintf(stats, 96, L"%.0f  ·  %.0f m  ·  %d slot%s",
-                          l.fracture, l.fullRange, l.slots, l.slots == 1 ? L"" : L"s");
-            g.DrawString(stats, -1, &noteFont,
-                         Gdiplus::RectF(left, y + scaleF(6), wide - scaleF(12), rowH),
-                         &right, chosen ? &dimBrush : &faintBrush);
-            loadoutHits_.push_back({row, 0, i});
-            y += rowH + scaleF(2);
+            if (laserFits(MINING_LASERS[i], *ship_)) laserChoices.push_back(i);
         }
-        y += scaleF(8);
+        laserField = Gdiplus::RectF(left, y, wide, scaleF(26));
+        const bool fieldHot = isHot(hoverMain_, laserField);
+        mainscanField(g, laserField, scaleF(1.0f), fieldHot, laserListOpen, false);
+        Gdiplus::StringFormat mid;
+        mid.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        mid.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+        mid.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+        const float chevronRoom = scaleF(32);
+        if (loadout_.laser) {
+            const std::wstring stock = laserStock(*loadout_.laser);
+            Gdiplus::RectF stockW;
+            g.MeasureString(stock.c_str(), -1, &noteFont, Gdiplus::PointF(0, 0), &stockW);
+            const float stockX = laserField.GetRight() - chevronRoom - stockW.Width;
+            g.DrawString(toW(loadout_.laser->name).c_str(), -1, &rowFont,
+                         Gdiplus::RectF(laserField.X + scaleF(12), laserField.Y,
+                                        (std::max)(scaleF(40), stockX - laserField.X - scaleF(20)), laserField.Height),
+                         &mid, &textBrush);
+            g.DrawString(stock.c_str(), -1, &noteFont,
+                         Gdiplus::RectF(stockX, laserField.Y, stockW.Width + scaleF(4), laserField.Height), &mid,
+                         &dimBrush);
+        } else {
+            g.DrawString(L"Select a laser head", -1, &rowFont,
+                         Gdiplus::RectF(laserField.X + scaleF(12), laserField.Y, laserField.Width - chevronRoom,
+                                        laserField.Height),
+                         &mid, &faintBrush);
+        }
+        loadoutHits_.push_back({laserField, 8, 0});
+        y += laserField.Height + scaleF(8);
     }
 
     // --- what a crafted head prints on itself
@@ -5801,6 +5857,48 @@ void MinerGUI::drawLoadoutCard(Gdiplus::Graphics& g, int cw, int ch) {
             y = (std::max)(y + scaleF(38), leaveY + scaleF(23));
         }
     }
+
+    // --- what the head puts out, once the modules and the craft have had
+    // their say. The same figures outputOf gives the rock view, so the card
+    // and the rock cannot disagree. Power is the only one the craft moves,
+    // and the line under it is the three steps: the laser's own, after the
+    // modules, after the craft. The other four are already finished.
+    if (heads_.size() > 1) {
+        const std::wstring statsLabel = L"LASER STATS  ·  " + headPlace(headShown_);
+        g.DrawString(statsLabel.c_str(), -1, &labelFont, Gdiplus::PointF(left, y), &faintBrush);
+    } else {
+        g.DrawString(L"LASER STATS", -1, &labelFont, Gdiplus::PointF(left, y), &faintBrush);
+    }
+    y += scaleF(17);
+    if (!loadout_.laser) {
+        g.DrawString(L"Select a laser head", -1, &noteFont, Gdiplus::PointF(left, y), &faintBrush);
+        y += scaleF(20);
+    } else {
+        const LaserOutput out = outputOf(loadout_);
+        const long inst = std::lround(out.instability);
+        const std::wstring figures[5] = {
+            formatNumber((int)std::lround(out.fracture)),
+            std::to_wstring((long)std::lround(out.window)) + L"%",
+            std::to_wstring((long)std::lround(out.rate)) + L"%",
+            std::to_wstring((long)std::lround(out.resistance)) + L"%",
+            (inst >= 0 ? L"+" : L"") + std::to_wstring(inst) + L"%",
+        };
+        static const wchar_t* const names[5] = {L"POWER", L"WINDOW", L"RATE", L"RESIST", L"INSTAB"};
+        Gdiplus::Font statFont(&numeralFamily(), scaleF(Type::NUMBER), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        const float colW = wide / 5.0f;
+        for (int i = 0; i < 5; i++) {
+            const float x = left + colW * (float)i;
+            g.DrawString(names[i], -1, &labelFont, Gdiplus::PointF(x, y), &faintBrush);
+            g.DrawString(figures[i].c_str(), -1, &statFont, Gdiplus::PointF(x, y + scaleF(13)), &textBrush);
+        }
+        y += scaleF(32);
+        const std::wstring chain = formatNumber((int)std::lround(loadout_.laser->fracture)) + L" base  \u2192  " +
+                                   formatNumber((int)std::lround(out.stock)) + L" modules  \u2192  " +
+                                   formatNumber((int)std::lround(out.fracture));
+        g.DrawString(chain.c_str(), -1, &noteFont, Gdiplus::PointF(left, y), &faintBrush);
+        y += scaleF(18);
+    }
+    y += scaleF(6);
 
     // --- the modules it has room for
     const int slots = loadout_.laser ? loadout_.laser->slots : 0;
@@ -5915,6 +6013,40 @@ void MinerGUI::drawLoadoutCard(Gdiplus::Graphics& g, int cw, int ch) {
     // --- the gadget on the rock
     // The gadget is not fitted to the ship - it is stuck on the rock, and
     // it is picked in the rock view where the rock is. See drawRockAdvice.
+
+    // The dropped list, last, so it lies over the stats and the modules.
+    // A phone's picture leaves it out: the field above is drawn closed.
+    if (laserListOpen && !laserChoices.empty()) {
+        const float rowH = scaleF(26);
+        const float pad = scaleF(6);
+        const float listH = rowH * (float)laserChoices.size() + 2 * pad;
+        const Gdiplus::RectF list(laserField.X, laserField.GetBottom() + scaleF(4), laserField.Width, listH);
+        mainscanDropList(g, list, scaleF(1.0f), nullptr);
+        Gdiplus::StringFormat mid;
+        mid.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        mid.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+        mid.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+        for (size_t n = 0; n < laserChoices.size(); n++) {
+            const int i = laserChoices[n];
+            const MiningLaser& l = MINING_LASERS[i];
+            const Gdiplus::RectF row(list.X + pad, list.Y + pad + rowH * (float)n, list.Width - 2 * pad, rowH);
+            const bool chosen = loadout_.laser == &l;
+            if (chosen) selectionFrame(g, row, scaleF(R_CONTROL));
+            else if (isHot(hoverMain_, row)) fillRoundRect(g, row, scaleF(R_CONTROL), COL_HOVER);
+            const std::wstring stock = laserStock(l);
+            Gdiplus::RectF stockW;
+            g.MeasureString(stock.c_str(), -1, &noteFont, Gdiplus::PointF(0, 0), &stockW);
+            const float stockX = row.GetRight() - scaleF(10) - stockW.Width;
+            g.DrawString(toW(l.name).c_str(), -1, &rowFont,
+                         Gdiplus::RectF(row.X + scaleF(10), row.Y,
+                                        (std::max)(scaleF(40), stockX - row.X - scaleF(16)), row.Height),
+                         &mid, chosen ? &accentBrush : &textBrush);
+            g.DrawString(stock.c_str(), -1, &noteFont,
+                         Gdiplus::RectF(stockX, row.Y, stockW.Width + scaleF(4), row.Height), &mid,
+                         chosen ? &dimBrush : &faintBrush);
+            loadoutHits_.push_back({row, 0, i});
+        }
+    }
 }
 
 // The ship list, dropped under its field. Three entries and no scrolling -
