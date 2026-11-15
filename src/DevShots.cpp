@@ -19,6 +19,7 @@
 #include "UexMarket.h"
 #include "WhereToBuy.h"
 #include "Datarunner.h"
+#include "DatarunnerRead.h"
 #include "TextLineReader.h"
 #include "PluginHost.h"
 #include "GameFiles.h"
@@ -436,7 +437,7 @@ static std::vector<SCMiner::Datarunner::Row> shotDatarunnerRows(const std::vecto
             row.level = d.level;
             row.stock = d.stock;
             row.price = d.price;
-            row.snippet = card;
+            row.crop = D::packBgra(card);
             rows.push_back(row);
         }
     }

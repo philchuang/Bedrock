@@ -9,13 +9,53 @@
 // what the order cost and the method it runs with. What is collected is
 // the player's to say - the terminal shows nothing once it is.
 
-#include "RefineryTerminal.h"
-
 #include <filesystem>
 #include <string>
 #include <vector>
 
 namespace SCMiner {
+
+// A panel as the book keeps it: the fields that persist, and none of where
+// it stood on the screen.
+enum class RefineryKind { None, Setup, Processing, Completed, Other };
+
+struct RefineryOrderRow {
+    std::string material;
+    bool inert = false;
+    int quality = -1;
+    int quantity = -1;
+    int yield = -1;
+};
+
+struct RefineryOrderPanel {
+    RefineryKind kind = RefineryKind::None;
+    int number = -1;         // "WORK ORDER n"
+    std::string method;
+    double cost = -1;
+    int seconds = -1;
+    std::vector<RefineryOrderRow> rows;
+
+    // Every field the panel's kind has was read and makes sense
+    bool whole() const {
+        if (rows.empty()) return false;
+        for (const RefineryOrderRow& row : rows) {
+            if (!row.inert && row.material.empty()) return false;
+            if (!row.inert && row.quality < 0) return false;
+        }
+        if (kind == RefineryKind::Setup) return !method.empty() && cost >= 0 && seconds >= 0;
+        if (kind == RefineryKind::Processing) return number >= 0 && seconds >= 0;
+        if (kind == RefineryKind::Completed) return true;
+        return false;
+    }
+};
+
+struct RefineryReading {
+    std::vector<RefineryOrderPanel> panels;
+    std::string stationText;
+    bool delivered = false;
+    int capacity = -1;
+    int workload = -1;
+};
 
 struct RefineryOrder {
     struct Part {
@@ -74,7 +114,7 @@ public:
     // known ones given the time they still run and any part not seen before
     // (a long list scrolls); its SETUP panel is kept for the order it turns
     // into. True when the book changed.
-    bool apply(const std::string& station, const RefineryScreen& screen, long long now);
+    bool apply(const std::string& station, const RefineryReading& screen, long long now);
     // A reading as it comes off the screen: only the panels the reading
     // before it said the same about are applied - a panel caught half drawn,
     // or with the game's "WORK ORDER ACCEPTED" box over it, says something
@@ -82,7 +122,7 @@ public:
     // on the screen for a second or two before CONFIRM takes it away, and it
     // only ever goes to an order whose time it matches. True when the book
     // changed.
-    bool take(const std::string& station, const RefineryScreen& read, long long taken);
+    bool take(const std::string& station, const RefineryReading& read, long long taken);
     // What became of each quote and order since the last call, a line each -
     // where an order got no quote, why (Application keeps them in
     // debug\refinery_jobs.txt)
@@ -103,18 +143,18 @@ public:
 
     // Whether two readings of a panel are of the same order: number and
     // parts alike, and done at the same moment give or take `slack` seconds
-    static bool samePanel(const RefineryPanel& a, long long aTaken, const RefineryPanel& b, long long bTaken, int slack = 5);
+    static bool samePanel(const RefineryOrderPanel& a, long long aTaken, const RefineryOrderPanel& b, long long bTaken, int slack = 5);
     // A PROCESSING panel the book can take: a number, a time, and every
     // part named with its quality and yield; a COMPLETED one: its parts
-    static bool usable(const RefineryPanel& panel);
+    static bool usable(const RefineryOrderPanel& panel);
 
 private:
     std::vector<RefineryOrder> orders_;
     // The reading before, which the next has to agree with
-    RefineryScreen last_;
+    RefineryReading last_;
     std::string lastStation_;
     long long lastTaken_ = 0;
-    void noteQuote(const std::string& station, const RefineryPanel& panel, long long now);
+    void noteQuote(const std::string& station, const RefineryOrderPanel& panel, long long now);
     // "WORK ORDER DELIVERED": where and since when it stands, whether the
     // last look saw it and when - and the done order no look since shows,
     // taken off: one for each time it comes up
@@ -123,7 +163,7 @@ private:
     long long noticeSeen_ = 0;
     bool noticeUp_ = false;
     int toCollect_ = 0;
-    bool noteCollected(const std::string& station, const RefineryScreen& read, long long now);
+    bool noteCollected(const std::string& station, const RefineryReading& read, long long now);
     // The SETUPs that had a quote on them lately, the newest last, for the
     // orders they become: two set up one after the other go each to its own,
     // and an order first read a while after it was placed - the player gone

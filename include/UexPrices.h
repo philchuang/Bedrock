@@ -48,6 +48,28 @@ public:
     const UexOffer* cheapestBuy(const std::string& ore) const;
     // The ore among `ores` whose refined form fetches most; "" where none has a price
     std::string mostValuable(const std::vector<std::string>& ores) const;
+
+    // A gem as the Ore Finder lists it: the name, and the terminal paying
+    // most. UEX knows a few only as ore ("Saldynium (Ore)") or raw.
+    struct GemSale {
+        std::string gem;
+        UexOffer offer;
+    };
+    struct GemSales {
+        std::vector<GemSale> priced;   // dearest first
+        std::vector<std::string> unpriced;
+    };
+    GemSales gemSales(const std::vector<std::string>& gems) const;
+
+    // A refined ore's buyers, best first, and the best in `system` when
+    // none of those is there
+    struct RefinedSales {
+        std::vector<UexOffer> offers;
+        bool hasHome = false;
+        UexOffer home;
+    };
+    RefinedSales refinedSales(const std::string& ore, const std::string& system) const;
+
     bool empty() const { return byCommodity_.empty(); }
 
     // UEX's name of an ore's refined form: Bedrock's, but Aluminium is

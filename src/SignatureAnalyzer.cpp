@@ -151,8 +151,8 @@ SignatureAnalyzer::Rocks SignatureAnalyzer::rocksHere() const {
     return Rocks::Usual;
 }
 
-OCREngine::ReadingPolicy makeReadingPolicy(SignatureAnalyzer& analyzer) {
-    OCREngine::ReadingPolicy policy;
+ReadingPolicy makeReadingPolicy(SignatureAnalyzer& analyzer) {
+    ReadingPolicy policy;
     policy.canonicalize = [&analyzer](int v) { return analyzer.canonicalize(v); };
     policy.bonus = [&analyzer](int v) -> double {
         // No signature exists outside this range, so such a reading is noise -
@@ -164,6 +164,13 @@ OCREngine::ReadingPolicy makeReadingPolicy(SignatureAnalyzer& analyzer) {
         int cluster = 0;
         return analyzer.isExactMatch(v, name, cluster) ? 40.0 : 0.0;
     };
+    policy.explainsExactly = [&analyzer](int v) { return analyzer.explainsExactly(v); };
+    policy.isSingleSignature = [&analyzer](int v) { return analyzer.isSingleSignature(v); };
+    policy.isKnownSignature = [&analyzer](int v) { return analyzer.isKnownSignature(v); };
+    policy.isExactMatch = [&analyzer](int v, std::string& name, int& cluster) {
+        return analyzer.isExactMatch(v, name, cluster);
+    };
+    policy.knownSignatures = [&analyzer] { return analyzer.knownSignatures(); };
     return policy;
 }
 

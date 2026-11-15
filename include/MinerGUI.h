@@ -141,6 +141,12 @@ public:
         gearShopsNote_ = note;
         if (gearPage_ && hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
     }
+    // The shops already ordered for where the player is (shopsInOrder).
+    // Null while the lists have not come. The page draws these rows.
+    void setGearOrder(std::shared_ptr<const std::map<std::string, std::vector<ShopInOrder>>> order) {
+        gearOrder_ = std::move(order);
+        if (gearPage_ && hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+    }
     // Where the player is, for the order of those shops (nearestFirst): the
     // place as GamePlaces names it ("ARC-L1", "Levski"; "" in open space or
     // before the log has named one) and its system ("Stanton"; "" unknown)
@@ -1434,6 +1440,11 @@ private:
         float holdAlone = 0;
     };
     RockVerdict rockVerdict() const;
+    // The verdict the rock view draws. Worked out again when the rock, the
+    // loadout, the heads or the gadget have changed; the paint only reads it.
+    const RockVerdict& rockAnswer() const;
+    mutable RockVerdict rockVerdictCached_;
+    mutable std::string rockVerdictKey_;
     // The active modules counted on these heads, as words - empty when none
     std::wstring firedWords(const std::vector<const MiningLoadout*>& fits) const;
     // The laser power share these heads need with no active module running, or -1
@@ -1681,6 +1692,7 @@ private:
     // The gear's shops (setGearShops) and where the player is, to list them
     // nearest first (setWhereAt)
     std::shared_ptr<const UexShops> gearShops_;
+    std::shared_ptr<const std::map<std::string, std::vector<ShopInOrder>>> gearOrder_;
     std::string gearShopsNote_;
     std::string wherePlace_, whereSystem_;
     // The Gear page (gearPage_): which list, how far down it is scrolled,

@@ -217,6 +217,13 @@ const std::vector<ShopOffer>& UexShops::offersFor(const std::string& item) const
     return found == byItem_.end() ? none : found->second;
 }
 
+std::vector<std::string> UexShops::items() const {
+    std::vector<std::string> names;
+    names.reserve(byItem_.size());
+    for (const auto& item : byItem_) names.push_back(item.first);
+    return names;
+}
+
 std::vector<ShopInOrder> nearestFirst(const std::vector<ShopOffer>& offers, const std::string& system,
                                       const std::string& place) {
     NavPoint me;
@@ -249,6 +256,15 @@ std::vector<ShopInOrder> nearestFirst(const std::vector<ShopOffer>& offers, cons
         if (a.offer.system != b.offer.system) return a.offer.system < b.offer.system;
         return a.offer.where < b.offer.where;
     });
+    return out;
+}
+
+std::map<std::string, std::vector<ShopInOrder>> shopsInOrder(const UexShops& shops, const std::string& system,
+                                                             const std::string& place) {
+    std::map<std::string, std::vector<ShopInOrder>> out;
+    for (const std::string& item : shops.items()) {
+        out.emplace(item, onePerPlace(nearestFirst(shops.offersFor(item), system, place)));
+    }
     return out;
 }
 

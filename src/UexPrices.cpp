@@ -181,4 +181,49 @@ std::string UexPrices::mostValuable(const std::vector<std::string>& ores) const 
     return best;
 }
 
+namespace {
+bool sameWord(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+    }
+    return true;
+}
+}  // namespace
+
+UexPrices::GemSales UexPrices::gemSales(const std::vector<std::string>& gems) const {
+    GemSales out;
+    for (const std::string& gem : gems) {
+        const UexOffer* best = nullptr;
+        for (const char* suffix : {"", " (Ore)", " (Raw)"}) {
+            const std::vector<UexOffer>& offers = offersFor(gem + suffix);
+            if (!offers.empty()) {
+                best = &offers.front();
+                break;
+            }
+        }
+        if (best) out.priced.push_back({gem, *best});
+        else out.unpriced.push_back(gem);
+    }
+    std::sort(out.priced.begin(), out.priced.end(),
+              [](const GemSale& a, const GemSale& b) { return a.offer.price > b.offer.price; });
+    return out;
+}
+
+UexPrices::RefinedSales UexPrices::refinedSales(const std::string& ore, const std::string& system) const {
+    RefinedSales out;
+    out.offers = offersFor(ore);
+    bool homeListed = false;
+    for (const UexOffer& offer : out.offers) {
+        if (!system.empty() && sameWord(offer.system, system)) homeListed = true;
+    }
+    if (!out.offers.empty() && !homeListed) {
+        if (const UexOffer* home = bestIn(ore, system)) {
+            out.home = *home;
+            out.hasHome = true;
+        }
+    }
+    return out;
+}
+
 }  // namespace SCMiner

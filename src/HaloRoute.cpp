@@ -1,6 +1,7 @@
 #include "HaloRoute.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <initializer_list>
 
@@ -195,6 +196,53 @@ const HaloPass* bestHaloPass(const std::vector<HaloPass>& passes) {
         if (!best || pass.enterKm - pass.leaveKm > best->enterKm - best->leaveKm) best = &pass;
     }
     return best;
+}
+
+namespace {
+bool sameWord(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+    }
+    return true;
+}
+bool inStanton(const std::string& name, NavPoint& p) { return !name.empty() && navPoint(name, "Stanton", p); }
+}  // namespace
+
+bool haloConnects(const std::string& from, const std::string& to) {
+    NavPoint a, b;
+    return inStanton(from, a) && inStanton(to, b) && runsThroughHalo(a, b);
+}
+
+std::vector<HaloPass> haloPassesNamed(const std::string& from, const std::string& to) {
+    NavPoint a, b;
+    if (!inStanton(from, a) || !inStanton(to, b)) return {};
+    return haloPasses(a, b);
+}
+
+PlannedHalo planHalo(const std::string& pickedFrom, const std::string& pickedTo, const std::string& routeFrom,
+                     const std::string& routeTo, const std::string& whereSystem, const std::string& wherePlace) {
+    PlannedHalo plan;
+    NavPoint a, b;
+    const std::string here = sameWord(whereSystem, "Stanton") ? wherePlace : std::string();
+    for (const std::string& name : {pickedFrom, routeFrom, here, std::string("ARC-L1")}) {
+        if (inStanton(name, a)) {
+            plan.from = name;
+            break;
+        }
+    }
+    auto through = [&](const std::string& name) { return name != plan.from && inStanton(name, b) && runsThroughHalo(a, b); };
+    if (through(pickedTo)) {
+        plan.to = pickedTo;
+    } else if (through(routeTo)) {
+        plan.to = routeTo;
+        plan.plotted = true;
+    } else {
+        plan.to = nearestHaloDestination(plan.from);
+        if (!plan.to.empty()) inStanton(plan.to, b);
+    }
+    if (!plan.to.empty()) plan.passes = haloBandsReached(a, b);
+    return plan;
 }
 
 }  // namespace SCMiner

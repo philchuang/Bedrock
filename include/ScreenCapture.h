@@ -9,7 +9,7 @@
 #include "Win32Shim.h"   // HWND, for gameWindow(): a name Application.cpp calls
 #endif
 #include <optional>
-#include "MiningData.h"
+#include "ReadLimits.h"
 #include "GlyphReader.h"
 #ifdef _WIN32
 #include "DxgiCapture.h"

@@ -1,9 +1,6 @@
 // The REFINEMENT CENTER read off the screen - see RefineryTerminal.h.
 #include "RefineryTerminal.h"
 
-#include "MiningHardware.h"
-#include "RefineryData.h"
-#include "RefiningData.h"
 #include "TextLineReader.h"
 #include "DevSwitch.h"
 
@@ -769,11 +766,6 @@ int refineryWorkloadIn(const std::string& text) {
     return -1;
 }
 
-const char* refineryWorkloadName(int workload) {
-    static const char* const NAMES[] = {"light", "moderate", "heavy", "extreme"};
-    return workload >= 0 && workload < 4 ? NAMES[workload] : "";
-}
-
 int parseRefineryTime(const std::string& text) {
     // "7m 22s", "1h 2m 3s", "45s", "2d 3h": numbers each followed by its unit
     int total = 0, value = -1, parts = 0;
@@ -799,93 +791,6 @@ int parseRefineryTime(const std::string& text) {
     }
     if (value >= 0 || parts == 0) return -1;
     return total;
-}
-
-std::string refiningMethodIn(const std::string& text) {
-    const std::string t = letters(text);
-    if (t.size() < 4) return "";
-    int best = 1 << 30;
-    std::string name;
-    for (const RefiningMethod& m : REFINING_METHODS) {
-        const std::string want = letters(m.name);
-        // A long name squeezed into the reader's line may come back cut short:
-        // compare with as much of the name as was read
-        const std::string head = want.substr(0, (std::min)(want.size(), t.size()));
-        const int d = editDistance(t, t.size() < want.size() ? head : want);
-        if (d < best) {
-            best = d;
-            name = m.name;
-        }
-    }
-    return best <= (std::max)(1, static_cast<int>(t.size()) / 4) ? name : "";
-}
-
-std::string refineryMaterialIn(const std::string& text, bool* inert) {
-    if (inert) *inert = false;
-    const std::string t = letters(text);
-    if (t.size() < 3) return "";
-    if (editDistance(t, "INERTMATERIALS") <= 3 || editDistance(t, "NERTMATERIALS") <= 2 ||
-        t.rfind("INERT", 0) == 0) {
-        if (inert) *inert = true;
-        return "";
-    }
-    // The salvage's refined name, which no material in the tables has: the
-    // construction salvage comes out as CONSTRUCTION MATERIALS, too long for
-    // its column, so cut short as much as was read
-    {
-        const std::string want = "CONSTRUCTIONMATERIALS";
-        if (t.size() >= 13 && editDistance(t, want.substr(0, (std::min)(want.size(), t.size()))) <= 1) {
-            return "Construction Salvage";
-        }
-    }
-    // ...and where what comes out is named for itself, not for what went in:
-    // PROCESSING lists raw ice as PRESSURIZED ICE (Levski, 29.10.2026) and,
-    // by the game's commodities, raw silicon as SILICON
-    {
-        struct Refined {
-            const char* name;
-            const char* material;
-        };
-        static const Refined REFINED[] = {{"PRESSURIZEDICE", "Raw Ice"}, {"SILICON", "Raw Silicon"}};
-        for (const Refined& r : REFINED) {
-            const std::string want = r.name;
-            if (editDistance(t, want) <= (std::max)(1, static_cast<int>(want.size()) / 5)) return r.material;
-        }
-    }
-    int best = 1 << 30;
-    std::string name;
-    for (const char* material : REFINERY_MATERIALS) {
-        const std::string full = letters(material);
-        // "Iron (Ore)" as SETUP writes it, "IRON" as PROCESSING does
-        std::string bare = material;
-        const size_t paren = bare.find(" (");
-        if (paren != std::string::npos) bare = bare.substr(0, paren);
-        for (const std::string& want : {full, letters(bare)}) {
-            const int d = editDistance(t, want);
-            if (d < best) {
-                best = d;
-                name = material;
-            }
-        }
-    }
-    return best <= (std::max)(1, static_cast<int>(t.size()) / 5) ? name : "";
-}
-
-bool refineryQualityFits(const std::string& material, int quality) {
-    std::string ore = material;
-    const size_t paren = ore.find(" (");
-    if (paren != std::string::npos) ore = ore.substr(0, paren);
-    if (ore == "Raw Ice") ore = "Ice";
-    else if (ore == "Raw Silicon") ore = "Silicon";
-    else if (ore == "Aluminum") ore = "Aluminium";
-    for (const OreBands& b : ORE_BANDS) {
-        if (ore != b.ore) continue;
-        for (uint16_t v : b.bands) {
-            if (v == quality) return true;
-        }
-        return false;
-    }
-    return true;
 }
 
 bool RefineryPanel::whole() const {
@@ -1320,6 +1225,48 @@ RefineryScreen readRefineryScreen(const cv::Mat& input, const std::vector<Refine
     if (notice) screen.delivered = findDeliveredNotice(raw, reader);
     screen.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     return screen;
+}
+
+namespace {
+
+RefineryKind kindOf(RefineryBar::Band band) {
+    switch (band) {
+        case RefineryBar::Band::Setup: return RefineryKind::Setup;
+        case RefineryBar::Band::Processing: return RefineryKind::Processing;
+        case RefineryBar::Band::Completed: return RefineryKind::Completed;
+        case RefineryBar::Band::Other: return RefineryKind::Other;
+        case RefineryBar::Band::None: return RefineryKind::None;
+    }
+    return RefineryKind::None;
+}
+
+}  // namespace
+
+RefineryReading refineryReading(const RefineryScreen& screen) {
+    RefineryReading out;
+    out.stationText = screen.stationText;
+    out.delivered = screen.delivered;
+    out.capacity = screen.capacity;
+    out.workload = screen.workload;
+    for (const RefineryPanel& panel : screen.panels) {
+        RefineryOrderPanel plain;
+        plain.kind = kindOf(panel.kind);
+        plain.number = panel.order;
+        plain.method = panel.method;
+        plain.cost = panel.cost;
+        plain.seconds = panel.seconds;
+        for (const RefineryRow& row : panel.rows) {
+            RefineryOrderRow line;
+            line.material = row.material;
+            line.inert = row.inert;
+            line.quality = row.quality;
+            line.quantity = row.quantity;
+            line.yield = row.yield;
+            plain.rows.push_back(line);
+        }
+        out.panels.push_back(plain);
+    }
+    return out;
 }
 
 }  // namespace SCMiner

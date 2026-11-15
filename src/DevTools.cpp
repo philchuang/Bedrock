@@ -938,7 +938,7 @@ int runRefineryReplay(const std::string& dir, const std::string& station, long l
                                                  : SCMiner::readRefineryScreen(frame, bars, *lines, notice);
         if (!read.panels.empty()) lastPanels = taken;
         const size_t had = book.orders().size();
-        const bool changed = book.take(station, read, taken);
+        const bool changed = book.take(station, refineryReading(read), taken);
         std::cout << std::filesystem::path(files[i]).filename().string() << ": " << read.panels.size() << " panels"
                   << (read.delivered ? ", WORK ORDER DELIVERED" : "")
                   << (changed ? (book.orders().size() > had   ? "  -> new order"

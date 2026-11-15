@@ -218,68 +218,119 @@ set(PLUGIN_RUNTIME_SOURCES
 set_source_files_properties(${PLUGIN_RUNTIME_SOURCES} PROPERTIES LANGUAGE CXX)
 
 # --------------------------------------------------------------------------
-# The core: everything that describes the game and reads it, with no window
-# system under it. It builds on both platforms from the same sources.
+# Three libraries, on both platforms. bedrock_rules is the game: tables,
+# advice, the book, the shops. bedrock_read is the picture: capture and the
+# readers. bedrock_host is the rest of the program that is not the window
+# (the phone, the plugins, the files). The window and Application stay in
+# the executable. cmake/BedrockFence.cmake fails the configure when a
+# source takes an include that would merge them again.
+# Application still includes the reader headers. That check joins this one
+# when the scan moves into ScanSession (docs/dev/dotnet-port.md, step D).
 # --------------------------------------------------------------------------
-set(CORE_SOURCES
-    src/GlyphReader.cpp
-    src/EmbeddedData.cpp
-    src/TextLineReader.cpp
+set(RULES_SOURCES
     src/SignatureAnalyzer.cpp
-    src/OCREngine.cpp
     src/GameState.cpp
     src/GamePlaces.cpp
-    src/ScanPanel.cpp
-    src/PanelFive.cpp
-    src/PanelKeep.cpp
-    src/LoadoutReader.cpp
-    src/LaserRange.cpp
     src/RockContents.cpp
-    src/RockScans.cpp
-    src/Feedback.cpp
-    src/DebugZip.cpp
-    src/TextField.cpp
-    src/RefineryTerminal.cpp
+    src/OreNames.cpp
+    src/RefineryNames.cpp
+    src/LoadoutNames.cpp
     src/RefineryOrders.cpp
-    src/RefineryShare.cpp
     src/TradeBook.cpp
-    src/CommodityTerminal.cpp
-    src/Datarunner.cpp
     src/BlueprintLibrary.cpp
     src/Reputation.cpp
-    src/NoteBook.cpp
-    src/DataBackup.cpp
-    src/AppPaths.cpp
-    src/P4kReader.cpp
-    src/GameTexts.cpp
     src/MiniJson.cpp
     src/UexPrices.cpp
     src/WhereToBuy.cpp
     src/HaloRoute.cpp
     src/UexReports.cpp
     src/UexMarket.cpp
+    src/RockScans.cpp
+)
+
+set(READ_SOURCES
+    src/GlyphReader.cpp
+    src/EmbeddedData.cpp
+    src/TextLineReader.cpp
+    src/OCREngine.cpp
+    src/ScanPanel.cpp
+    src/LoadoutReader.cpp
+    src/LaserRange.cpp
+    src/RockContentsRead.cpp
+    src/PanelFive.cpp
+    src/PanelKeep.cpp
+    src/RefineryTerminal.cpp
+    src/CommodityTerminal.cpp
+    src/Datarunner.cpp
+    src/ScreenCapture.cpp
+    src/FrameRecorder.cpp
+)
+if(WIN32)
+    list(APPEND READ_SOURCES src/DxgiCapture.cpp)
+else()
+    list(APPEND READ_SOURCES src/LinuxCapture.cpp)
+endif()
+
+set(HOST_SOURCES
+    src/RefineryShare.cpp
+    src/NoteBook.cpp
+    src/DataBackup.cpp
+    src/AppPaths.cpp
+    src/P4kReader.cpp
+    src/GameTexts.cpp
     src/ColourScheme.cpp
     src/PhoneServer.cpp
     third_party/qrcodegen/qrcodegen.cpp
     src/Plugins.cpp
     src/PluginHost.cpp
     src/GameFiles.cpp
+    src/Feedback.cpp
+    src/DebugZip.cpp
+    src/TextField.cpp
+    src/DevTools.cpp
     ${PLUGIN_RUNTIME_SOURCES}
 )
 
-# Source files
+include(cmake/BedrockFence.cmake)
+set(BEDROCK_TABLE_HEADERS
+    MiningHardware.h MiningLocations.h CommodityData.h RefineryData.h RefiningData.h
+    CraftingData.h GameTextMarks.h NavPlaces.h SignatureAnalyzer.h MiningData.h
+    MiningAdvice.h MinerGUI.h)
+bedrock_check_fence("bedrock_rules must not include OpenCV, Win32 or MinerGUI.h"
+    OPENCV SOURCES ${RULES_SOURCES} NAMES windows.h Windows.h MinerGUI.h)
+bedrock_check_fence("bedrock_read must not include MinerGUI.h or an ore table"
+    SOURCES ${READ_SOURCES} NAMES ${BEDROCK_TABLE_HEADERS})
+bedrock_check_fence("the window must not include a reader header that mentions cv::"
+    CV SOURCES include/MinerGUI.h src/MinerGUI.cpp)
+
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${RULES_SOURCES} ${READ_SOURCES} ${HOST_SOURCES} include/MinerGUI.h src/MinerGUI.cpp)
+
+add_library(bedrock_rules STATIC ${RULES_SOURCES})
+add_library(bedrock_read STATIC ${READ_SOURCES})
+add_library(bedrock_host STATIC ${HOST_SOURCES})
+target_link_libraries(bedrock_read PUBLIC bedrock_rules)
+if(MSVC)
+    target_compile_options(bedrock_rules PRIVATE /utf-8)
+    target_compile_options(bedrock_read PRIVATE /utf-8)
+    target_compile_options(bedrock_host PRIVATE /utf-8)
+endif()
+if(WIN32)
+    target_link_libraries(bedrock_host PUBLIC zstd::libzstd)
+    if(BEDROCK_WITH_TESSERACT)
+        target_link_libraries(bedrock_read PUBLIC Tesseract::libtesseract)
+    endif()
+endif()
+
+# Source files of the executable itself. The libraries above supply the rest.
 set(SOURCES
     src/main.cpp
-    src/ScreenCapture.cpp
-    src/DxgiCapture.cpp
-    src/FrameRecorder.cpp
     src/Application.cpp
+    src/UexKey.cpp
     src/MinerGUI.cpp
     src/Updater.cpp
-    src/DevTools.cpp
     src/DevShots.cpp
     src/SelfTest.cpp
-    ${CORE_SOURCES}
 )
 
 set(HEADERS
@@ -352,6 +403,8 @@ if(WIN32)
     endif()
 
     target_link_libraries(${PROJECT_NAME} PRIVATE
+        bedrock_read
+        bedrock_host
         ${OpenCV_LIBS}
         zstd::libzstd
         gdi32
@@ -365,34 +418,46 @@ if(WIN32)
         shell32
         ole32
     )
-    if(BEDROCK_WITH_TESSERACT)
-        target_link_libraries(${PROJECT_NAME} PRIVATE Tesseract::libtesseract)
-    endif()
 else()
     # ----------------------------------------------------------------------
     # Linux. The core builds as a library so the pieces above it - the capture
     # layer, and in time the window - can be added one at a time and each one
     # measured against the Windows build rather than assumed.
     # ----------------------------------------------------------------------
-    add_library(bedrock_core STATIC ${CORE_SOURCES})
-    target_include_directories(bedrock_core PUBLIC
+    target_include_directories(bedrock_rules PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+        ${ZSTD_INCLUDE_DIRS}
+    )
+    target_include_directories(bedrock_read PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+        ${OpenCV_INCLUDE_DIRS}
+        ${ZSTD_INCLUDE_DIRS}
+        ${X11_INCLUDE_DIRS}
+    )
+    target_include_directories(bedrock_host PUBLIC
         ${CMAKE_SOURCE_DIR}/include
         ${OpenCV_INCLUDE_DIRS}
         ${ZSTD_INCLUDE_DIRS}
     )
-    target_link_libraries(bedrock_core PUBLIC ${OpenCV_LIBS} ${ZSTD_LIBRARIES})
-    target_link_directories(bedrock_core PUBLIC ${ZSTD_LIBRARY_DIRS})
+    target_link_libraries(bedrock_read PUBLIC ${OpenCV_LIBS} ${X11_LIBRARIES})
+    target_link_libraries(bedrock_rules PUBLIC ${ZSTD_LIBRARIES})
+    target_link_libraries(bedrock_host PUBLIC ${OpenCV_LIBS} ${ZSTD_LIBRARIES})
+    target_link_directories(bedrock_read PUBLIC ${ZSTD_LIBRARY_DIRS} ${X11_LIBRARY_DIRS})
+    target_link_directories(bedrock_host PUBLIC ${ZSTD_LIBRARY_DIRS})
     # by name only when asked for: pkg-config's answers stay in the cache of
     # a build folder that once had them, and would be linked in regardless
     if(BEDROCK_WITH_TESSERACT)
-        target_include_directories(bedrock_core PUBLIC ${TESSERACT_INCLUDE_DIRS})
-        target_link_libraries(bedrock_core PUBLIC ${TESSERACT_LIBRARIES})
-        target_link_directories(bedrock_core PUBLIC ${TESSERACT_LIBRARY_DIRS})
+        target_include_directories(bedrock_read PUBLIC ${TESSERACT_INCLUDE_DIRS})
+        target_link_libraries(bedrock_read PUBLIC ${TESSERACT_LIBRARIES})
+        target_link_directories(bedrock_read PUBLIC ${TESSERACT_LIBRARY_DIRS})
     endif()
     # what the binary carries inside itself - see src/EmbeddedData.cpp
-    target_compile_definitions(bedrock_core PRIVATE
+    target_compile_definitions(bedrock_read PRIVATE
         BEDROCK_RES_DIR="${CMAKE_SOURCE_DIR}/resources"
         BEDROCK_TESTS_DIR="${CMAKE_SOURCE_DIR}/tests")
+    # The name the Linux targets already link. It is the three libraries.
+    add_library(bedrock_core INTERFACE)
+    target_link_libraries(bedrock_core INTERFACE bedrock_rules bedrock_read bedrock_host)
     # .incbin reads those files while the object is assembled, out of make's
     # sight, so a changed file would not be picked up. Named here, a changed one
     # rebuilds the object. Read off EmbeddedData.cpp itself, so its list
@@ -417,14 +482,8 @@ else()
     # capture and sit in an #ifdef, the remaining 1,200 are the locator - the
     # plate search, the channel splitting, the probe. Shared rather than
     # copied, so a fix to the locator reaches both platforms at once.
-    add_library(bedrock_capture STATIC src/LinuxCapture.cpp src/ScreenCapture.cpp src/DevTools.cpp)
-    target_include_directories(bedrock_capture PUBLIC
-        ${CMAKE_SOURCE_DIR}/include
-        ${OpenCV_INCLUDE_DIRS}
-        ${X11_INCLUDE_DIRS}
-    )
-    target_link_libraries(bedrock_capture PUBLIC bedrock_core ${X11_LIBRARIES})
-    target_link_directories(bedrock_capture PUBLIC ${X11_LIBRARY_DIRS})
+    add_library(bedrock_capture INTERFACE)
+    target_link_libraries(bedrock_capture INTERFACE bedrock_core)
 
     add_executable(bedrock-read src/linux_cli.cpp)
     target_link_libraries(bedrock-read PRIVATE bedrock_capture)
@@ -451,9 +510,9 @@ else()
         add_executable(bedrock
             src/linux/linux_app.cpp
             src/Application.cpp
+            src/UexKey.cpp
             src/MinerGUI.cpp
             src/Updater.cpp
-            src/FrameRecorder.cpp
             src/DevShots.cpp
             src/SelfTest.cpp
             src/linux/Win32Shim.cpp

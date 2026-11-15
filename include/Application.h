@@ -380,10 +380,10 @@ private:
     // to see why a job did not go
     void keepRefineryNotes(const std::vector<std::string>& lines);
     std::chrono::steady_clock::time_point refineryHandCheck_{};
-    void takeRefineryScreen(const RefineryScreen& read, const std::string& station, long long taken);
+    void takeRefineryScreen(const RefineryReading& read, const std::string& station, long long taken);
     void pushRefineryOrders();
     RefineryOrderBook refineryOrders_;
-    std::future<RefineryScreen> refineryJob_;   // a reading under way
+    std::future<RefineryReading> refineryJob_;   // a reading under way
     std::string refineryJobStation_;            // ...where
     long long refineryJobTaken_ = 0;            // ...and when its picture was taken (UTC)
     std::chrono::steady_clock::time_point lastRefineryLook_{};
@@ -413,7 +413,7 @@ private:
     std::future<std::pair<std::string, std::map<std::string, RefineryShare::StationState>>> stationsJob_;
     std::chrono::steady_clock::time_point stationsAsked_{};
     std::map<std::string, RefineryShare::StationState> stationsShared_;
-    void shareRefineryScreen(const RefineryScreen& read, const std::string& station, long long taken);
+    void shareRefineryScreen(const RefineryReading& read, const std::string& station, long long taken);
     bool queueRefineryShare(const RefineryShare::Reading& reading);   // false where it does not go
     void serviceRefineryShare();
     void pushRefineryWorkloads();
@@ -538,6 +538,8 @@ public:
     static UexShopsOutcome loadUexShops(const std::filesystem::path& folder, bool keptOnly = false);
 private:
     void serviceUexShops();
+    void handGearOrder();
+    std::string gearPlace_, gearSystem_;
     std::future<UexShopsOutcome> uexShopsJob_;
     std::shared_ptr<const UexShops> uexShops_;
     std::string uexShopsNote_;
@@ -835,7 +837,7 @@ private:
 
     // Domain knowledge for the OCR consensus vote: repair misread digits
     // against the signature table and reward exact hits
-    OCREngine::ReadingPolicy readingPolicy();
+    ReadingPolicy readingPolicy();
 
     // One possible signature label: the cropped image and where it came from
     struct LabelCandidate {

@@ -1,5 +1,7 @@
 #include "Datarunner.h"
+#include "DatarunnerRead.h"
 
+#include "CommodityTerminal.h"
 #include "TextLineReader.h"
 
 #include <opencv2/imgcodecs.hpp>
@@ -101,6 +103,29 @@ std::vector<unsigned char> jpegForUex(const cv::Mat& bgr) {
 
 }  // namespace
 
+Pixels packBgra(const cv::Mat& bgr) {
+    Pixels out;
+    if (bgr.empty()) return out;
+    cv::Mat bgra;
+    if (bgr.channels() == 4) bgra = bgr;
+    else if (bgr.channels() == 3) cv::cvtColor(bgr, bgra, cv::COLOR_BGR2BGRA);
+    else if (bgr.channels() == 1) cv::cvtColor(bgr, bgra, cv::COLOR_GRAY2BGRA);
+    else return out;
+    if (!bgra.isContinuous()) bgra = bgra.clone();
+    out.width = bgra.cols;
+    out.height = bgra.rows;
+    out.bgra.assign(bgra.data, bgra.data + (size_t)out.width * out.height * 4);
+    return out;
+}
+
+cv::Mat unpackBgr(const Pixels& pixels) {
+    if (pixels.empty()) return {};
+    const cv::Mat bgra(pixels.height, pixels.width, CV_8UC4, const_cast<unsigned char*>(pixels.bgra.data()));
+    cv::Mat bgr;
+    cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
+    return bgr;
+}
+
 std::vector<unsigned char> pictureForUex(cv::Mat frame) {
     if (frame.empty()) return {};
     if (frame.channels() == 4) cv::cvtColor(frame, frame, cv::COLOR_BGRA2BGR);
@@ -146,6 +171,19 @@ std::vector<unsigned char> montageForUex(const cv::Mat& montage, int frameHeight
     return jpegForUex(out);
 }
 
+void addToMontage(Pixels& montage, const Pixels& frame, const std::vector<CardBox>& rows) {
+    cv::Mat picture = unpackBgr(montage);
+    cv::Mat looked = unpackBgr(frame);
+    std::vector<cv::Rect> rects;
+    for (const CardBox& box : rows) rects.emplace_back(box.x, box.y, box.width, box.height);
+    addToMontage(picture, looked, rects);
+    montage = packBgra(picture);
+}
+
+std::vector<unsigned char> montageForUex(const Pixels& montage, int frameHeight) {
+    return montageForUex(unpackBgr(montage), frameHeight);
+}
+
 Shot readPicture(const cv::Mat& bgr, TextLineReader& reader) {
     Shot shot;
     if (bgr.empty()) return shot;
@@ -173,14 +211,14 @@ Shot readPicture(const cv::Mat& bgr, TextLineReader& reader) {
         row.levelSure = card.levelSure();
         row.stockSure = card.stockSure();
         row.priceSure = card.priceSure();
-        row.card = card.card;
+        row.card = {card.card.x, card.card.y, card.card.width, card.card.height};
         // the card with a little of its ground around it, the level's bar
         // left of the name in it
         const int margin = (std::max)(3, card.card.height / 8);
         const cv::Rect piece = cv::Rect(card.card.x - 2 * margin, card.card.y - margin, card.card.width + 3 * margin,
                                         card.card.height + 2 * margin) &
                                cv::Rect(0, 0, bgr.cols, bgr.rows);
-        if (piece.area() > 0) row.snippet = bgr(piece).clone();
+        if (piece.area() > 0) row.crop = packBgra(bgr(piece));
         shot.rows.push_back(std::move(row));
     }
     // the very picture the rows were read off

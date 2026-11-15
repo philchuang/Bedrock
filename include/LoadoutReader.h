@@ -9,6 +9,8 @@
 // are told apart by what they show. The MOLE's pilot never sees its heads,
 // so this is for the Prospector and the Golem.
 
+#include "LoadoutResolve.h"
+
 #include <opencv2/core.hpp>
 
 #include <string>
@@ -37,6 +39,9 @@ struct SeenLoadout {
     // the lines above that name a module, and the modules they name - none
     // when nothing is fitted
     std::vector<std::string> moduleTexts;
+    // the lines under each module's name, kept so the name can be resolved
+    // after the read, beside the hardware table
+    std::vector<std::vector<std::string>> moduleBelow;
     std::vector<const MiningModule*> modules;
     // how many icons stand over the laser's table, one over each module's
     // column (-1: not looked at) - more than there are over a busy ground -
@@ -74,29 +79,14 @@ bool readSeenLoadout(const cv::Mat& frame, TextLineReader& lines, SeenLoadout& s
 // the rock's composition (RockContents.h) is one too.
 cv::Mat hudLetteringInk(const cv::Mat& bgr, double scale);
 
-// A line as the HUD writes it matched to the game's names: the laser's name
-// before MINING LASER, a module's before MODULE. nullptr unless exactly one
-// fits.
-const MiningLaser* laserByHudLine(const std::string& line);
-const MiningModule* moduleByHudLine(const std::string& line);
-// ...the laser of a MOLE's turret: size 2, the one size the MOLE takes
-const MiningLaser* turretLaserByHudLine(const std::string& line);
-
 // The laser a MOLE's turret fires, off the turret's mining HUD: the line
 // "HOFSTEDE-S2 MINING LASER" over its table, low and left of the middle.
 // That table stands over the turret's own gauges and does not match the
-// one-seat ships' by its shape, so the line is looked for row by row. Null
+// one-seat ships' by its shape, so the line is looked for row by row. False
 // when no row there names a laser a turret takes; `read` gets the line.
-const MiningLaser* readTurretLaser(const cv::Mat& frame, TextLineReader& lines, std::string* read = nullptr);
-// A module's block in the HUD's list - its name, and the lines under it that
-// say what it does - matched as readSeenLoadout matches it. Public for the
-// self-test.
-const MiningModule* moduleByHudBlock(const std::string& nameLine, const std::vector<std::string>& below);
-
-// Whether the table's Head column, as read (SeenLoadout::head, -1 where
-// nothing was), is what this laser and these modules make of it
-bool headColumnAgrees(const MiningLaser& laser, const std::vector<const MiningModule*>& modules, const int head[6],
-                      const double sure[6]);
+// Which line names a laser is answered by LoadoutResolve, installed beside
+// the hardware table.
+bool readTurretLaser(const cv::Mat& frame, TextLineReader& lines, std::string* read = nullptr);
 
 // Whose mining HUD a picture shows, by a ship's id - "prospector" or
 // "golem", the two whose HUD lists what they carry - and nullptr for any

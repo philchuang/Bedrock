@@ -2,6 +2,11 @@
 #include "DevSwitch.h"
 #include "ScanPanel.h"
 #include "LoadoutReader.h"
+#include "LoadoutFill.h"
+#include "LoadoutNames.h"
+#include "RefineryTerminal.h"
+#include "DatarunnerRead.h"
+#include "RockContentsRead.h"
 #include "LaserRange.h"
 #include "MiningHardware.h"
 #include "GamePlaces.h"
@@ -575,6 +580,7 @@ Application::~Application() {
 }
 
 bool Application::initialize() {
+    installLoadoutResolve();
     // Load the saved capture region first
     loadRegionConfig();
     g_debugImages = recordScans_;
@@ -2136,8 +2142,10 @@ void Application::readTurretOnHud(const cv::Mat& frame) {
     if (now - lastTurretRead_ < std::chrono::seconds(every)) return;
     lastTurretRead_ = now;
     try {
-        turretJob_ = std::async(std::launch::async, [this, picture = frame.clone()]() {
-            return readTurretLaser(picture, textLines_);
+        turretJob_ = std::async(std::launch::async, [this, picture = frame.clone()]() -> const MiningLaser* {
+            std::string line;
+            if (!readTurretLaser(picture, textLines_, &line)) return nullptr;
+            return turretLaserByHudLine(line);
         });
     } catch (const std::system_error&) {
         // no thread to be had: the reading waits for the next look
@@ -2188,7 +2196,9 @@ void Application::loadoutCheckForRock(float mass) {
     }
 }
 
-void Application::takeSeenLoadout(const SeenLoadout& seen, const MiningShip& kind) {
+void Application::takeSeenLoadout(const SeenLoadout& read, const MiningShip& kind) {
+    SeenLoadout seen = read;
+    fillSeenLoadout(seen);
     if (!seen.complete()) {
         // No table in the picture: no mining HUD up, which is no HUD too
         // busy to read, and does not slow the readings down
@@ -3359,7 +3369,7 @@ void Application::processScanWithGUI() {
     }
 }
 
-OCREngine::ReadingPolicy Application::readingPolicy() {
+ReadingPolicy Application::readingPolicy() {
     return makeReadingPolicy(analyzer_);
 }
 
@@ -4720,7 +4730,10 @@ void Application::applyGameState() {
             if (gui_) {
                 gui_->setPlace(line, analyzer_.placeFilter(), ground == Ground::Space);
                 // ...and the place itself, for the gear's shops, nearest first
-                gui_->setWhereAt(place.known() ? place.name : std::string(), pretty);
+                gearPlace_ = place.known() ? place.name : std::string();
+                gearSystem_ = pretty;
+                gui_->setWhereAt(gearPlace_, gearSystem_);
+                handGearOrder();
                 if (lastRecognizedSignature_ > 0) {
                     auto results = analyzer_.analyzeSignature(lastRecognizedSignature_);
                     gui_->updateResults(lastRecognizedSignature_, results, -1.0, analyzer_.outOfPlace());
@@ -4773,7 +4786,7 @@ void Application::lookForRefinery() {
     if (!gui_ || !textLines_.ready()) return;
     if (refineryJob_.valid()) {
         if (refineryJob_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
-        RefineryScreen read;
+        RefineryReading read;
         try {
             read = refineryJob_.get();
         } catch (const std::exception& e) {
@@ -4818,14 +4831,14 @@ void Application::lookForRefinery() {
     if (notice && atTerminal) refineryUp_ = true;
     if (bars.empty() && !(notice && atTerminal)) {
         // away from the terminal: the next reading has nothing to agree with
-        refineryOrders_.take(station, RefineryScreen(), taken);
+        refineryOrders_.take(station, RefineryReading(), taken);
         return;
     }
     refineryJobStation_ = station;
     refineryJobTaken_ = taken;
     try {
         refineryJob_ = std::async(std::launch::async, [this, picture = frame.clone(), bars, notice]() {
-            return readRefineryScreen(picture, bars, textLines_, notice);
+            return refineryReading(readRefineryScreen(picture, bars, textLines_, notice));
         });
     } catch (const std::system_error&) {
         // no thread to be had: the next look tries again
@@ -4833,7 +4846,7 @@ void Application::lookForRefinery() {
 }
 
 // What two readings in a row agree on goes into the book (RefineryOrderBook::take)
-void Application::takeRefineryScreen(const RefineryScreen& read, const std::string& placed, long long taken) {
+void Application::takeRefineryScreen(const RefineryReading& read, const std::string& placed, long long taken) {
     // The station the terminal names itself, else the one the log has the
     // player at; neither, and there is nowhere to put an order
     // ...and with no panel up to name it, the station of the last panels
@@ -4848,7 +4861,7 @@ void Application::takeRefineryScreen(const RefineryScreen& read, const std::stri
         refineryLastPanels_ = std::chrono::steady_clock::now();
     }
     if (station.empty()) {
-        refineryOrders_.take("", RefineryScreen(), taken);
+        refineryOrders_.take("", RefineryReading(), taken);
         return;
     }
     shareRefineryScreen(read, station, taken);
@@ -4899,7 +4912,7 @@ void Application::setRefineryShare(bool on) {
 // order being set up: like the orders themselves, taken only where two
 // readings in a row agree - one misread figure never stands - and then shown
 // and, where the player shares, sent
-void Application::shareRefineryScreen(const RefineryScreen& read, const std::string& station, long long taken) {
+void Application::shareRefineryScreen(const RefineryReading& read, const std::string& station, long long taken) {
     if (read.capacity >= 0 || read.workload >= 0) {
         const WorkloadReading now{read.capacity, read.workload, taken};
         const auto last = workloadLast_.find(station);
@@ -4920,8 +4933,8 @@ void Application::shareRefineryScreen(const RefineryScreen& read, const std::str
             }
         }
     }
-    for (const RefineryPanel& panel : read.panels) {
-        if (panel.kind != RefineryBar::Band::Setup || !panel.whole()) continue;
+    for (const RefineryOrderPanel& panel : read.panels) {
+        if (panel.kind != RefineryKind::Setup || !panel.whole()) continue;
         RefineryShare::Reading r;
         r.station = station;
         r.observed = taken;
@@ -4932,9 +4945,9 @@ void Application::shareRefineryScreen(const RefineryScreen& read, const std::str
         }
         r.cost = panel.cost;
         r.seconds = panel.seconds;
-        std::string key = station + "|" + std::to_string(panel.order) + "|" + r.method + "|" +
+        std::string key = station + "|" + std::to_string(panel.number) + "|" + r.method + "|" +
                           std::to_string(std::llround(panel.cost)) + "|" + std::to_string(panel.seconds);
-        for (const RefineryRow& row : panel.rows) {
+        for (const RefineryOrderRow& row : panel.rows) {
             if (row.inert || row.material.empty() || row.quantity <= 0 || row.yield < 0) continue;
             r.items.push_back({row.material, row.quantity, row.quality, row.yield});
             key += "|" + row.material + ":" + std::to_string(row.quantity) + ":" + std::to_string(row.yield);
@@ -5844,6 +5857,16 @@ Application::UexShopsOutcome Application::loadUexShops(const std::filesystem::pa
 // the page has them at once; then each list as uexListCached has it,
 // fetched where it is half a day old; again once what came is half a day
 // old - and after a failure every UEX_RETRY_MINUTES
+void Application::handGearOrder() {
+    if (!gui_) return;
+    if (!uexShops_) {
+        gui_->setGearOrder(nullptr);
+        return;
+    }
+    gui_->setGearOrder(std::make_shared<const std::map<std::string, std::vector<ShopInOrder>>>(
+        shopsInOrder(*uexShops_, gearSystem_, gearPlace_)));
+}
+
 void Application::serviceUexShops() {
     if (!gui_) return;
     if (uexShopsJob_.valid() && uexShopsJob_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
@@ -5856,6 +5879,7 @@ void Application::serviceUexShops() {
                 uexShops_ = done.shops;
                 std::cout << "\nUEX shops: " << uexShops_->itemCount() << " items kept from before" << std::endl;
                 gui_->setGearShops(uexShops_, "");
+                handGearOrder();
             }
         } else {
             if (done.shops) uexShops_ = done.shops;
@@ -5864,6 +5888,7 @@ void Application::serviceUexShops() {
                       << (uexShops_ ? std::to_string(uexShops_->itemCount()) + " items" : std::string("none"))
                       << (uexShopsNote_.empty() ? "" : " - " + uexShopsNote_) << std::endl;
             gui_->setGearShops(uexShops_, uexShopsNote_);
+            handGearOrder();
         }
     }
     if (!uexWanted_ || uexShopsJob_.valid()) return;
@@ -6448,15 +6473,15 @@ bool Application::watchTerminal() {
                     offered->side = fresh->side;
                     offered->taken = fresh->taken;
                     offered->rows = fresh->rows;
-                    for (Datarunner::Row& row : offered->rows) row.snippet.release();
+                    for (Datarunner::Row& row : offered->rows) row.crop.clear();
                     terminalOffered_.push_back(std::move(offered));
                     // One picture and one report for a list: the rows join
                     // the picture of the same shop's same list not sent yet,
                     // and their piece of the look goes under it
                     const std::shared_ptr<Datarunner::Shot> into = terminalPicture(fresh->shop, fresh->side, since);
-                    std::vector<cv::Rect> where;
+                    std::vector<Datarunner::CardBox> where;
                     for (const Datarunner::Row& row : fresh->rows) where.push_back(row.card);
-                    const int frameHeight = look->montage.rows;
+                    const int frameHeight = look->montage.height;
                     if (into) {
                         Datarunner::addToMontage(into->montage, look->montage, where);
                         into->jpeg = Datarunner::montageForUex(into->montage, frameHeight);
@@ -6469,7 +6494,7 @@ bool Application::watchTerminal() {
                         std::cout << "\nUEX Datarunner: the terminal at " << (into->shop.empty() ? "?" : into->shop)
                                   << " - " << where.size() << " rows more, " << into->rows.size() << " in all" << std::endl;
                     } else {
-                        fresh->montage.release();
+                        fresh->montage.clear();
                         Datarunner::addToMontage(fresh->montage, look->montage, where);
                         fresh->jpeg = Datarunner::montageForUex(fresh->montage, frameHeight);
                         fresh->shown = keepPicture(fresh->jpeg, AppPaths::data() / "debug" / "uex_pictures",
@@ -6485,7 +6510,7 @@ bool Application::watchTerminal() {
             }
         }
         if (sawTerminal) {
-            look->montage.release();   // kept to compare with, not to send
+            look->montage.clear();   // kept to compare with, not to send
             terminalLastLook_ = look;
             terminalSeenLook_ = look;
         } else {
@@ -6558,7 +6583,7 @@ bool Application::watchTerminal() {
     terminalJob_ = std::async(std::launch::async, [frame, reader, taken, channel, shop]() {
         auto look = std::make_shared<Datarunner::Shot>(Datarunner::readPicture(frame, *reader));
         look->automatic = true;
-        look->montage = frame;   // the look itself, for the list's one picture
+        look->montage = Datarunner::packBgra(frame);   // the look itself, for the list's one picture
         look->jpeg.clear();      // ...which is made of it where rows are new
         look->taken = taken;
         look->channel = channel;

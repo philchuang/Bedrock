@@ -1,7 +1,6 @@
 #include "PanelFive.h"
 
 #include "DevSwitch.h"
-#include "MiningHardware.h"
 #include "PanelFiveShapes.h"
 #include "RockContents.h"
 #include "ScanPanel.h"
@@ -1323,30 +1322,6 @@ std::vector<FiveListLine> readFiveList(const cv::Mat& frame, const ScanPanel& pa
         if (all && sum > 100.0 - 0.01 * (double)out.size() - 0.006 && sum < 100.006) break;
     }
     for (FiveListLine& entry : out) entry.dim = entry.bright < 0.7 * brightest;
-    return out;
-}
-
-std::vector<int> fiveQualities(const std::string& rockOre) {
-    auto same = [](const char* a, const std::string& b) {
-        if (std::strlen(a) != b.size()) return false;
-        for (size_t i = 0; i < b.size(); i++) {
-            if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
-        }
-        return true;
-    };
-    std::vector<int> out;
-    for (int i = 0; i < ROCK_PART_COUNT; i++) {
-        const RockPart& part = ROCK_PARTS[i];
-        if (!same(part.rock, rockOre)) continue;
-        for (int b = 0; b < ORE_BANDS_COUNT; b++) {
-            if (!same(ORE_BANDS[b].ore, part.ore)) continue;
-            for (int band = lowestQualityBand(part); band <= topQualityBand(part.qualityScale); band++) {
-                out.push_back(ORE_BANDS[b].bands[band]);
-            }
-        }
-    }
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
 }
 

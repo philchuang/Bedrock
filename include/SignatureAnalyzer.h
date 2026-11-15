@@ -1,9 +1,10 @@
 #pragma once
 
-#include <vector>
-#include <string>
 #include "MiningData.h"
-#include "OCREngine.h"
+#include "ReadingPolicy.h"
+
+#include <string>
+#include <vector>
 
 namespace SCMiner {
 
@@ -13,7 +14,7 @@ class SignatureAnalyzer;
 // signature table, reward exact hits, and reject values no signature can
 // produce. Shared so the app, the self-test and the --ocr tool all judge
 // readings the same way.
-OCREngine::ReadingPolicy makeReadingPolicy(SignatureAnalyzer& analyzer);
+ReadingPolicy makeReadingPolicy(SignatureAnalyzer& analyzer);
 
 // Matches a scanned radar signature against the per-mineral signature table
 // (signature = mineral base value x cluster size, see MiningData.h).

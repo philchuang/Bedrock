@@ -14,11 +14,9 @@
 // still stands in the way of Send, and the record of what went - kept over
 // a restart, for UEX's five minutes between two reports of a commodity.
 
-#include "CommodityTerminal.h"
+#include "Certainty.h"
 #include "TradeBook.h"
 #include "UexReports.h"
-
-#include <opencv2/core.hpp>
 
 #include <filesystem>
 #include <memory>
@@ -29,6 +27,10 @@
 namespace SCMiner {
 
 class TextLineReader;
+
+// The inventory bar's words, as the terminal prints them. "OUT OF STOCK"
+// through "MAX INVENTORY"; "" for a level the bar does not have.
+const char* commodityLevelWords(int level);
 
 namespace Datarunner {
 
@@ -47,6 +49,23 @@ constexpr long long COOLDOWN_SECONDS = 5 * 60;
 constexpr long long OLDEST_SECONDS = 30ll * 24 * 3600;
 // The cargo box sizes UEX takes, in SCU
 bool boxesUexTakes(const std::string& sizes);
+
+// A picture the window can hold: tightly packed BGRA, no OpenCV type.
+struct Pixels {
+    int width = 0;
+    int height = 0;
+    std::vector<unsigned char> bgra;
+    bool empty() const { return width <= 0 || height <= 0 || (int)bgra.size() < width * height * 4; }
+    void clear() { width = height = 0; bgra.clear(); }
+};
+
+// Where a card stood on the picture, in pixels.
+struct CardBox {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
 
 // One row of a picture: a commodity's card, as the reader made it out and
 // the player has it since
@@ -70,8 +89,8 @@ struct Row {
     Certainty stockSure = Certainty::Missing;
     Certainty priceSure = Certainty::Missing;
     std::string boxes;              // the cargo box sizes the log listed for it, "8,16,24,32"; "" none
-    cv::Rect card;                  // where it stands on the picture
-    cv::Mat snippet;                // ...that piece of the picture, to show beside it
+    CardBox card;                   // where it stands on the picture
+    Pixels crop;                    // ...that piece of the picture, to show beside it
     bool removed = false;           // taken out by the player
 };
 
@@ -94,7 +113,7 @@ struct Shot {
     // that picture at the game's own size - the first look whole, under it
     // the piece of each later look with the rows it added (addToMontage)
     bool automatic = false;
-    cv::Mat montage;
+    Pixels montage;
     long long taken = 0;            // when it was written, Unix seconds
     int width = 0, height = 0;
     std::string channel;            // "LIVE", "PTU"; "" not known
@@ -113,27 +132,14 @@ struct Shot {
     std::vector<std::string> ids;   // the report ids UEX gave
 };
 
-// A picture as UEX gets it with a report: at most 1080 pixels tall - a
-// 5120x1440 game comes out 3840x1080, its terminal readable - a JPEG well
-// under UEX's 10 MB. Empty for an empty picture.
-std::vector<unsigned char> pictureForUex(cv::Mat frame);
 // Bedrock's looks at one list put together: the first one whole; of each
 // later one, the piece with the cards at `rows` (where they stand on it) and
 // a little around them, under what is there - at its own place across, so
 // the columns stand under the first look's
-void addToMontage(cv::Mat& montage, const cv::Mat& frame, const std::vector<cv::Rect>& rows);
+void addToMontage(Pixels& montage, const Pixels& frame, const std::vector<CardBox>& rows);
 // ...as UEX gets it: at the size a look of `frameHeight` would come at (a
 // 1440 game's at 1080), one JPEG under UEX's 10 MB. Empty for none.
-std::vector<unsigned char> montageForUex(const cv::Mat& montage, int frameHeight);
-
-// A picture read: its rows as the reader made them out, each with its piece
-// of the picture, the list it shows, and the picture as UEX gets it. No rows
-// where it shows no commodity terminal - or cannot be read. Where the game's
-// picture is black (blackPicture), `own` - Bedrock's picture of the game,
-// taken when the game's came - is read instead, if there is one.
-Shot readPicture(const std::filesystem::path& file, TextLineReader& reader, const cv::Mat& own = cv::Mat());
-// ...the same, of a picture in hand (the self-test, the screenshots)
-Shot readPicture(const cv::Mat& bgr, TextLineReader& reader);
+std::vector<unsigned char> montageForUex(const Pixels& montage, int frameHeight);
 // The Datarunner at a commodity terminal without Print Screen: Bedrock looks
 // at the game every second or two while the log says a terminal is in use.
 // The complete rows of a look - a name, the level, the stock and a price per
@@ -158,10 +164,6 @@ bool listDone(const std::vector<std::pair<std::string, int>>& done, const std::s
 // picture's time) - for the BUY list of that very shop only; the log has
 // nothing of LOCAL MARKET VALUE. 0 not known.
 int listLength(const Shot& shot, const TradeBook::TerminalFill* fill);
-
-// A picture with nothing on it, as Star Citizen saved its screenshots with
-// HDR on: nought throughout. A dark scene still has its lights and its HUD.
-bool blackPicture(const cv::Mat& bgr);
 
 // The commodity among UEX's a name read off a terminal is: Sure where it is
 // one of their names letter for letter, Check where it is one with a slip or

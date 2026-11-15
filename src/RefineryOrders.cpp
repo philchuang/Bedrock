@@ -15,9 +15,9 @@ namespace SCMiner {
 
 namespace {
 
-std::vector<RefineryOrder::Part> partsOf(const RefineryPanel& panel, bool refinedOnly) {
+std::vector<RefineryOrder::Part> partsOf(const RefineryOrderPanel& panel, bool refinedOnly) {
     std::vector<RefineryOrder::Part> parts;
-    for (const RefineryRow& row : panel.rows) {
+    for (const RefineryOrderRow& row : panel.rows) {
         if (row.inert || row.material.empty()) continue;
         if (refinedOnly && row.yield < 0) continue;
         parts.push_back({row.material, row.quality, row.yield, row.quantity});
@@ -225,13 +225,13 @@ std::string refineryOrderKey(const RefineryOrder& order) {
     return key;
 }
 
-bool RefineryOrderBook::usable(const RefineryPanel& panel) {
-    const bool running = panel.kind == RefineryBar::Band::Processing;
-    const bool done = panel.kind == RefineryBar::Band::Completed;
+bool RefineryOrderBook::usable(const RefineryOrderPanel& panel) {
+    const bool running = panel.kind == RefineryKind::Processing;
+    const bool done = panel.kind == RefineryKind::Completed;
     if (!running && !done) return false;
-    if (running && (panel.order < 0 || panel.seconds < 0)) return false;
+    if (running && (panel.number < 0 || panel.seconds < 0)) return false;
     int named = 0;
-    for (const RefineryRow& row : panel.rows) {
+    for (const RefineryOrderRow& row : panel.rows) {
         if (row.inert) continue;
         if (row.material.empty() || row.quality < 0 || row.yield < 0) return false;
         named++;
@@ -239,13 +239,13 @@ bool RefineryOrderBook::usable(const RefineryPanel& panel) {
     return named > 0;
 }
 
-bool RefineryOrderBook::samePanel(const RefineryPanel& a, long long aTaken, const RefineryPanel& b, long long bTaken,
+bool RefineryOrderBook::samePanel(const RefineryOrderPanel& a, long long aTaken, const RefineryOrderPanel& b, long long bTaken,
                                   int slack) {
-    if (a.kind != b.kind || a.order != b.order) return false;
+    if (a.kind != b.kind || a.number != b.number) return false;
     if (!sameParts(partsOf(a, false), partsOf(b, false))) return false;
-    if (a.kind == RefineryBar::Band::Completed) return true;   // done: no clock on it
+    if (a.kind == RefineryKind::Completed) return true;   // done: no clock on it
     // A quote: the method, the bill and the time alike as well
-    if (a.kind != RefineryBar::Band::Processing) {
+    if (a.kind != RefineryKind::Processing) {
         return a.method == b.method && a.cost == b.cost && a.seconds == b.seconds;
     }
     const long long dueA = aTaken + a.seconds, dueB = bTaken + b.seconds;
@@ -256,7 +256,7 @@ bool RefineryOrderBook::samePanel(const RefineryPanel& a, long long aTaken, cons
 // the ones the quote gave a yield, as far as the list shows them. The same
 // quote seen again only moves its time on - unless it went to an order
 // already: then it is set up anew, the same job twice being two orders.
-void RefineryOrderBook::noteQuote(const std::string& station, const RefineryPanel& panel, long long now) {
+void RefineryOrderBook::noteQuote(const std::string& station, const RefineryOrderPanel& panel, long long now) {
     if (panel.method.empty() || panel.cost < 0 || panel.seconds <= 0) {
         std::string lacks;
         if (panel.method.empty()) lacks += "its method";
@@ -346,16 +346,16 @@ RefineryOrderBook::Quote* RefineryOrderBook::quoteFor(const std::string& station
     return best;
 }
 
-bool RefineryOrderBook::apply(const std::string& station, const RefineryScreen& screen, long long now) {
+bool RefineryOrderBook::apply(const std::string& station, const RefineryReading& screen, long long now) {
     bool changed = false;
-    for (const RefineryPanel& panel : screen.panels) {
-        if (panel.kind == RefineryBar::Band::Setup) {
+    for (const RefineryOrderPanel& panel : screen.panels) {
+        if (panel.kind == RefineryKind::Setup) {
             noteQuote(station, panel, now);
             continue;
         }
         if (!usable(panel)) continue;
         const std::vector<RefineryOrder::Part> parts = partsOf(panel, false);
-        if (panel.kind == RefineryBar::Band::Completed) {
+        if (panel.kind == RefineryKind::Completed) {
             // Done: the order with these parts is done now at the latest. Its number
             // may have moved up, as the one before it was collected (work order 2
             // becomes work order 1).
@@ -367,7 +367,7 @@ bool RefineryOrderBook::apply(const std::string& station, const RefineryScreen& 
             if (!known) {
                 RefineryOrder order;
                 order.station = station;
-                order.number = panel.order;
+                order.number = panel.number;
                 order.parts = parts;
                 order.due = now;
                 order.seen = now;
@@ -384,8 +384,8 @@ bool RefineryOrderBook::apply(const std::string& station, const RefineryScreen& 
                 known->due = now;
                 changed = true;
             }
-            if (panel.order >= 0 && known->number != panel.order) {
-                known->number = panel.order;
+            if (panel.number >= 0 && known->number != panel.number) {
+                known->number = panel.number;
                 changed = true;
             }
             for (const RefineryOrder::Part& p : parts) {
@@ -423,9 +423,9 @@ bool RefineryOrderBook::apply(const std::string& station, const RefineryScreen& 
             const long long apart = std::llabs(order.due - due);
             const bool sameTime = apart <= 10;
             const bool sameMinute = apart <= 70;
-            const bool sameNumber = order.number >= 0 && order.number == panel.order;
+            const bool sameNumber = order.number >= 0 && order.number == panel.number;
             const bool common = overlap(order.parts, parts);
-            const bool movedUp = order.number < 0 || panel.order <= order.number;
+            const bool movedUp = order.number < 0 || panel.number <= order.number;
             if ((sameTime && (sameNumber || common)) || (sameMinute && common && movedUp) ||
                 (sameMinute && rough && sameNumber) || (sameNumber && common)) {
                 known = &order;
@@ -440,8 +440,8 @@ bool RefineryOrderBook::apply(const std::string& station, const RefineryScreen& 
                 known->due = due;
                 changed = true;
             }
-            if (known->number != panel.order) {
-                known->number = panel.order;
+            if (known->number != panel.number) {
+                known->number = panel.number;
                 changed = true;
             }
             // the parts this look shows, added to the ones seen before
@@ -462,7 +462,7 @@ bool RefineryOrderBook::apply(const std::string& station, const RefineryScreen& 
         }
         RefineryOrder order;
         order.station = station;
-        order.number = panel.order;
+        order.number = panel.number;
         order.parts = parts;
         order.due = due;
         order.seen = now;
@@ -517,7 +517,7 @@ bool RefineryOrderBook::anyDone(long long now) const {
 // panels or more on the list, which may hold more than the terminal shows,
 // nor on a look away from the list (signing out shows neither panel nor
 // notice).
-bool RefineryOrderBook::noteCollected(const std::string& station, const RefineryScreen& read, long long now) {
+bool RefineryOrderBook::noteCollected(const std::string& station, const RefineryReading& read, long long now) {
     if (station.empty()) return false;
     if (read.delivered) {
         // up again after a look without it: another order collected
@@ -531,13 +531,13 @@ bool RefineryOrderBook::noteCollected(const std::string& station, const Refinery
     }
     if (station == deliveredStation_) noticeUp_ = read.delivered;
     if (station != deliveredStation_ || now - deliveredAt_ > 30 || toCollect_ <= 0) return false;
-    std::vector<const RefineryPanel*> shown;
-    for (const RefineryPanel& panel : read.panels) {
+    std::vector<const RefineryOrderPanel*> shown;
+    for (const RefineryOrderPanel& panel : read.panels) {
         if (usable(panel)) shown.push_back(&panel);
     }
     if (shown.empty() ? !read.delivered : shown.size() >= 4) return false;
     std::vector<bool> matched(orders_.size(), false);
-    for (const RefineryPanel* panel : shown) {
+    for (const RefineryOrderPanel* panel : shown) {
         const std::vector<RefineryOrder::Part> parts = partsOf(*panel, false);
         int best = -1;
         for (size_t i = 0; i < orders_.size(); i++) {
@@ -569,14 +569,14 @@ bool RefineryOrderBook::noteCollected(const std::string& station, const Refinery
     return true;
 }
 
-bool RefineryOrderBook::take(const std::string& station, const RefineryScreen& read, long long taken) {
-    for (const RefineryPanel& panel : read.panels) {
-        if (panel.kind == RefineryBar::Band::Setup) noteQuote(station, panel, taken);
+bool RefineryOrderBook::take(const std::string& station, const RefineryReading& read, long long taken) {
+    for (const RefineryOrderPanel& panel : read.panels) {
+        if (panel.kind == RefineryKind::Setup) noteQuote(station, panel, taken);
     }
-    RefineryScreen steady;
+    RefineryReading steady;
     if (station == lastStation_ && taken - lastTaken_ <= 10) {
-        for (const RefineryPanel& panel : read.panels) {
-            for (const RefineryPanel& before : last_.panels) {
+        for (const RefineryOrderPanel& panel : read.panels) {
+            for (const RefineryOrderPanel& before : last_.panels) {
                 if (samePanel(panel, taken, before, lastTaken_)) {
                     steady.panels.push_back(panel);
                     break;

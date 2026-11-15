@@ -19,6 +19,8 @@
 // box and opens below with the box sizes, the amount and BUY - at its foot,
 // left, "Total: 8 SCU": the box picked times the units.
 
+#include "Certainty.h"
+
 #include <opencv2/core.hpp>
 
 #include <string>
@@ -27,11 +29,6 @@
 namespace SCMiner {
 
 class TextLineReader;
-
-// How sure a value read off the picture is: Sure where two readings of it
-// agree, or it is word for word one the game writes; Check where it was made
-// out once, or with a slip; Missing where it was not made out at all
-enum class Certainty { Missing = 0, Check = 1, Sure = 2 };
 
 struct CommodityCard {
     std::string name;        // as read, a long name's two lines joined

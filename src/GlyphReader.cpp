@@ -1,6 +1,6 @@
 #include "GlyphReader.h"
 #include "DevSwitch.h"
-#include "MiningData.h"
+#include "ReadLimits.h"
 #include "EmbeddedData.h"
 #include <map>
 #include <set>

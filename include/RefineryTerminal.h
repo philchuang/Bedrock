@@ -26,6 +26,9 @@
 // while the player is merely near a refinery - and only then is anything
 // read, field by field, with the second reader (TextLineReader).
 
+#include "RefineryNames.h"
+#include "RefineryOrders.h"
+
 #include <opencv2/core.hpp>
 
 #include <string>
@@ -120,20 +123,10 @@ int parseRefineryPercent(const std::string& text);
 // before "workload": 0 light, 1 moderate, 2 heavy, 3 extreme; -1 for none.
 // Its first line alone is enough, it ends on that word.
 int refineryWorkloadIn(const std::string& text);
-// "light", "moderate", "heavy", "extreme"; "" for anything else
-const char* refineryWorkloadName(int workload);
 // "874" -> 874 with O/I/S/B put right; -1 for "--" and anything else
 int parseRefineryCount(const std::string& text);
-// The method a read names, as REFINING_METHODS spells it; "" when none is near
-std::string refiningMethodIn(const std::string& text);
-// The material a read names, as REFINERY_MATERIALS spells it ("IRON (ORE)" and
-// the refined "IRON" both give "Iron (Ore)"; the salvage's refined
-// "CONSTRUCTION MATERIALS", cut short to "CONSTRUCTION MA" in its column or
-// not, gives "Construction Salvage"); "" when none is near
-std::string refineryMaterialIn(const std::string& text, bool* inert = nullptr);
-// Whether a quality is one a material comes in: one of its ore's eight
-// values (ORE_BANDS) - the terminal prints the raw ore's, refined or not.
-// True for a material the bands do not know (salvage, rubble).
-bool refineryQualityFits(const std::string& material, int quality);
+
+// The reading the book keeps: the panels' fields, and none of where they stood.
+RefineryReading refineryReading(const RefineryScreen& screen);
 
 }  // namespace SCMiner

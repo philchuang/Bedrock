@@ -16,7 +16,7 @@
 #include "RefineryData.h"
 #include "RefiningData.h"
 #include "RefineryShare.h"
-#include "RefineryTerminal.h"
+#include "RefineryNames.h"
 #include "resource.h"
 #include <dwmapi.h>
 #include <shellapi.h>
@@ -5151,11 +5151,7 @@ void MinerGUI::setRoute(const std::string& from, const std::string& to) {
     }
     routeFrom_ = from;
     routeTo_ = to;
-    routePasses_.clear();
-    NavPoint a, b;
-    if (!from.empty() && !to.empty() && navPoint(from, "Stanton", a) && navPoint(to, "Stanton", b)) {
-        routePasses_ = haloPasses(a, b);
-    }
+    routePasses_ = haloPassesNamed(from, to);
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
     if (planner_ && plannerVisible_) InvalidateRect(planner_, nullptr, FALSE);
 }
@@ -7057,7 +7053,10 @@ void MinerGUI::drawGearPage(Gdiplus::Graphics& g, int cw, int ch) {
         return panelPad + shopStep * (float)r.shops.size() + scaleF(6) + lessH + scaleF(9);
     };
     for (Row& r : rows) {
-        if (gearShops_) r.shops = onePerPlace(nearestFirst(gearShops_->offersFor(r.item), whereSystem_, wherePlace_));
+        if (gearOrder_) {
+            const auto found = gearOrder_->find(r.item);
+            if (found != gearOrder_->end()) r.shops = found->second;
+        }
         r.open = !r.shops.empty() && r.item == gearOpen_;
         r.pitch = r.open ? ownH + panelHeight(r) + scaleF(14) : scaleF(headsList ? 66.0f : 49.0f);
     }
@@ -7633,6 +7632,40 @@ void MinerGUI::sayFired(RockVerdict& v, const std::vector<const MiningLoadout*>&
     note = std::wstring(text) + (note.empty() ? L"" : L"  ·  " + note);
 }
 
+const MinerGUI::RockVerdict& MinerGUI::rockAnswer() const {
+    std::string key;
+    auto add = [&](const std::string& part) { key.append(part); key.push_back('\n'); };
+    auto addPtr = [&](const void* p) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%p", p);
+        add(buf);
+    };
+    add(std::to_string(rock_.mass));
+    add(std::to_string(rock_.resistance));
+    add(std::to_string(rock_.instability));
+    add(std::to_string(rock_.scu));
+    add(rock_.ore);
+    add(std::to_string(rock_.distance));
+    add(rock_.resistanceAdjusted ? "1" : "0");
+    add(std::to_string(headShown_));
+    addPtr(loadout_.laser);
+    add(std::to_string(loadout_.craftedPower));
+    for (const MiningModule* m : loadout_.modules) addPtr(m);
+    addPtr(fittedGadget_);
+    addPtr(turretLaser_);
+    for (size_t i = 0; i < heads_.size(); i++) {
+        add(i < firing_.size() && firing_[i] ? "1" : "0");
+        addPtr(heads_[i].laser);
+        add(std::to_string(heads_[i].craftedPower));
+        for (const MiningModule* m : heads_[i].modules) addPtr(m);
+    }
+    if (key != rockVerdictKey_) {
+        rockVerdictCached_ = rockVerdict();
+        rockVerdictKey_ = std::move(key);
+    }
+    return rockVerdictCached_;
+}
+
 MinerGUI::RockVerdict MinerGUI::rockVerdict() const {
     RockVerdict v;
     wchar_t text[256];
@@ -8136,7 +8169,7 @@ int MinerGUI::drawRockOutput(Gdiplus::Graphics& g, int cw, int yPos) {
     right.SetAlignment(Gdiplus::StringAlignmentFar);
     right.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
 
-    const RockVerdict v = rockVerdict();
+    const RockVerdict& v = rockAnswer();
 
     // --- the answer -------------------------------------------------------
     g.DrawString(L"BREAK ANALYSIS", -1, &labelFont, Gdiplus::PointF(M, y), &faintBrush);
@@ -18500,7 +18533,7 @@ void MinerGUI::drawCompactRock(Gdiplus::Graphics& g, int cw, int ch) {
     line(rockMarketLine(), infoFont, accentBrush);
 
     // the verdict, the way the full window puts it
-    const RockVerdict v = rockVerdict();
+    const RockVerdict& v = rockAnswer();
     Gdiplus::Color tone = COL_TEXT_DIM;
     switch (v.kind) {
         case RockVerdict::Solo: tone = v.good ? COL_GREEN : COL_YELLOW; break;
@@ -19089,12 +19122,7 @@ LRESULT MinerGUI::handlePlannerMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
                         (menu == 1 ? haloFrom_ : haloTo_) = hit.value;
                         // a place picked to go to that no route from the new
                         // start runs through the belt to is dropped
-                        NavPoint a, b;
-                        if (menu == 1 && !haloTo_.empty() &&
-                            !(navPoint(haloFrom_, "Stanton", a) && navPoint(haloTo_, "Stanton", b) &&
-                              runsThroughHalo(a, b))) {
-                            haloTo_.clear();
-                        }
+                        if (menu == 1 && !haloTo_.empty() && !haloConnects(haloFrom_, haloTo_)) haloTo_.clear();
                         break;
                     }
                     return 0;
@@ -20320,21 +20348,50 @@ std::vector<std::pair<std::wstring, int>> MinerGUI::datarunnerListEntries() cons
 // A row's piece of the picture, at the size it is drawn: brought down with
 // OpenCV's area filter, as GDI+ and the Linux build's painter would blur it
 Gdiplus::Bitmap* MinerGUI::datarunnerSnippet(const Datarunner::Shot& shot, size_t row, int w, int h) {
-    if (row >= shot.rows.size() || shot.rows[row].snippet.empty() || w < 4 || h < 4) return nullptr;
+    if (row >= shot.rows.size() || shot.rows[row].crop.empty() || w < 4 || h < 4) return nullptr;
     const std::string key = std::to_string(shot.id) + ":" + std::to_string(row) + ":" + std::to_string(w) + "x" +
                             std::to_string(h);
     const auto found = drSnippets_.find(key);
     if (found != drSnippets_.end()) return found->second.get();
     if (drSnippets_.size() > 400) drSnippets_.clear();   // a window dragged through many sizes
-    cv::Mat sized, bgra;
-    cv::resize(shot.rows[row].snippet, sized, cv::Size(w, h), 0, 0, cv::INTER_AREA);
-    cv::cvtColor(sized, bgra, cv::COLOR_BGR2BGRA);   // opaque, so plain and premultiplied are one
+    const Datarunner::Pixels& src = shot.rows[row].crop;
+    std::vector<unsigned char> scaled((size_t)w * (size_t)h * 4);
+    for (int y = 0; y < h; y++) {
+        int y0 = y * src.height / h;
+        int y1 = (y + 1) * src.height / h;
+        if (y1 <= y0) y1 = y0 + 1;
+        if (y1 > src.height) y1 = src.height;
+        for (int x = 0; x < w; x++) {
+            int x0 = x * src.width / w;
+            int x1 = (x + 1) * src.width / w;
+            if (x1 <= x0) x1 = x0 + 1;
+            if (x1 > src.width) x1 = src.width;
+            int b = 0, g = 0, r = 0, a = 0, n = 0;
+            for (int yy = y0; yy < y1; yy++) {
+                const unsigned char* rowp = src.bgra.data() + (size_t)yy * (size_t)src.width * 4;
+                for (int xx = x0; xx < x1; xx++) {
+                    const unsigned char* p = rowp + (size_t)xx * 4;
+                    b += p[0];
+                    g += p[1];
+                    r += p[2];
+                    a += p[3];
+                    n++;
+                }
+            }
+            unsigned char* out = scaled.data() + ((size_t)y * (size_t)w + (size_t)x) * 4;
+            out[0] = (unsigned char)(b / n);
+            out[1] = (unsigned char)(g / n);
+            out[2] = (unsigned char)(r / n);
+            out[3] = (unsigned char)(a / n);
+        }
+    }
     auto picture = std::make_unique<Gdiplus::Bitmap>(w, h, PixelFormat32bppPARGB);
     Gdiplus::Rect all(0, 0, w, h);
     Gdiplus::BitmapData bits;
     if (picture->LockBits(&all, Gdiplus::ImageLockModeWrite, PixelFormat32bppPARGB, &bits) != Gdiplus::Ok) return nullptr;
     for (int y = 0; y < h; y++) {
-        std::memcpy(static_cast<BYTE*>(bits.Scan0) + (ptrdiff_t)y * bits.Stride, bgra.ptr(y), (size_t)w * 4);
+        std::memcpy(static_cast<BYTE*>(bits.Scan0) + (ptrdiff_t)y * bits.Stride, scaled.data() + (size_t)y * (size_t)w * 4,
+                    (size_t)w * 4);
     }
     picture->UnlockBits(&bits);
     Gdiplus::Bitmap* kept = picture.get();
@@ -20745,7 +20802,7 @@ void MinerGUI::drawDatarunnerCard(Gdiplus::Graphics& g, int cw, int ch) {
         auto visible = [&](const Gdiplus::RectF& r) { return r.Y >= drRows_.Y - 0.5f && r.GetBottom() <= drRows_.GetBottom() + 0.5f; };
         // the piece of the picture
         float snipW = width - sideW - scaleF(10);
-        if (!row.snippet.empty()) snipW = (std::min)(snipW, snipH * (float)row.snippet.cols / (float)row.snippet.rows);
+        if (!row.crop.empty()) snipW = (std::min)(snipW, snipH * (float)row.crop.width / (float)row.crop.height);
         const Gdiplus::RectF snip(left, ry, std::floor(snipW), snipH);
         if (Gdiplus::Bitmap* piece = datarunnerSnippet(shot, i, (int)snip.Width, (int)snip.Height)) {
             g.DrawImage(piece, snip);
@@ -21014,34 +21071,12 @@ void MinerGUI::paintGemMenu(Gdiplus::Graphics& g, int ch) {
 // ---- the Aaron Halo's way in, in the Ore Finder ---------------------------
 
 MinerGUI::HaloPlan MinerGUI::haloPlan() const {
+    const PlannedHalo planned = planHalo(haloFrom_, haloTo_, routeFrom_, routeTo_, whereSystem_, wherePlace_);
     HaloPlan plan;
-    NavPoint a, b;
-    auto inStanton = [](const std::string& name, NavPoint& p) { return !name.empty() && navPoint(name, "Stanton", p); };
-    // From: picked by hand; else where the route plotted set off, or where
-    // the player is; else ARC-L1
-    const std::string here = _stricmp(whereSystem_.c_str(), "Stanton") == 0 ? wherePlace_ : std::string();
-    for (const std::string& name : {haloFrom_, routeFrom_, here, std::string("ARC-L1")}) {
-        if (inStanton(name, a)) {
-            plan.from = name;
-            break;
-        }
-    }
-    // To: only a place a route from there runs through the belt to - picked
-    // by hand; else the route plotted; else the nearest such place through
-    // the densest band
-    auto through = [&](const std::string& name) {
-        return name != plan.from && inStanton(name, b) && runsThroughHalo(a, b);
-    };
-    if (through(haloTo_)) {
-        plan.to = haloTo_;
-    } else if (through(routeTo_)) {
-        plan.to = routeTo_;
-        plan.plotted = true;
-    } else {
-        plan.to = nearestHaloDestination(plan.from);
-        if (!plan.to.empty()) navPoint(plan.to, "Stanton", b);
-    }
-    if (!plan.to.empty()) plan.passes = haloBandsReached(a, b);
+    plan.from = planned.from;
+    plan.to = planned.to;
+    plan.plotted = planned.plotted;
+    plan.passes = planned.passes;
     return plan;
 }
 
@@ -22128,66 +22163,45 @@ void MinerGUI::paintPlanner(HDC hdc) {
                         return line;
                     };
                     if (roc || fps) {
-                        // the family's gems, each by the terminal paying most for
-                        // it, the dearest first - or the one gem picked. UEX knows
-                        // a few only as ore: Saldynium is "Saldynium (Ore)" there
+                        // which gems this card lists; what they fetch is gemSales
                         const MiningFamily family = roc ? MiningFamily::ROC : MiningFamily::FPS;
-                        std::vector<std::pair<std::string, const UexOffer*>> gems;
-                        std::vector<std::string> unpriced;
+                        std::vector<std::string> names;
                         for (const auto& place : ORE_LOCATIONS) {
                             if (place.family != family) continue;
-                            const std::string gem = place.mineral;
-                            if (!pickedGem.empty() && gem != pickedGem) continue;
-                            const bool seen = std::any_of(gems.begin(), gems.end(), [&](const auto& g2) { return g2.first == gem; }) ||
-                                              std::find(unpriced.begin(), unpriced.end(), gem) != unpriced.end();
-                            if (seen) continue;
-                            const UexOffer* best = nullptr;
-                            for (const char* suffix : {"", " (Ore)", " (Raw)"}) {
-                                const auto& offers = uexPrices_->offersFor(gem + suffix);
-                                if (!offers.empty()) {
-                                    best = &offers.front();
-                                    break;
-                                }
-                            }
-                            if (best) gems.push_back({gem, best});
-                            else unpriced.push_back(gem);
+                            if (!pickedGem.empty() && place.mineral != pickedGem) continue;
+                            if (std::find(names.begin(), names.end(), place.mineral) != names.end()) continue;
+                            names.push_back(place.mineral);
                         }
-                        std::sort(gems.begin(), gems.end(), [](const auto& a, const auto& b) { return a.second->price > b.second->price; });
-                        for (const auto& gem : gems) {
-                            sellLines.push_back(lineOf(toW(gem.first), *gem.second, toW(gem.second->terminal) + L"  \u00B7  "));
+                        const UexPrices::GemSales sales = uexPrices_->gemSales(names);
+                        for (const UexPrices::GemSale& gem : sales.priced) {
+                            sellLines.push_back(lineOf(toW(gem.gem), gem.offer, toW(gem.offer.terminal) + L"  \u00B7  "));
                         }
-                        if (gems.empty()) {
+                        if (sales.priced.empty()) {
                             sellNote = pickedGem.empty()
                                            ? std::wstring(L"No terminal reported buying any of these in the last 30 days")
                                            : L"No terminal reported buying " + toW(pickedGem) + L" in the last 30 days";
                         }
-                        if (!unpriced.empty() && pickedGem.empty()) {
+                        if (!sales.unpriced.empty() && pickedGem.empty()) {
                             sellTail = L"No prices reported for ";
-                            for (size_t i = 0; i < unpriced.size(); i++) {
-                                if (i) sellTail += i + 1 == unpriced.size() ? L" and " : L", ";
-                                sellTail += toW(unpriced[i]);
+                            for (size_t i = 0; i < sales.unpriced.size(); i++) {
+                                if (i) sellTail += i + 1 == sales.unpriced.size() ? L" and " : L", ";
+                                sellTail += toW(sales.unpriced[i]);
                             }
                             sellTail += L".";
                         }
                     } else {
-                        const auto& offers = uexPrices_->offersFor(plannerMineral_);
-                        if (offers.empty()) {
+                        const UexPrices::RefinedSales sales = uexPrices_->refinedSales(plannerMineral_, currentSystem_);
+                        if (sales.offers.empty()) {
                             sellNote = L"No terminal reported buying refined " + toW(plannerMineral_) +
                                        L" in the last 30 days";
                         }
-                        bool homeListed = false;
-                        for (const UexOffer& offer : offers) {
+                        for (const UexOffer& offer : sales.offers) {
                             sellLines.push_back(lineOf(toW(offer.terminal), offer, L""));
-                            if (!currentSystem_.empty() && _stricmp(offer.system.c_str(), currentSystem_.c_str()) == 0) {
-                                homeListed = true;
-                            }
                         }
-                        if (!offers.empty() && !homeListed) {
-                            if (const UexOffer* home = uexPrices_->bestIn(plannerMineral_, currentSystem_)) {
-                                SellLine line = lineOf(toW(home->terminal), *home, L"Best in your system  \u00B7  ");
-                                line.home = true;
-                                sellLines.push_back(std::move(line));
-                            }
+                        if (sales.hasHome) {
+                            SellLine line = lineOf(toW(sales.home.terminal), sales.home, L"Best in your system  \u00B7  ");
+                            line.home = true;
+                            sellLines.push_back(std::move(line));
                         }
                     }
                 }

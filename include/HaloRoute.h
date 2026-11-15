@@ -89,4 +89,24 @@ extern const HaloPlace HALO_PLACES[HALO_PLACE_COUNT];
 std::vector<const HaloPlace*> haloDestinations(const std::string& from);
 std::string nearestHaloDestination(const std::string& from);
 
+// Whether both names are places in Stanton and a route from one to the
+// other runs through the belt
+bool haloConnects(const std::string& from, const std::string& to);
+
+// The bands a route between two named places crosses; empty where either
+// name is not a place in Stanton
+std::vector<HaloPass> haloPassesNamed(const std::string& from, const std::string& to);
+
+// The Aaron Halo card's route. `pickedFrom` and `pickedTo` are what the
+// player chose; the route pair is what the star map plotted; whereSystem
+// and wherePlace are where the player is. From falls back through those to
+// ARC-L1. To is a place the route from there runs through the belt to.
+struct PlannedHalo {
+    std::string from, to;
+    bool plotted = false;
+    std::vector<HaloPass> passes;
+};
+PlannedHalo planHalo(const std::string& pickedFrom, const std::string& pickedTo, const std::string& routeFrom,
+                     const std::string& routeTo, const std::string& whereSystem, const std::string& wherePlace);
+
 }  // namespace SCMiner

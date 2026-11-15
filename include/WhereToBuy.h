@@ -51,6 +51,7 @@ public:
     bool read(const std::string& json, std::string& why);
     // ...an item's shops, by its name; empty where UEX lists none
     const std::vector<ShopOffer>& offersFor(const std::string& item) const;
+    std::vector<std::string> items() const;
     bool empty() const { return byItem_.empty(); }
     size_t itemCount() const { return byItem_.size(); }
 
@@ -84,6 +85,11 @@ std::vector<ShopInOrder> nearestFirst(const std::vector<ShopOffer>& offers, cons
 // ...one per place, as the Gear page lists them: the first of each place in
 // that order - the nearest, and of one place's shops the cheaper
 std::vector<ShopInOrder> onePerPlace(const std::vector<ShopInOrder>& shops);
+
+// Each item's shops as the Gear page lists them: nearest first from where
+// the player is, one shop per place. The window draws this; it does not sort.
+std::map<std::string, std::vector<ShopInOrder>> shopsInOrder(const UexShops& shops, const std::string& system,
+                                                             const std::string& place);
 
 // A shop's place by the name a list gives it: a gateway with the system it
 // stands in, as UEX names it - Pyro and Nyx each have a Stanton Gateway

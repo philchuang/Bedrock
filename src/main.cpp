@@ -22,7 +22,10 @@
 #include "PanelShapes.h"
 #include "TextLineReader.h"
 #include "LoadoutReader.h"
+#include "LoadoutFill.h"
+#include "LoadoutNames.h"
 #include "RockContents.h"
+#include "RockContentsRead.h"
 #include "MiningHardware.h"
 #include "DevTools.h"
 #include "DevShots.h"
@@ -188,10 +191,13 @@ int runScanPanelLive(const std::string& outDir) {
     // the thing to be measured is behind it. Desktop Duplication hands back
     // what is actually on the screen, so the game has to be the thing on it.
     for (int left = 6; left > 0; left--) {
-        std::cout << "Switch to Star Citizen - capturing in " << left << " ... " << std::flush;
+        std::cout << "
+Switch to Star Citizen - capturing in " << left << " ... " << std::flush;
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    std::cout << "                                          " << std::flush;
+    std::cout << "
+                                          
+" << std::flush;
 
     SCMiner::ScreenCapture capture;
     cv::Rect area(GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
@@ -4461,12 +4467,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             } else {
                 for (int k = i + 1; k < __argc; k++) files.push_back(__argv[k]);
             }
+            SCMiner::installLoadoutResolve();
             for (const std::string& file : files) {
                 const cv::Mat frame = cv::imread(file, cv::IMREAD_COLOR);
                 if (frame.empty()) continue;
                 const auto started = std::chrono::steady_clock::now();
                 SCMiner::SeenLoadout seen;
                 SCMiner::readSeenLoadout(frame, *lines, seen);
+                SCMiner::fillSeenLoadout(seen);
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
                 std::cout << std::filesystem::path(file).filename().string() << ": table "
                           << (seen.tableFound ? "" : "not ") << "found " << seen.score << " at " << seen.table.x << ","
@@ -4484,7 +4492,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 if (!seen.tableFound) {
                     std::string line;
                     const auto turretStarted = std::chrono::steady_clock::now();
-                    const SCMiner::MiningLaser* turret = SCMiner::readTurretLaser(frame, *lines, &line);
+                    const bool turretFound = SCMiner::readTurretLaser(frame, *lines, &line);
+                    const SCMiner::MiningLaser* turret = turretFound ? SCMiner::turretLaserByHudLine(line) : nullptr;
                     const double turretMs =
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - turretStarted).count();
                     std::cout << "  turret laser '" << line << "' -> " << (turret ? turret->name : "-") << "; "

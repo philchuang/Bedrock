@@ -24,6 +24,8 @@
 #include "LaserRange.h"
 #include "ToneMap.h"
 #include "LoadoutReader.h"
+#include "LoadoutFill.h"
+#include "LoadoutNames.h"
 #include "MiningHardware.h"
 #include "P4kReader.h"
 #include "GameState.h"
@@ -42,6 +44,7 @@
 #include "RefiningData.h"
 #include "ScanPanel.h"
 #include "RockContents.h"
+#include "RockContentsRead.h"
 #include "RockScans.h"
 #include "Feedback.h"
 #include "DebugZip.h"
@@ -54,6 +57,7 @@
 #include "RefineryShare.h"
 #include "CommodityTerminal.h"
 #include "Datarunner.h"
+#include "DatarunnerRead.h"
 #include "UexPrices.h"
 #include "HaloRoute.h"
 #include "WhereToBuy.h"
@@ -222,6 +226,7 @@ static cv::Mat testFrame1080() {
 }  // namespace
 
 int runSelfTest() {
+    SCMiner::installLoadoutResolve();
     std::cout << "\n=== Bedrock self-test ===\n" << std::endl;
     bool allPassed = true;
 
@@ -2389,33 +2394,33 @@ int runSelfTest() {
 
         // The book: a quote read once, the order it became read twice - then
         // a minute later, a garbled reading, another station, a second order
-        using SCMiner::RefineryBar;
-        using SCMiner::RefineryPanel;
-        using SCMiner::RefineryScreen;
+        using SCMiner::RefineryKind;
+        using SCMiner::RefineryOrderPanel;
+        using SCMiner::RefineryReading;
         auto row = [](const char* material, int quality, int quantity, int yield) {
-            SCMiner::RefineryRow r;
+            SCMiner::RefineryOrderRow r;
             r.material = material;
             r.quality = quality;
             r.quantity = quantity;
             r.yield = yield;
             return r;
         };
-        RefineryPanel setup;
-        setup.kind = RefineryBar::Band::Setup;
+        RefineryOrderPanel setup;
+        setup.kind = RefineryKind::Setup;
         setup.method = "Pyrometric Chromalysis";
         setup.cost = 194;
         setup.seconds = 442;
         setup.rows = {row("Iron (Ore)", 325, 236, -1), row("Iron (Ore)", 874, 484, 235)};
-        RefineryPanel running;
-        running.kind = RefineryBar::Band::Processing;
-        running.order = 1;
+        RefineryOrderPanel running;
+        running.kind = RefineryKind::Processing;
+        running.number = 1;
         running.rows = {row("Iron (Ore)", 874, -1, 235)};
-        auto screen = [](std::vector<RefineryPanel> panels) {
-            RefineryScreen s;
+        auto screen = [](std::vector<RefineryOrderPanel> panels) {
+            RefineryReading s;
             s.panels = std::move(panels);
             return s;
         };
-        auto at = [](RefineryPanel p, int seconds) {
+        auto at = [](RefineryOrderPanel p, int seconds) {
             p.seconds = seconds;
             return p;
         };
@@ -2430,14 +2435,14 @@ int runSelfTest() {
                             first.parts.size() == 1 && first.parts[0].quantity == 484 && first.complete();
         book.take("Levski", screen({at(running, 380)}), t0 + 64);
         const bool later = !book.take("Levski", screen({at(running, 379)}), t0 + 65) && book.orders().size() == 1;
-        RefineryPanel garbled = at(running, 378);
+        RefineryOrderPanel garbled = at(running, 378);
         garbled.rows[0].quality = -1;
         const bool notGarbled = !book.take("Levski", screen({garbled}), t0 + 66) &&
                                 !book.take("Levski", screen({garbled}), t0 + 67) && book.orders().size() == 1;
         const bool notElsewhere = !book.take("Checkmate", screen({at(running, 300)}), t0 + 144) &&
                                   book.orders().size() == 1;
-        RefineryPanel second = running;
-        second.order = 2;
+        RefineryOrderPanel second = running;
+        second.number = 2;
         second.rows = {row("Iron (Ore)", 325, -1, 114)};
         book.take("Levski", screen({at(running, 300), at(second, 209)}), t0 + 144);
         book.take("Levski", screen({at(running, 299), at(second, 208)}), t0 + 145);
@@ -2457,14 +2462,14 @@ int runSelfTest() {
         // its quote's list showing the last rows only - one order, four parts,
         // the quote on it; and an Iron quality Iron does not come in dropped
         SCMiner::RefineryOrderBook scrolled;
-        RefineryPanel bigQuote = setup;
+        RefineryOrderPanel bigQuote = setup;
         bigQuote.cost = 1210;
         bigQuote.seconds = 3600;
         bigQuote.rows = {row("Gold (Ore)", 553, 120, 54), row("Copper (Ore)", 652, 300, 135)};
-        RefineryPanel top = running;
-        top.order = 3;
+        RefineryOrderPanel top = running;
+        top.number = 3;
         top.rows = {row("Quantainium (Raw)", 669, -1, 210), row("Bexalite (Raw)", 756, -1, 88)};
-        RefineryPanel bottom = top;
+        RefineryOrderPanel bottom = top;
         bottom.rows = {row("Gold (Ore)", 553, -1, 54), row("Copper (Ore)", 652, -1, 135)};
         scrolled.take("Checkmate", screen({bigQuote}), t0);
         scrolled.take("Checkmate", screen({at(top, 3597)}), t0 + 3);
@@ -2477,18 +2482,18 @@ int runSelfTest() {
         // first comes off on the second look - and the last over an empty
         // list, while an order still running stays
         SCMiner::RefineryOrderBook pickup;
-        RefineryPanel one = running;
-        RefineryPanel two = running;
-        two.order = 2;
+        RefineryOrderPanel one = running;
+        RefineryOrderPanel two = running;
+        two.number = 2;
         two.rows = {row("Iron (Ore)", 664, -1, 52), row("Torite (Ore)", 873, -1, 31)};
-        RefineryPanel three = running;
-        three.order = 3;
+        RefineryOrderPanel three = running;
+        three.number = 3;
         three.rows = {row("Gold (Ore)", 553, -1, 54)};
         pickup.take("Checkmate", screen({at(one, 300), at(two, 200), at(three, 4000)}), t0);
         pickup.take("Checkmate", screen({at(one, 299), at(two, 199), at(three, 3999)}), t0 + 1);
-        auto done = [](RefineryPanel p, int number) {
-            p.kind = RefineryBar::Band::Completed;
-            p.order = number;
+        auto done = [](RefineryOrderPanel p, int number) {
+            p.kind = RefineryKind::Completed;
+            p.number = number;
             p.seconds = -1;
             return p;
         };
@@ -2502,13 +2507,13 @@ int runSelfTest() {
         const bool notWithoutNotice = pickup.orders().size() == 3;
         // ...under the notice with neither panel read, no telling which of
         // the two went: both stay; the other read, the first comes off
-        RefineryScreen unread;
+        RefineryReading unread;
         unread.delivered = true;
         pickup.take("Checkmate", unread, t0 + 404);
         const bool notOnOneLook = pickup.orders().size() == 3;
         pickup.take("Checkmate", unread, t0 + 405);
         const bool notWhenUnsure = pickup.orders().size() == 3;
-        RefineryScreen delivered = screen({done(two, 1)});
+        RefineryReading delivered = screen({done(two, 1)});
         delivered.delivered = true;
         pickup.take("Checkmate", delivered, t0 + 406);
         const bool firstOff = pickup.orders().size() == 2 && pickup.orders()[0].parts.size() == 2 &&
@@ -2517,7 +2522,7 @@ int runSelfTest() {
         pickup.take("Checkmate", unread, t0 + 407);
         pickup.take("Checkmate", unread, t0 + 408);
         const bool oneEach = pickup.orders().size() == 2;
-        RefineryScreen emptied;
+        RefineryReading emptied;
         emptied.delivered = true;
         pickup.take("Checkmate", emptied, t0 + 430);
         pickup.take("Checkmate", emptied, t0 + 431);
@@ -2543,12 +2548,12 @@ int runSelfTest() {
         // first order was: each order its own quote - not the newest for both
         // (one job went to UEX, the other did not, 15 October 2026)
         SCMiner::RefineryOrderBook pair;
-        RefineryPanel quoteB = setup;
+        RefineryOrderPanel quoteB = setup;
         quoteB.cost = 201;
         quoteB.seconds = 470;
         quoteB.rows = {row("Iron (Ore)", 874, 500, 243)};
-        RefineryPanel orderB = running;
-        orderB.order = 2;
+        RefineryOrderPanel orderB = running;
+        orderB.number = 2;
         orderB.rows = {row("Iron (Ore)", 874, -1, 243)};
         pair.take("Levski", screen({setup}), t0);
         pair.take("Levski", screen({quoteB}), t0 + 22);
@@ -2559,8 +2564,8 @@ int runSelfTest() {
                              pair.orders()[1].complete() && pair.orders()[1].placed == t0 + 24;
         // ...the same job set up twice: two quotes, an order each
         SCMiner::RefineryOrderBook twin;
-        RefineryPanel running2 = running;
-        running2.order = 2;
+        RefineryOrderPanel running2 = running;
+        running2.number = 2;
         twin.take("Levski", screen({setup}), t0);
         twin.take("Levski", screen({at(running, 440)}), t0 + 4);
         twin.take("Levski", screen({at(running, 439)}), t0 + 5);
@@ -2578,7 +2583,7 @@ int runSelfTest() {
         late.take("Levski", screen({at(running, 144)}), t0 + 301);
         const bool lateQuoted = late.orders().size() == 1 && late.orders()[0].complete() && late.orders()[0].placed == t0 + 3;
         SCMiner::RefineryOrderBook stranger;
-        RefineryPanel gold = running;
+        RefineryOrderPanel gold = running;
         gold.rows = {row("Gold (Ore)", 553, -1, 54)};
         stranger.take("Levski", screen({setup}), t0);
         stranger.take("Levski", screen({at(gold, 145)}), t0 + 300);
@@ -2599,29 +2604,29 @@ int runSelfTest() {
         // 23 s on - one order, not a second beside it; the other order read
         // then its own
         SCMiner::RefineryOrderBook rounded;
-        RefineryPanel quoteBig = setup;
+        RefineryOrderPanel quoteBig = setup;
         quoteBig.cost = 133210;
         quoteBig.seconds = 15240;
         quoteBig.rows = {row("Stileron (Ore)", 330, 5916, 2662), row("Stileron (Ore)", 517, 622, 279),
                          row("Stileron (Ore)", 681, 612, 275)};
-        RefineryPanel big = running;
-        big.order = 2;
+        RefineryOrderPanel big = running;
+        big.number = 2;
         big.rows = {row("Stileron (Ore)", 330, -1, 2662), row("Stileron (Ore)", 517, -1, 279),
                     row("Stileron (Ore)", 681, -1, 275)};
-        RefineryPanel quoteSmall = setup;
+        RefineryOrderPanel quoteSmall = setup;
         quoteSmall.cost = 10474;
         quoteSmall.seconds = 1854;
         quoteSmall.rows = {row("Stileron (Ore)", 747, 558, 253)};
-        RefineryPanel small2 = running;
-        small2.order = 2;
+        RefineryOrderPanel small2 = running;
+        small2.number = 2;
         small2.rows = {row("Stileron (Ore)", 747, -1, 253)};
         const long long t1 = 1794139300;
         rounded.take("Checkmate", screen({quoteBig}), t1);
         rounded.take("Checkmate", screen({at(big, 15180)}), t1 + 48);
         rounded.take("Checkmate", screen({at(big, 15180)}), t1 + 49);
         rounded.take("Checkmate", screen({quoteSmall}), t1 + 60);
-        RefineryPanel bigUp = big;
-        bigUp.order = 1;
+        RefineryOrderPanel bigUp = big;
+        bigUp.number = 1;
         rounded.take("Checkmate", screen({at(bigUp, 15180), at(small2, 1844)}), t1 + 72);
         rounded.take("Checkmate", screen({at(bigUp, 15180), at(small2, 1843)}), t1 + 73);
         const auto& roundedOrders = rounded.orders();
@@ -2631,7 +2636,7 @@ int runSelfTest() {
         // ...its quote although the two roundings put it placed 39 s before
         // the quote was last seen (from 15 s it went without)
         SCMiner::RefineryOrderBook early;
-        RefineryPanel quoteIron = setup;
+        RefineryOrderPanel quoteIron = setup;
         quoteIron.seconds = 7260;
         quoteIron.rows = {row("Iron (Ore)", 874, 484, 235)};
         early.take("Levski", screen({quoteIron}), t1);
@@ -2643,8 +2648,8 @@ int runSelfTest() {
         // quote; and a long list scrolled to other parts half a minute on
         // still the one order
         SCMiner::RefineryOrderBook alike;
-        RefineryPanel running2Long = running;
-        running2Long.order = 2;
+        RefineryOrderPanel running2Long = running;
+        running2Long.number = 2;
         alike.take("Levski", screen({quoteIron}), t1);
         alike.take("Levski", screen({at(running, 7260)}), t1 + 5);
         alike.take("Levski", screen({at(running, 7260)}), t1 + 6);
@@ -2655,10 +2660,10 @@ int runSelfTest() {
                               alike.orders()[1].number == 2 && alike.orders()[0].complete() &&
                               alike.orders()[1].complete();
         SCMiner::RefineryOrderBook scrolledLong;
-        RefineryPanel topLong = running;
-        topLong.order = 3;
+        RefineryOrderPanel topLong = running;
+        topLong.number = 3;
         topLong.rows = {row("Quantainium (Raw)", 669, -1, 210), row("Bexalite (Raw)", 756, -1, 88)};
-        RefineryPanel bottomLong = topLong;
+        RefineryOrderPanel bottomLong = topLong;
         bottomLong.rows = {row("Gold (Ore)", 553, -1, 54), row("Copper (Ore)", 652, -1, 135)};
         scrolledLong.take("Checkmate", screen({at(topLong, 7200)}), t1);
         scrolledLong.take("Checkmate", screen({at(topLong, 7200)}), t1 + 1);
@@ -7371,6 +7376,7 @@ int runSelfTest() {
                 hud.copyTo(screen(cv::Rect(1772, 590, hud.cols, hud.rows)));
                 SCMiner::SeenLoadout seen;
                 SCMiner::readSeenLoadout(screen, *reader, seen);
+                SCMiner::fillSeenLoadout(seen);
                 std::string got = seen.laser ? seen.laser->name : "-";
                 for (const SCMiner::MiningModule* m : seen.modules) got += std::string(", ") + m->name;
                 std::vector<std::string> names;
@@ -7476,7 +7482,8 @@ int runSelfTest() {
                     cv::Mat screen(1440, 5120, CV_8UC3, cv::Scalar(0, 0, 0));
                     cut.copyTo(screen(cv::Rect(t.x, t.y, cut.cols, cut.rows)));
                     std::string line;
-                    const SCMiner::MiningLaser* laser = SCMiner::readTurretLaser(screen, *reader, &line);
+                    const bool found = SCMiner::readTurretLaser(screen, *reader, &line);
+                    const SCMiner::MiningLaser* laser = found ? SCMiner::turretLaserByHudLine(line) : nullptr;
                     allPassed &= check(laser && std::string(laser->name) == t.laser,
                                        std::string("...and a turret's HUD reads as ") + t.laser + " (got '" + line + "')");
                 }
@@ -7489,14 +7496,15 @@ int runSelfTest() {
                         cv::Mat screen(1440, 2560, CV_8UC3, cv::Scalar(0, 0, 0));
                         cut.copyTo(screen(cv::Rect(387, 849, cut.cols, cut.rows)));
                         std::string line;
-                        const SCMiner::MiningLaser* laser = SCMiner::readTurretLaser(screen, *reader, &line);
+                        const bool found = SCMiner::readTurretLaser(screen, *reader, &line);
+                        const SCMiner::MiningLaser* laser = found ? SCMiner::turretLaserByHudLine(line) : nullptr;
                         allPassed &= check(laser && std::string(laser->name) == "Hofstede-S2 Mining Laser",
                                            "...and on a 16:9 screen since 4.10.3, the line higher up (got '" + line + "')");
                     }
                 }
                 if (reader) {
                     const cv::Mat blank(1440, 5120, CV_8UC3, cv::Scalar(0, 0, 0));
-                    allPassed &= check(SCMiner::readTurretLaser(blank, *reader) == nullptr,
+                    allPassed &= check(!SCMiner::readTurretLaser(blank, *reader),
                                        "...and a screen with no turret's HUD names no laser");
                 }
             }

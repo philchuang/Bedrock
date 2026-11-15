@@ -7,7 +7,8 @@
 #include <string>
 #include <vector>
 
-#include "MiningAdvice.h"
+#include "OreNames.h"
+#include "RockStats.h"
 #include "OCREngine.h"
 #include "GlyphReader.h"
 
@@ -378,11 +379,6 @@ cv::Rect panelSpotWindow(const PanelSpot& spot, const cv::Size& frame);
 // is worth its cost: the column's bar less what the reading may make up.
 double glanceAtPanelSpot(const PanelSpot& spot, const cv::Mat& window);
 double glanceBar(const PanelSpot& spot);
-
-// An ore's name as Tesseract read it, snapped to the nearest mineral the game
-// has and written as the app writes it ("Ice"); empty when nothing is near
-// enough.
-std::string snapOreName(const std::string& read);
 
 // ...and the same name read off its row by the second reader, snapped the
 // same way. The download carries no Tesseract data, so on a fresh install

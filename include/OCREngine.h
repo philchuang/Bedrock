@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ReadingPolicy.h"
+
 #include <string>
 #include <optional>
 #include <functional>
@@ -11,7 +13,7 @@
 #ifdef BEDROCK_TESSERACT
 #include <tesseract/baseapi.h>
 #endif
-#include "MiningData.h"
+#include "ReadLimits.h"
 
 namespace SCMiner {
 
@@ -34,21 +36,11 @@ public:
     // so the signature path keeps its digits-only rule.
     std::string recognizeLine(const cv::Mat& image, const char* whitelist);
 
-    // Domain knowledge the consensus vote uses to judge raw readings.
-    struct ReadingPolicy {
-        // Repairs a misread to its unique table value (identity if unknown).
-        // Applied BEFORE voting so renderings that fail on different digits
-        // still converge on the same candidate.
-        std::function<int(int)> canonicalize;
-        // Rates how well a value fits the signature table.
-        std::function<double(int)> bonus;
-    };
-
     // Runs recognizeNumber on several preprocessed candidates (one per
     // contrast channel/variant) and returns the value they agree on.
     // Confidence and raw text afterwards refer to the winning candidate.
     std::optional<int> recognizeBest(const std::vector<cv::Mat>& candidates,
-                                     const ReadingPolicy& policy = {});
+                                     const SCMiner::ReadingPolicy& policy = {});
 
     // Returns the confidence of the last recognition (0-100)
     double getLastConfidence() const;
