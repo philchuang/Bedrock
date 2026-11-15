@@ -158,13 +158,69 @@ The Lua host moves into the core and keeps the `bedrock` table in `Plugins.h`. E
 
 The sandbox is the part that has to be re-proved: no files, no processes, no network beyond what `bedrock` hands over, an 8 ms budget, and a fault that stops that plugin only. Wikelo and Blackbox are the acceptance test. The host lands when the window can paint a list the core hands it.
 
+## Split the C++ first
+
+Do this before any C#. The files already suggest three concerns, and the includes do not follow them. `MinerGUI.h` includes `RefineryOrders.h`, `RockContents.h`, and `Datarunner.h`, and those include OpenCV. `LoadoutReader` returns a `const MiningLaser*` into the generated table. `RefineryOrders` stores a `RefineryScreen`, whose panels carry a `cv::Rect`. The gear page, the rock view, and the Ore Finder call `nearestFirst`, `resistanceLetsThrough`, `navPoint`, and `offersFor` while painting. `Application` owns the scan and the window together.
+
+Until those are undone, extracting a reader library means taking the window's headers with it. Each step below leaves the executable shipping and `--selftest` green. No C ABI yet, and no change to what a player sees.
+
+The fence, applied at the end of the last step and kept afterwards: a rules target that does not include OpenCV or Win32, a reader target that does not include `MinerGUI.h`, and a window whose headers do not include a header that includes OpenCV. CMake is what enforces it. A comment will not.
+
+### A. Results the window can hold
+
+Give the window and the save files a result type with no `cv::` in it.
+
+- `RockContents.h` splits. The part list (`RockPartRead` and the check that the shares add up) stays a plain header. `readRockContents` and `rockContentsRegion` move to a reader header the window does not include.
+- `RefineryPanel::bar` stays in the reader. The book stores orders, not the screen geometry. `RefineryOrders::apply` takes the fields it already persists (number, parts, method, cost, time, station text) rather than a `RefineryScreen`. `RefineryOrders.h` stops including `RefineryTerminal.h`.
+- `Datarunner::Row` keeps its text, its certainties, and its crop as tightly packed BGRA plus a width and a height. `cv::Mat snippet` and `cv::Rect card` stay inside the reader .cpp. The window's resize of that crop becomes a scale of those bytes, or the reader scales it before handing it over. `Datarunner.h` stops including OpenCV.
+
+`GlyphReader::readByGrid` already takes the candidate values and an `accept` function from outside. Leave that. It is the right shape: the reader scores pixels, and someone else says which integers are legal.
+
+### B. Names resolved next to the tables
+
+A reader returns the line it read.
+
+- `SeenLoadout` keeps `laserText` and `moduleTexts`. `laser` and `modules` are filled by `laserByHudLine` and `turretLaserByHudLine`, called from `Application` after the read, not from inside `LoadoutReader`.
+- A Datarunner row's commodity id, UEX name, and cargo-box sizes are filled after the read, beside `TradeBook` and the UEX tables. The reader returns the name and the figures it saw, and how sure it is.
+- `makeReadingPolicy` stays the injection point it is. The scan calls it. The reader library does not compile the ore tables in. When the tables later move to C#, the supplier of that callback changes and the glyph matcher does not.
+
+### C. Paint receives an answer
+
+The window stops deciding.
+
+- Gear: `Application` computes `onePerPlace(nearestFirst(...))` when the place or the shop list changes, and hands the window the ordered rows.
+- Rock view: `Application` computes `resistanceLetsThrough` and the break answer when the rock or the loadout changes, and hands the window the figures it draws.
+- Ore Finder and the Halo calculator: `Application` resolves `navPoint` and the shop offers, and hands the window distances and prices.
+
+The paint functions format text and place rectangles. A new rule in a paint function is the same failure as a parser in a view model later.
+
+### D. The scan leaves `Application`
+
+Move the grab, the readers, the recent-read window, the agreed-value cache, and marker tracking into one class, `ScanSession`, in its own sources. It does not include `MinerGUI.h`. It accepts an aim box, live mode, cover rectangles, and a reading policy. It returns the same structs the window is handed today.
+
+`Application` keeps the log, the HTTP pollers, the plugin host, and the window callbacks. On a reading it updates the page models from step C and calls `updateResults`, `updateRock`, and the rest. The `breathe` pump, which yields to the window mid-scan, stays a callback `ScanSession` calls. It is the one edge back toward the window, and it is a function with no type of the window in it.
+
+`PhoneServer` and the GDI+ painting stay with the executable. They are not part of `ScanSession`. `ColourScheme` stays data the window reads.
+
+### E. Three CMake targets
+
+| Target | Holds | Must not include |
+|---|---|---|
+| `bedrock_rules` | Tables, `SignatureAnalyzer`, `MiningAdvice`, `WhereToBuy`, `HaloRoute`, `GameState`, `TradeBook`, `BlueprintLibrary`, `Reputation`, `RefineryOrders`, the UEX JSON parsers | OpenCV, Win32, `MinerGUI.h` |
+| `bedrock_read` | Capture, the readers, `ScanSession`, glyph and model blobs | `MinerGUI.h`, the ore-table headers |
+| the executable | `Application`, `MinerGUI`, `PhoneServer`, HTTP, plugins, the Linux shim | a reader header that mentions `cv::` |
+
+`bedrock_read` may call a function pointer supplied by the executable. It may not include `SignatureAnalyzer.h` to get the table for itself. `bedrock_rules` is what a later C# port translates. `bedrock_read` is what it links.
+
+Exit: `--selftest` passes, a live session behaves as before, and the three targets fail to configure if the includes grow back. Step 1 below is then a matter of building `bedrock_read` as a DLL, which is a build change rather than an untangle.
+
 ## How to perform it
 
-Each step leaves a program that still builds, still passes `--selftest`, and can still be shipped. The reader is extracted before the window is rewritten, so a Star Citizen patch during the port lands in one reader rather than in two trees.
+Each step leaves a program that still builds, still passes `--selftest`, and can still be shipped. The reader is extracted before the window is rewritten, so a Star Citizen patch during the port lands in one reader rather than in two trees. The C++ split above is already done.
 
 ### 1. Library, same executable
 
-Move the reader sources and the scan state machine behind a C++ class the existing `Application` calls. The class returns the structs the code already uses (`RockStats`, `RefineryScreen`, `SeenLoadout`, and the rest). `Application` keeps the window, the log, and HTTP.
+Build `bedrock_read` as a DLL the executable loads, with the C++ class from the split (`ScanSession`) as its surface. `Application` keeps the window, the log, and HTTP, and still supplies the reading policy.
 
 Exit: the current executable, linked against the new library, passes `--selftest` and a live session behaves as before. No C# yet.
 
@@ -239,7 +295,7 @@ The update manifest gains a second file, the reader library, and the apply step 
 
 ## Risks worth remembering
 
-- **The cut is `Application.cpp`.** About 6,500 lines refer to both the scan and the window. Step 1 is the dangerous step. Do it while the UI is still the C++ UI, so a regression is a C++ bug.
+- **The cut is `Application.cpp`.** About 6,500 lines refer to both the scan and the window. Step D of the C++ split is that cut. Do it while the UI is still the C++ UI, so a regression is a C++ bug. Step 1 only changes how the resulting class is linked.
 - **Cover rectangles.** The Windows grab sees the overlay. The list passed to `bedrock_set_covers` has to include every Bedrock window, including the overlay, on every grab.
 - **Priority.** Lower the scan thread, not the process.
 - **Plugins.** The sandbox will not match until Wikelo and Blackbox have been run. A Lua fault must not take the process down.
