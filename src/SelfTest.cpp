@@ -5,6 +5,7 @@
 // both sides (EmbeddedData); beside a build, the ones under tests/ are taken
 // instead.
 #include "SelfTest.h"
+#include "ScreenCapture.h"
 
 #include "DevSwitch.h"
 #include "Application.h"
@@ -9158,13 +9159,13 @@ int runSelfTest() {
     // it, short of the cockpit's own figures
     {
         int margin = 0;
-        const auto wide = SCMiner::Application::defaultAimBox(cv::Rect(0, 0, 5120, 1440), &margin);
+        const auto wide = SCMiner::defaultAimBox(cv::Rect(0, 0, 5120, 1440), &margin);
         allPassed &= check(std::abs(wide.x - 2384) <= 6 && std::abs(wide.y - 385) <= 2 &&
                            std::abs(wide.width - 352) <= 2 && std::abs(wide.height - 180) <= 2 && margin == 250,
                            "5120x1440 gives the measured aim box (got " + std::to_string(wide.x) + "," +
                            std::to_string(wide.y) + " " + std::to_string(wide.width) + "x" +
                            std::to_string(wide.height) + ", margin " + std::to_string(margin) + ")");
-        const auto hd = SCMiner::Application::defaultAimBox(cv::Rect(2560, 0, 1920, 1080), &margin);
+        const auto hd = SCMiner::defaultAimBox(cv::Rect(2560, 0, 1920, 1080), &margin);
         allPassed &= check(hd.x + hd.width / 2 == 2560 + 960 && std::abs(hd.height - 135) <= 1 &&
                            std::abs(hd.width - 264) <= 1 && margin == 188 && hd.y > 0 && hd.y < 400,
                            "1920x1080 on a second monitor scales the box with the height and keeps it there");

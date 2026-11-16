@@ -19,6 +19,9 @@ const MiningLaser* turretLaserByHudLine(const std::string& line);
 // A module's block in the HUD's list - its name, and the lines under it that
 // say what it does.
 const MiningModule* moduleByHudBlock(const std::string& nameLine, const std::vector<std::string>& below);
+// Whether a scan panel is looked for: not while the log has the player in
+// the seat of a ship that cannot mine. Defined beside the HUD reader.
+bool panelsWanted(const std::string& logShip, bool inSeat);
 // Whether the table's Head column, as read (-1 where nothing was), is what
 // this laser and these modules make of it.
 bool headColumnAgrees(const MiningLaser& laser, const std::vector<const MiningModule*>& modules, const int head[6],

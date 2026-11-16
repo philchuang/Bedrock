@@ -166,23 +166,23 @@ The fence, applied at the end of the last step and kept afterwards: a rules targ
 
 ### Where the split stands
 
-A, B, C, and the libraries of E are in the tree. `--selftest` passes on that tree. `bedrock_read` is a static library. It is not the DLL in step 1, and there is no C ABI. D is not done: `Application` still owns the scan and the window together, and its headers still include reader headers that mention `cv::`.
+A, B, C, D, and the libraries of E are in the tree. `--selftest` passes on that tree. `bedrock_read` is a static library. It is not the DLL in step 1, and there is no C ABI.
 
 **A is done.** `RockContents.h` is the part list and the share-sum check. `readRockContents` and `rockContentsRegion` are in `RockContentsRead.h`, which the window does not include. The book stores a `RefineryReading`: orders, method, cost, time, station text, capacity, workload. `RefineryOrders.h` does not include `RefineryTerminal.h`. The converter from a `RefineryScreen` lives next to the reader. `Datarunner::Row` keeps its text, its certainties, and its crop as tightly packed BGRA plus a width and a height. The window scales those bytes. `cv::Mat` and `cv::Rect` stay in `DatarunnerRead.h` and the reader `.cpp`. `Datarunner.h` does not include OpenCV.
 
-**B is done.** `SeenLoadout` keeps `laserText`, `moduleTexts`, and `moduleBelow`. `LoadoutReader` does not name a laser or a module. After the read, `Application` calls `fillSeenLoadout`, which calls `laserByHudLine` and `moduleByHudLine`. During the read the reader calls function pointers installed by `installLoadoutResolve`, so it does not include `MiningHardware.h`. A Datarunner row's commodity id, UEX name, and cargo-box sizes are still filled by `match()` after the read. `makeReadingPolicy` is a `ReadingPolicy` of its own, not a type inside `OCREngine`, so `SignatureAnalyzer.h` does not include OpenCV. The policy carries the signature queries. The scan still calls `SignatureAnalyzer` directly. Pointing it at the policy belongs with the move in D.
+**B is done.** `SeenLoadout` keeps `laserText`, `moduleTexts`, and `moduleBelow`. `LoadoutReader` does not name a laser or a module. After the read, `Application` calls `fillSeenLoadout`, which calls `laserByHudLine` and `moduleByHudLine`. During the read the reader calls function pointers installed by `installLoadoutResolve`, so it does not include `MiningHardware.h`. A Datarunner row's commodity id, UEX name, and cargo-box sizes are still filled by `match()` after the read. `makeReadingPolicy` is a `ReadingPolicy` of its own, not a type inside `OCREngine`, so `SignatureAnalyzer.h` does not include OpenCV. The policy carries the signature queries. The scan calls those through the policy `Application` passes in. It does not call `SignatureAnalyzer` itself.
 
 **C is done for gear, and the other pages call the rules instead of writing them in the paint.** When the place or the shop list changes, `Application` calls `shopsInOrder` and hands the window the ordered rows (`setGearOrder`). The gear paint draws those rows. It does not call `nearestFirst`. The rock formula is still `MinerGUI::rockVerdict`. The firing heads, the gadget, and the loadout edits live in the window, so `Application` does not own that computation. Paint does not call the formula. `rockAnswer` caches the verdict and recomputes it when the rock, the loadout, the heads, or the gadget change, and both rock views draw that cache. `planHalo`, `haloPassesNamed`, and `haloConnects` are in `HaloRoute`. `gemSales` and `refinedSales` are in `UexPrices`. The window copies those results and measures text. It does not call `navPoint` or `offersFor`. `Application` does not precompute the halo or the sell list. The places and the mineral the player picked live in the window.
 
-**D is not done.** There is no `ScanSession`. The grab, the readers, the recent-read window, the agreed-value cache, and marker tracking are still members and methods of `Application`.
+**D is done.** `ScanSession` owns one mining scan: the grab, the rock look, the signature scan, the recent-read window, the agreed-value cache, and marker tracking. `Application` applies what the session returns, the rock before the signature half, and still owns the log, the pollers, and the window. `RefineryGlance` and `DatarunnerEyes` own the other two picture loops. `Application.h` and `Application.cpp` do not include a reader header that mentions `cv::`.
 
-**E is the three libraries. The executable fence does not yet cover `Application`.** `bedrock_rules`, `bedrock_read`, and `bedrock_host` are static libraries on Windows and on Linux. The executable keeps `Application`, `MinerGUI`, the updater, and the developer tools (`SelfTest`, `DevTools`, `DevShots`, `main`). `PhoneServer`, plugins, paths, and `ColourScheme` are `bedrock_host`. `UexKey` (the DPAPI seal) is a source of the executable, so `UexReports.cpp` does not include `windows.h`. `cmake/BedrockFence.cmake` fails configure when:
+**E is the three libraries. The executable fence walks `Application.h` and `Application.cpp`.** `bedrock_rules`, `bedrock_read`, and `bedrock_host` are static libraries on Windows and on Linux. The executable keeps `Application`, `MinerGUI`, the updater, and the developer tools (`SelfTest`, `DevTools`, `DevShots`, `main`). `PhoneServer`, plugins, paths, and `ColourScheme` are `bedrock_host`. `UexKey` (the DPAPI seal) is a source of the executable, so `UexReports.cpp` does not include `windows.h`. `cmake/BedrockFence.cmake` fails configure when:
 
 - a rules source reaches OpenCV, `windows.h`, or `MinerGUI.h`
 - a reader source reaches `MinerGUI.h` or an ore-table header: `MiningHardware.h`, `MiningLocations.h`, `CommodityData.h`, `RefineryData.h`, `RefiningData.h`, `CraftingData.h`, `GameTextMarks.h`, `NavPlaces.h`, `SignatureAnalyzer.h`, `MiningData.h`, `MiningAdvice.h`
-- `MinerGUI.h` or `MinerGUI.cpp` includes a project header that mentions `cv::`
+- `MinerGUI.h`, `MinerGUI.cpp`, `Application.h`, or `Application.cpp` includes a project header that mentions `cv::`
 
-`MinerGUI.cpp` may include OpenCV itself. That is how the window decodes a JPEG or a PNG it shows. The fence does not walk `Application.cpp` or `Application.h` until D, because those files still include the readers. `SelfTest`, `DevTools`, `DevShots`, and `main` may include reader headers. They are the developer tools.
+`MinerGUI.cpp` may include OpenCV itself. That is how the window decodes a JPEG or a PNG it shows. The fence walks `include/Application.h` and `src/Application.cpp` with that check on. `SelfTest`, `DevTools`, `DevShots`, and `main` may include reader headers. They are the developer tools.
 
 ### A. Results the window can hold
 
@@ -234,7 +234,7 @@ Exit: `--selftest` passes, a live session behaves as before, and the three targe
 
 ## How to perform it
 
-Each step leaves a program that still builds, still passes `--selftest`, and can still be shipped. The reader is extracted before the window is rewritten, so a Star Citizen patch during the port lands in one reader rather than in two trees. The C++ split above is not finished. A, B, C, and the static libraries of E are in. D is not, so step 1 is not yet a build change. Finish `ScanSession`, and extend the fence to `Application.h` and `Application.cpp`, before building the DLL.
+Each step leaves a program that still builds, still passes `--selftest`, and can still be shipped. The reader is extracted before the window is rewritten, so a Star Citizen patch during the port lands in one reader rather than in two trees. The C++ split above is done. `ScanSession` is in, and the fence walks `Application.h` and `Application.cpp`. Step 1 is a build change: link that class as a DLL.
 
 ### 1. Library, same executable
 

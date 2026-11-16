@@ -17,6 +17,13 @@ struct LoadoutResolve {
     bool (*moduleBlock)(const std::string& name, const std::vector<std::string>& below) = nullptr;
     bool (*headAgrees)(const std::string& laserText, const std::vector<std::string>& moduleNames,
                        const std::vector<std::vector<std::string>>& below, const int* head, const double* sure) = nullptr;
+    // laser id, then the module ids sorted, joined with '+'. Empty when the
+    // line does not name a laser or a module - the same key takeSeenLoadout
+    // built beside the table.
+    std::string (*fitKey)(const std::string& laserText, const std::vector<std::string>& moduleNames,
+                          const std::vector<std::vector<std::string>>& below) = nullptr;
+    // the turret laser's id, or empty. "HELIX U" and "HELIX II" are one laser.
+    std::string (*turretKey)(const std::string& line) = nullptr;
 };
 
 void setLoadoutResolve(LoadoutResolve resolve);

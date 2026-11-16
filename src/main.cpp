@@ -16,6 +16,7 @@
 #include <Windows.h>
 #include <opencv2/opencv.hpp>
 #include "Application.h"
+#include "ScreenCapture.h"
 #include "GameState.h"
 #include "GamePlaces.h"
 #include "ScanPanel.h"
@@ -4906,7 +4907,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             std::cout << "Game viewport: " << viewport->width << "x" << viewport->height
                       << " at " << viewport->x << "," << viewport->y << std::endl;
             int margin = 0;
-            const auto box = SCMiner::Application::defaultAimBox(*viewport, &margin);
+            const auto box = SCMiner::defaultAimBox(*viewport, &margin);
             std::cout << "Automatic aim box: " << box.x << "," << box.y << " " << box.width << "x"
                       << box.height << ", search margin " << margin << " px" << std::endl;
             std::cout << "HUD scale: "

@@ -27,6 +27,8 @@ bool blackPicture(const cv::Mat& bgr);
 
 // Tightly packed BGRA of a BGR or BGRA picture. Empty for an empty one.
 Pixels packBgra(const cv::Mat& bgr);
+// The BGR picture those bytes were packed from. Empty for an empty one.
+cv::Mat unpackBgr(const Pixels& pixels);
 
 }  // namespace Datarunner
 }  // namespace SCMiner

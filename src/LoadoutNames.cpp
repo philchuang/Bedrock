@@ -368,6 +368,27 @@ bool resolveHeadAgrees(const std::string& laserText, const std::vector<std::stri
     return headColumnAgrees(*laser, modules, head, sure);
 }
 
+std::string resolveFitKey(const std::string& laserText, const std::vector<std::string>& moduleNames,
+                          const std::vector<std::vector<std::string>>& below) {
+    const MiningLaser* laser = laserByHudLine(laserText);
+    if (!laser || moduleNames.size() != below.size()) return {};
+    std::vector<std::string> ids;
+    for (size_t i = 0; i < moduleNames.size(); i++) {
+        const MiningModule* module = moduleByHudBlock(moduleNames[i], below[i]);
+        if (!module) return {};
+        ids.push_back(module->id);
+    }
+    std::sort(ids.begin(), ids.end());
+    std::string key = laser->id;
+    for (const std::string& id : ids) key += "+" + id;
+    return key;
+}
+
+std::string resolveTurretKey(const std::string& line) {
+    const MiningLaser* laser = turretLaserByHudLine(line);
+    return laser ? std::string(laser->id) : std::string();
+}
+
 }  // namespace
 
 void installLoadoutResolve() {
@@ -377,6 +398,8 @@ void installLoadoutResolve() {
     resolve.exactTurretLine = resolveExactTurretLine;
     resolve.moduleBlock = resolveModuleBlock;
     resolve.headAgrees = resolveHeadAgrees;
+    resolve.fitKey = resolveFitKey;
+    resolve.turretKey = resolveTurretKey;
     setLoadoutResolve(resolve);
 }
 

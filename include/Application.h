@@ -6,12 +6,11 @@
 #include <thread>
 #include <chrono>
 #include <functional>
-#include "ScreenCapture.h"
-#include "OCREngine.h"
 #include "MiningAdvice.h"
-#include "ScanPanel.h"
-#include "PanelFive.h"
-#include "PanelKeep.h"
+#include "ScanSession.h"
+#include "RefineryGlance.h"
+#include "DatarunnerEyes.h"
+#include "LoadoutNames.h"
 #include <deque>
 #include <map>
 #include "SignatureAnalyzer.h"
@@ -21,14 +20,10 @@
 #include <future>
 #include "GameState.h"
 #include "Updater.h"
-#include "GlyphReader.h"
-#include "TextLineReader.h"
-#include "LoadoutReader.h"
 #include "RockContents.h"
 #include "RockScans.h"
 #include "Feedback.h"
 #include "RefineryOrders.h"
-#include "FrameRecorder.h"
 #include "UexPrices.h"
 #include "UexReports.h"
 #include "WhereToBuy.h"
@@ -50,7 +45,6 @@ public:
     // The aim box for a game drawn in this viewport, in the proportions of
     // the setup it was measured on (see the definition). margin gets the
     // search margin that goes with it.
-    static CaptureRegion defaultAimBox(const cv::Rect& viewport, int* margin = nullptr);
     // Re-derives the box when it is automatic and the viewport changed;
     // true when it did change
     bool refreshAutoAim(bool announce);
@@ -89,35 +83,11 @@ public:
     bool isAutoTrackActive() const;
 
 private:
-    ScreenCapture screenCapture_;
-    OCREngine ocrEngine_;
-    bool ocrAvailable_ = false;   // tessdata found at start
-    GlyphReader glyphReader_;
-    // The second reader: a neural recogniser run on the row the glyph reader
-    // cut - a second opinion on its value, and a reader of its own where the
-    // glyph reader gives up. See TextLineReader.
-    TextLineReader textLines_;
-    // The value both readers last agreed on, and where: the scans after that
-    // one do not ask again while the same value stands in the same place -
-    // holding a rock in the sights would otherwise pay for the second reader
-    // on every scan to hear the same answer
-    int agreedValue_ = 0;
-    cv::Rect agreedRect_;
-    // Rows the second reader has already looked at and found no
-    // signature in: where each sat on the screen and when it was
-    // tried. While it is resting these are left alone - the same
-    // pixels give the same answer - and a row that is NOT among them
-    // is read at once, resting or not. See the idle pace in the scan.
-    struct LineLooked {
-        cv::Rect where;
-        std::chrono::steady_clock::time_point when;
-    };
-    std::vector<LineLooked> lineLooked_;
-    bool lineLookedAt(const cv::Rect& where);
-    void rememberLineLook(const cv::Rect& where);
-    // Rolling record of what the scan looked at, so a missed reading can be
-    // replayed later instead of reconstructed from a screenshot taken too late
-    FrameRecorder recorder_;
+    std::unique_ptr<ScanSession> scan_;
+    RefineryGlance refineryGlance_;
+    DatarunnerEyes datarunnerEyes_;
+    void applyRock(const ScanSession::RockReport& report);
+
     // Recording is OFF unless region_config.txt says record=1: a hand-out
     // must neither film anyone's screen nor need ffmpeg. With it off there is
     // no ring, no Ctrl+Alt+K, and no debug pictures either.
@@ -179,20 +149,9 @@ private:
     std::string placeOverride_;
     std::string placeOverrideStamp_;
 
-    // Looking for the game's SCAN RESULTS panel, which is what puts the
-    // window into its rock view. It is anchored to the rock in 3D, so the
-    // whole viewport has to be searched rather than the small area the
-    // signature reader watches - and that is dear enough at 5120x1440 to be
-    // on a clock of its own rather than on every scan.
-    void lookForRock();
     bool shipCanMine() const;   // panelsWanted: anywhere but in the seat of a ship that cannot mine
-    // One line per look at a scan panel into debug\rock_readings.csv - what
-    // was read, and what the median made of it. steady is null for a look that
-    // did not name enough figures to count. rangeMetres is what the LASER
-    // RANGE gauge read on the same look, 0 for nothing.
-    void logRockReading(const ScanPanel& panel, const RockStats* steady, int rangeMetres,
-                        const std::string& notTaken = std::string());
-    void noteRockScan(const RockStats& look, int rows, float labelScale);
+    void loadoutLookAgain();    // the next look reads the loadout at once
+    void noteRockScan(const RockStats& shown, const RockStats& look, int rows, float labelScale);
     // The rocks done (Recorder::done) to rock_scans.csv and the share queue:
     // those whose wait is over, or with `all` every rock off view
     void keepRockScans(bool all = false);
@@ -223,53 +182,6 @@ private:
     std::future<Feedback::Result> feedbackJob_;   // one going: what came of it
     int feedbackGameTold_ = -1;                   // what the page was last told
     bool feedbackInstallTold_ = false;
-    // The laser's range to the rock: the middle of the gauge's last five
-    // readings, none older than RANGE_KEPT; 0 when there is none, which the
-    // rock view reads as full power. A look that reads no gauge leaves the
-    // readings as they are - the laser off for a moment, a flash over the
-    // figure - and a rock that leaves the view takes them with it.
-    std::deque<std::pair<std::chrono::steady_clock::time_point, int>> rangeReadings_;
-    static constexpr int RANGE_KEPT_SECONDS = 15;
-    float laserRange(std::chrono::steady_clock::time_point now) const;
-    // ...and the rock as last given to the view, to give again with a new
-    // range on looks that read the gauge and no figures
-    RockStats shownRock_;
-    // The rock to the view with the gauge's range on it. A rock of another
-    // mass than the one on view drops the readings taken before this look.
-    void rockToView(RockStats& rock, std::chrono::steady_clock::time_point look);
-    // Whether the rock view is fed at all; see the definition
-    static bool rockViewWanted();
-    std::chrono::steady_clock::time_point lastRockLook_{};
-    RockViewHold rockHold_;       // when the view goes back to the signatures
-    OCREngine rockOcr_;
-    bool rockOcrTried_ = false;
-    bool rockOcrReady_ = false;
-    bool rockSeen_ = false;       // the last look had one, for the log line
-    float shownMass_ = 0;         // the mass of the rock on view, 0 when none is
-    std::string shownOre_;        // ...and its ore, as the panel's heading read
-    float otherMass_ = 0;         // a mass read with no figures beside it that is not that rock's
-    int otherLooks_ = 0;          // ...and how many looks in a row read it
-    // The last few readings of the same rock. Every look reads the panel
-    // again, and OCR does not read the same pixels the same way twice. What
-    // is shown is the middle of the recent ones, which one bad reading cannot
-    // move.
-    std::deque<RockStats> rockReadings_;
-    int rockMissShots_ = 0;      // pictures kept of a panel the shapes missed
-    PanelKeep panelKeep_;        // ...and of the panel, one per rock, for a bug report
-    // ...written beside the readings: the cut of `frame` where panelKeep_
-    // says so (PanelKeep.h)
-    void keepPanelPicture(const cv::Mat& frame, const ScanPanel& panel, bool toneMapped,
-                          std::chrono::steady_clock::time_point now);
-    static RockStats steadyRock(const std::deque<RockStats>& readings);
-    // Whether the rock is made of the 5.0 numbers (RockStats::v5)
-    void rockModelFor(RockStats& rock) const;
-    // The shape reader's looks, read as one - see PanelSteadier. The median
-    // above is left for the face reader, which stands in when the shape
-    // reader cannot find the panel's labels at all.
-    PanelSteadier rockSteadier_;
-    int rockUnsettled_ = 0;       // looks in a row that found a panel and settled nothing
-    RockScans::LookCheck rockCheck_;  // figures no rock can have wait, as unsettled ones do
-    RockScans::MassCheck massCheck_;  // a line or face look's mass a numeral off the view's waits for a second
     RockScans::Recorder rockScans_;   // the rocks the view took, for rock_scans.csv
     // ...and sent to the service (RockScans) unless the player takes the tick
     // off in Settings (sharerocks=0), where the build carries the service's
@@ -280,91 +192,8 @@ private:
     std::vector<RockScans::Scan> rockShareSending_;
     std::future<int> rockShareJob_;                 // a report going: the status it was answered with
     std::chrono::steady_clock::time_point rockShareNext_{}, rockShareRetry_{};
-    bool rockLabelsOnly_ = false; // the last look found the labels and no figures
-    int rockQuickLooks_ = 0;      // ...and how many looks in a row came straight after
-    bool rockSettling_ = false;   // the last look found a panel whose figures have not settled
-    int rockSettlingLooks_ = 0;   // ...and how many looks in a row came straight after
-    int glanceQuiet_ = 0;         // scans left without a glance, after one that led to nothing
-    // The last panel's place, kept across sessions - see loadPanelSpot
-    static constexpr const char* PANEL_SPOT_FILE = "panel_spot.txt";
-    void loadPanelSpot(const cv::Size& viewport);
-    void keepPanelSpot(const cv::Size& viewport);
-    PanelSpot keptSpot_;          // what panel_spot.txt holds, so it is written only on a change
-    // The loadout a one-seat ship's mining HUD shows (LoadoutReader), read
-    // now and then on the looks for a rock - beside its panel, or with none
-    // up in the Prospector or Golem the log has the player sitting in - and
-    // handed to the window once two readings agree: the fit with that laser
-    // and those modules is chosen.
-    // No fit has them: on a third reading that says the same, the ship flown
-    // takes them for its own.
-    static constexpr int OWN_READINGS = 3;
-    void readLoadoutOnHud(const cv::Mat& frame, const ScanPanel& panel);
-    void takeSeenLoadout(const SeenLoadout& seen, const MiningShip& kind);
-    // ...and on a MOLE, the turret the player sits in: the laser its HUD
-    // names (readTurretLaser), read every four seconds until two readings
-    // agree and every ten after, as a turret is changed without the log
-    // saying so - and handed to the window, whose rock view then speaks to
-    // that head. The pilot's seat, which the log does say, and a minute
-    // with no turret's HUD in view, take it back.
-    void readTurretOnHud(const cv::Mat& frame);
-    void takeTurretLaser(const MiningLaser* laser);
-    // The ship the scan panels show, where the log has the player in no
-    // seat: its fit is chosen (PanelShipWitness). A MOLE's turret laser is
-    // only read with a MOLE's fit chosen.
-    PanelShipWitness panelShip_;
-    std::future<const MiningLaser*> turretJob_;
-    std::chrono::steady_clock::time_point lastTurretRead_{};
-    std::string turretSeen_;            // the last reading's laser, by id
-    int turretAgreeing_ = 0;            // readings in a row that said it
-    std::string turretSaid_;            // ...and the one the window was told
-    int turretMissing_ = 0;             // readings in a row with no turret's HUD
-    static constexpr int TURRET_GONE_READINGS = 6;
-    std::future<SeenLoadout> loadoutJob_;   // a reading under way, off the window's thread
-    std::string loadoutJobSeat_;            // ...and the seat it was asked for in
-    const MiningShip* loadoutJobKind_ = nullptr;   // ...and whose HUD it was
-    std::chrono::steady_clock::time_point lastLoadoutRead_{};
-    std::string loadoutSeat_;           // the ship and hull the readings below were made in
-    std::string loadoutSeen_;           // the last reading, as laser and modules by id
-    std::string loadoutSaid_;           // ...and the one the window was last told, so it is told once
-    int loadoutAgreeing_ = 0;           // readings in a row that said the same
-    int loadoutUnsure_ = 0;             // readings in a row that came back unsure
-    int loadoutDisagreeing_ = 0;        // whole readings in a row that said something else than the last
-    bool loadoutNoHud_ = false;         // the last reading found no mining HUD in the picture
-    bool loadoutSettled_ = false;       // handed to the window for this seat
-    std::string loadoutLogSeat_;        // the ship, hull, seat and boarding the log last said
-    // The next look reads the loadout at once: live mode switched on, a scan
-    // asked for, the log saying the player sat down or got up
-    void loadoutLookAgain();
-    // ...and a new rock on view, when the last reading is older than this:
-    // the verdict about to be drawn rests on the loadout
-    void loadoutCheckForRock(float mass);
-    static constexpr int LOADOUT_ROCK_CHECK_S = 30;
-    bool loadoutRockCheck_ = false;     // a new rock asked for a reading...
-    std::chrono::steady_clock::time_point loadoutRockCheckSince_{};   // ...at this moment
-    // What the rock on view holds (RockContents): the composition list under
-    // the panel's figures, read off the window's thread while the view has
-    // none for this rock, and handed to it once two readings say the same.
-    void readContentsOnHud(const cv::Mat& frame, const ScanPanel& panel, const RockStats& rock);
-    // A reading come back, before the look: to the rock it was read for, and
-    // to that rock's line of rock_scans.csv whichever rock is on view by now.
-    // True: it was the first of two for the rock on view, and the second is
-    // read off a look taken at once rather than 0.7 s later.
-    bool collectRockContents();
-    void takeRockContents(const RockContents& read, const RockStats& rock);
-    void clearRockView();                    // the rock off the view, and its list with it
-    void rockGone(const char* why);          // ...and what was read of it: the view is the signatures'
-    std::future<RockContents> contentsJob_;  // a reading under way
-    float contentsJobMass_ = 0;              // ...and the rock it was asked for
-    RockScans::ListReadings listReadings_;   // the lists read whole, a few rocks back (rock_scans.csv)
-    float contentsFor_ = 0;                  // the mass of the rock the view's list is of; 0: it has none
-    std::string contentsOre_;                // ...and its ore
-    std::string contentsShown_;              // ...and the list itself, as one line
-    float contentsWanted_ = 0;               // the rock a list is being read for
-    std::string contentsWantedOre_;
-    std::string contentsSeen_;               // the last reading that held together, of whichever rock
-    int contentsTries_ = 0;                  // readings asked for it so far
-    std::chrono::steady_clock::time_point lastContentsRead_{};
     int tradesSeen_ = -1;                    // the trade book's changes the window has been told of
+
     // The refinery's terminal (RefineryTerminal, RefineryOrders). Placing a
     // work order writes nothing to the game's log, so the REFINEMENT CENTER
     // is read off the screen - and only there: at a station the tables know
@@ -383,11 +212,6 @@ private:
     void takeRefineryScreen(const RefineryReading& read, const std::string& station, long long taken);
     void pushRefineryOrders();
     RefineryOrderBook refineryOrders_;
-    std::future<RefineryReading> refineryJob_;   // a reading under way
-    std::string refineryJobStation_;            // ...where
-    long long refineryJobTaken_ = 0;            // ...and when its picture was taken (UTC)
-    std::chrono::steady_clock::time_point lastRefineryLook_{};
-    bool refineryUp_ = false;                   // the last look found a work order's panel
     std::string refineryLastStation_;           // the station of the last reading with panels on it...
     std::chrono::steady_clock::time_point refineryLastPanels_{};   // ...and when
     // Refinery workloads (RefineryShare): what the terminals show of them,
@@ -423,10 +247,6 @@ public:
     // can be pointed elsewhere with SCMINER_REFINERY_URL
     static std::string refineryServiceUrl();
 private:
-    // When a rock's scan panel was last on screen: the player is mining, and
-    // no terminal is in reach - in a MOLE's turret the log has nobody in a
-    // seat, and its cockpit's orange light can take a terminal's shape
-    std::chrono::steady_clock::time_point lastRockPanel_{};
     static constexpr const char* REFINERY_ORDERS_FILE = "refinery_orders.txt";
     static constexpr const char* PLACE_OVERRIDE_FILE = "place.txt";
     void loadPlaceOverride();
@@ -617,7 +437,6 @@ private:
     static constexpr int UEX_MARKET_QUALITY = 900;
     static std::shared_ptr<UexDirectory> loadUexDirectory(const std::filesystem::path& folder);
     void askUexDirectory();          // UEX's lists, asked for off the UI thread where they are not in yet
-    cv::Mat grabGamePicture();
     void serviceUexReports();
     void readUexReported();
     void rememberUexReported(const std::string& key);
@@ -642,23 +461,21 @@ private:
     struct DatarunnerGrowing {
         std::uintmax_t size = 0;
         std::chrono::steady_clock::time_point since{};
-        cv::Mat own;   // Bedrock's picture of the game, taken when this one came (for one the game saved black)
+        Datarunner::Pixels own;   // Bedrock's picture of the game, taken when this one came (for one the game saved black)
     };
     std::map<std::string, DatarunnerGrowing> datarunnerGrowing_;   // new ones, until the game has written them
-    std::deque<std::pair<std::filesystem::path, cv::Mat>> datarunnerToRead_;   // with Bedrock's own of the moment
+    std::deque<std::pair<std::filesystem::path, Datarunner::Pixels>> datarunnerToRead_;   // with Bedrock's own of the moment
     // A picture read that showed no terminal, for the foot of the main window
     // for a minute: "" none
     std::string datarunnerNote_;
     std::chrono::steady_clock::time_point datarunnerNoteAt_{};
     std::chrono::steady_clock::time_point datarunnerLooked_{}, datarunnerPushed_{};
-    std::unique_ptr<TextLineReader> datarunnerLines_;       // its own reader, used by one job at a time
     std::future<std::shared_ptr<Datarunner::Shot>> datarunnerReadJob_;   // (after the reader: it goes first)
     std::vector<std::shared_ptr<Datarunner::Shot>> datarunnerShots_;     // waiting for the player, oldest first
     int datarunnerNextId_ = 1;
     // ...and at a commodity terminal without Print Screen (watchTerminal):
     // looks at the game while the log says one is in use, read with a reader
     // of their own
-    std::unique_ptr<TextLineReader> terminalLines_;
     std::future<std::shared_ptr<Datarunner::Shot>> terminalJob_;   // (after the reader: it goes first)
     std::chrono::steady_clock::time_point terminalLooked_{}, terminalSeen_{};
     long long terminalStartedFor_ = 0;      // the log's terminal line the looking began with, ms
@@ -728,15 +545,7 @@ private:
     int lastRecognizedSignature_ = 0;
     std::chrono::steady_clock::time_point lastScanTime_;
 
-    CaptureRegion signatureRegion_;
     bool regionDetected_ = false;
-    // The aim box follows the game: derived from its viewport - the monitor
-    // the game is drawn on, scaled to its size - unless the user typed one
-    bool aimAuto_ = true;
-    cv::Rect aimViewport_;           // the viewport the automatic box was made for
-    // viewport height over the reader's reference height - see
-    // GlyphReader::REFERENCE_VIEWPORT_HEIGHT; re-read before every scan
-    double hudScale_ = 1.0;
     // region_config.txt: hudscale=100 leaves every picture as captured. On
     // 1440p footage shown at 1.5x (4K) and 0.75x (1080p) it read 164 / 94
     // frames right, against 153 / 78 with the locator brought to the
@@ -748,43 +557,10 @@ private:
     // window has never been told, so it keeps whatever it worked out
     // from the screen.
     int uiScalePercent_ = 0;
-    std::string captureStats_;       // size and light of the first capture, for the notes
     bool snapshotPending_ = false;   // Ctrl+Alt+S arrived while a scan ran
 
-    // Auto-tracking: with head tracking (Tobii) the marker is anchored to the
-    // rock in 3D, so it slides across the screen as the view moves. Instead of
-    // cropping fixed coordinates, search a generous area around the configured
-    // region and follow the label itself.
+    // Auto-tracking of the signature label (for head tracking / Tobii).
     std::atomic<bool> autoTrack_ = true;
-    int trackMargin_ = 250;          // how far around the region to search, px (see defaultAimBox)
-    cv::Rect lastLabelRect_;         // last located label, virtual screen coords
-    bool hasLastLabel_ = false;
-    // Scans since the locked marker was last confirmed. The lock survives a
-    // run of them instead of being dropped by the first empty frame.
-    int lockMisses_ = 0;
-    // The marker as it last read. Holding a rectangle only helps while the
-    // marker stays inside it, and it does not: the label is anchored to a rock
-    // in 3D, so looking around slides it across the screen. Matching this
-    // picture inside the search window drags the lock along with it, through
-    // the runs of frames where the value itself cannot be read.
-    cv::Mat lockPatch_;
-    // Detecting a lock that has settled on cockpit furniture: the same value
-    // at the same pixel, scan after scan
-    // Scans the lock has been carried by picture matching alone, without a
-    // reading confirming it, and whether the last match failed
-    int followOnly_ = 0;
-    bool followMissed_ = false;
-    int lockLost_ = 0;               // scans in a row the follow found it nowhere - see LOCK_LOST_AFTER
-    bool followedNow_ = false;       // this scan's follow found the marker: the locator may look near it only
-    // The previous scan of the allowed area, greyscale, for measuring how far
-    // the view turned between two scans
-    cv::Mat previousView_;
-    int stuckValue_ = 0;
-    cv::Rect stuckRect_;
-    int stuckCount_ = 0;
-    cv::Rect blacklistRect_;    // ignored while blacklistLeft_ counts down
-    int blacklistLeft_ = 0;
-    bool lastScanTracked_ = false;   // was the last capture taken from a found label?
 
     // Overlay window for visualizing the capture region
     HWND overlayHwnd_ = nullptr;
@@ -839,28 +615,6 @@ private:
     // against the signature table and reward exact hits
     ReadingPolicy readingPolicy();
 
-    // One possible signature label: the cropped image and where it came from
-    struct LabelCandidate {
-        cv::Mat image;
-        cv::Rect screenRect;
-        cv::Rect row;   // the digit row inside `image` as the locator saw it; empty if unknown
-        // The picture `image` was cut from, and where its corner sat in it -
-        // shared, not copied. The second reader cuts its line from here, so
-        // the room around the digits does not stop at the candidate's edge.
-        cv::Mat source;
-        cv::Point origin;
-    };
-
-    // Grabs everything that could be the signature label, best guess first.
-    // Other warm HUD elements can look like markers, so the scan tries them
-    // in order and keeps the one that actually reads as a table value.
-    std::vector<LabelCandidate> captureSignatureCandidates(int maxCandidates = 3);
-
-    // Grabs the image the OCR should read: either the located signature label
-    // (auto-tracking) or the configured region. outScreenRect receives where
-    // it was taken from, in virtual screen coordinates.
-    cv::Mat captureSignatureImage(cv::Rect* outScreenRect = nullptr);
-
     // Switches live scanning (and with it the rolling recording) on or off.
     // Shared by the LIVE button and by the restart that resumes the previous
     // state, so the two can never drift apart.
@@ -871,11 +625,6 @@ private:
     // playing, and by the time it has been reported the clips holding it are
     // long gone.
     void keepRecording();
-
-    // Sets the reader's HUD scale from the picture the game is drawn in:
-    // its window when it is running, the monitor under the aim box until
-    // then. True when it changed.
-    bool refreshHudScale();
 
     // Ctrl+Alt+S: the game picture as it is captured, with a note of
     // everything the scan works from, to debug/snapshot_*.png|txt - the
@@ -890,25 +639,6 @@ private:
     // A copy of region_config.txt in debug/, so that folder alone is the
     // whole report: settings, session, log and snapshots in one go
     void mirrorConfigToDebug() const;
-    void noteCapture(const cv::Mat& image);
-
-    // The hard boundary the scan may never look outside: the region the user
-    // marked, grown by the tracking margin, clipped to the game picture.
-    cv::Rect allowedArea() const;
-
-    // How far the view turned since the last scan, in pixels, measured from
-    // the picture itself. Moves the lock with it.
-    void trackCameraMotion(const cv::Mat& view);
-
-    // The area searched for labels when tracking, in virtual screen coords
-    CaptureRegion trackingSearchArea() const;
-
-    // Moves the lock onto wherever the marker has drifted to, by matching the
-    // last picture of it inside the freshly captured search window. Called
-    // when a scan read nothing: the plate is usually still on screen and the
-    // view has only turned.
-    void followLockedMarker(const cv::Mat& searchImage, const CaptureRegion& search);
-
     // Processes a single scan cycle (console mode, auto-detects the region)
     void processScan();
 

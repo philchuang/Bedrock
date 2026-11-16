@@ -131,4 +131,9 @@ private:
     std::vector<std::pair<cv::Rect, cv::Rect>> lastLabels_;
 };
 
+// The aim box for a game drawn in this viewport, in the proportions of a
+// 5120x1440 viewport (see the definition). margin receives the search margin
+// that goes with it. Defined with the scan.
+CaptureRegion defaultAimBox(const cv::Rect& viewport, int* margin = nullptr);
+
 } // namespace SCMiner

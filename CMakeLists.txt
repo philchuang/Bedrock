@@ -224,8 +224,8 @@ set_source_files_properties(${PLUGIN_RUNTIME_SOURCES} PROPERTIES LANGUAGE CXX)
 # (the phone, the plugins, the files). The window and Application stay in
 # the executable. cmake/BedrockFence.cmake fails the configure when a
 # source takes an include that would merge them again.
-# Application still includes the reader headers. That check joins this one
-# when the scan moves into ScanSession (docs/dev/dotnet-port.md, step D).
+# The executable check also walks Application.h and Application.cpp, so a
+# reader header that mentions cv:: cannot come back in through the window.
 # --------------------------------------------------------------------------
 set(RULES_SOURCES
     src/SignatureAnalyzer.cpp
@@ -264,6 +264,9 @@ set(READ_SOURCES
     src/Datarunner.cpp
     src/ScreenCapture.cpp
     src/FrameRecorder.cpp
+    src/ScanSession.cpp
+    src/RefineryGlance.cpp
+    src/DatarunnerEyes.cpp
 )
 if(WIN32)
     list(APPEND READ_SOURCES src/DxgiCapture.cpp)
@@ -301,10 +304,11 @@ bedrock_check_fence("bedrock_rules must not include OpenCV, Win32 or MinerGUI.h"
 bedrock_check_fence("bedrock_read must not include MinerGUI.h or an ore table"
     SOURCES ${READ_SOURCES} NAMES ${BEDROCK_TABLE_HEADERS})
 bedrock_check_fence("the window must not include a reader header that mentions cv::"
-    CV SOURCES include/MinerGUI.h src/MinerGUI.cpp)
+    CV SOURCES include/MinerGUI.h src/MinerGUI.cpp include/Application.h src/Application.cpp)
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    ${RULES_SOURCES} ${READ_SOURCES} ${HOST_SOURCES} include/MinerGUI.h src/MinerGUI.cpp)
+    ${RULES_SOURCES} ${READ_SOURCES} ${HOST_SOURCES}
+    include/MinerGUI.h src/MinerGUI.cpp include/Application.h src/Application.cpp)
 
 add_library(bedrock_rules STATIC ${RULES_SOURCES})
 add_library(bedrock_read STATIC ${READ_SOURCES})
