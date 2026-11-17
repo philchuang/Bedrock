@@ -27,6 +27,7 @@
 #include <cmath>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace SCMiner {
@@ -282,6 +283,29 @@ struct ThrottleAdvice {
 // THROUGH the rock, not what leaves the head.
 inline constexpr float BREAK_DECAY_PER_MASS = 0.2f;
 
+// Nyx I's rocks in 5.0 are made of other numbers. The 13 ship rocks there
+// (entities/mineable/mineablerock_surface*_v5.xml, PTU build 13189690) take
+// their global parameters from miningglobalparamsship_v5.xml; their make-up
+// is the old rocks' own (the same composition records).
+//
+//                   decayPerMass   cSCUPerVolume   kg per SCU at density 1
+//   every rock          0.2            0.7          100 / 0.7  = 142.857
+//   Nyx I, 5.0          1.45           7.61         100 / 7.61 =  13.141
+//
+// So a Nyx I rock weighs a tenth per SCU and takes back 7.25 times as much
+// per kg. Checked on 25 Prospector rocks of 15 November 2026: kg per SCU is
+// 13.141 times the parts' densities within 2 % (Savrilium 2.3 % over), and
+// the panel's own EASY / IMPOSSIBLE for the stock Arbor MH1 (2,340 W) sorts
+// by mass x 1.45 through the resistance - every EASY rock needs 1,820 W or
+// less, every IMPOSSIBLE one 2,055 W or more. At 0.2 all but the Savrilium
+// would need under a third of the head.
+struct RockModel {
+    float decayPerMass;
+    float kgPerScuAtDensityOne;
+};
+inline constexpr RockModel ROCKS_USUAL = {BREAK_DECAY_PER_MASS, 142.857f};
+inline constexpr RockModel ROCKS_V5 = {1.45f, 13.141f};
+
 // Where "enough power" stops being a yes or a no. Comfortable is enough left
 // over to drive the bar up rather than only to hold it; past the edge is
 // short. The edge is just past 1 because the decay itself is measured rather
@@ -290,11 +314,11 @@ inline constexpr float BREAK_EDGE = 1.05f;
 inline constexpr float BREAK_COMFORTABLE = 0.90f;
 
 inline ThrottleAdvice throttleFor(float mass, const MiningLaser* laser,
-                                  float powerAtRange) {
+                                  float powerAtRange, float decayPerMass = BREAK_DECAY_PER_MASS) {
     ThrottleAdvice out;
     if (!laser || mass <= 0 || powerAtRange <= 0) return out;
 
-    const float givesBack = mass * BREAK_DECAY_PER_MASS;
+    const float givesBack = mass * decayPerMass;
     const float share = givesBack / powerAtRange;          // 1.0 = full throttle
 
     out.toHold = share * 100.0f;
@@ -317,7 +341,20 @@ struct RockStats {
     // where it put some on. Either way the laser has already had its say.
     // See rockOwnResistance.
     bool resistanceAdjusted = false;
+    // Made of the 5.0 numbers: a Nyx I rock (RockModel)
+    bool v5 = false;
+    // 5.0 prints the laser's modifier in front of the resistance and the
+    // instability ("+25%  65%"), and the figures above already carry it: the
+    // rock's own is figure / (1 + modifier). There the colour says how severe
+    // a figure is, so resistanceAdjusted is set from the modifier instead.
+    float resistanceDelta = 0;     // per cent as printed; 0 where none was
+    float instabilityDelta = 0;
+    bool deltasRead = false;       // a 5.0 panel: the two above are what it printed
 };
+
+inline const RockModel& modelOf(const RockStats& rock) {
+    return rock.v5 ? ROCKS_V5 : ROCKS_USUAL;
+}
 
 // The rock as it is once a gadget is stuck on it. A gadget attaches to the
 // ROCK, not to the ship, so what it changes are the rock's own figures.
@@ -754,7 +791,44 @@ struct LaserSuggestion {
     float throttle = 0;     // per cent needed to hold the bar
     bool breaks = false;    // whether it can be held at all
     bool stock = false;     // true when no module was needed
+    // The passive modules alone that get the most through - nothing among
+    // them runs out - and what they get through: for heads that hold the
+    // rock only together
+    std::vector<const MiningModule*> passive;
+    float passivePower = 0;
+    // A crafted head on board, by its bonus in per cent (+28.84); 0 for a
+    // head off the shelf
+    float crafted = 0;
 };
+
+// Whether a mix holds only while a charge runs: an active module in it
+inline bool runsOut(const std::vector<const MiningModule*>& modules) {
+    return std::any_of(modules.begin(), modules.end(), [](const MiningModule* m) { return m && m->active; });
+}
+
+// " while Surge runs, 15 s": how long a hold lasts that needs a charge - the
+// active modules in the mix by name, and the shortest of their runs. "" for a
+// mix with none.
+inline std::string whileRuns(const std::vector<const MiningModule*>& modules) {
+    std::vector<std::string> names;
+    int seconds = 0;
+    for (const MiningModule* m : modules) {
+        if (!m || !m->active) continue;
+        std::string name = m->name;
+        static const std::string TAIL = " Module";
+        if (name.size() > TAIL.size() && name.compare(name.size() - TAIL.size(), TAIL.size(), TAIL) == 0) {
+            name.resize(name.size() - TAIL.size());
+        }
+        if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
+        if (m->seconds > 0 && (seconds == 0 || m->seconds < seconds)) seconds = m->seconds;
+    }
+    if (names.empty()) return "";
+    std::string out = " while " + names[0];
+    for (size_t i = 1; i < names.size(); i++) out += (i + 1 == names.size() ? " and " : ", ") + names[i];
+    out += names.size() > 1 ? " run" : " runs";
+    if (seconds > 0) out += ", " + std::to_string(seconds) + " s";
+    return out;
+}
 
 namespace detail {
 
@@ -770,14 +844,16 @@ namespace detail {
 // or less resistance - and at most three slots, which is a few hundred
 // mixes a head. Between two mixes that get the same through, the one with
 // fewer active modules wins - they are charges, and run out - and then the
-// one with fewer modules.
-inline std::vector<const MiningModule*> bestModules(const MiningLoadout& bare, const RockStats& rock) {
+// one with fewer modules. With `withActives` false only passive modules go in.
+inline std::vector<const MiningModule*> bestModules(const MiningLoadout& bare, const RockStats& rock,
+                                                    bool withActives = true) {
     std::vector<const MiningModule*> best;
     if (!bare.laser || bare.laser->slots <= 0) return best;
     const int slots = bare.laser->slots;
     std::vector<const MiningModule*> helps;
     for (int i = 0; i < MINING_MODULE_COUNT; i++) {
         const MiningModule& m = MINING_MODULES[i];
+        if (m.active && !withActives) continue;
         if (m.power > 1.0f || m.resistance < 0.0f) helps.push_back(&m);
     }
     const auto through = [&](const std::vector<const MiningModule*>& mods) {
@@ -825,10 +901,63 @@ inline std::vector<const MiningModule*> bestModules(const MiningLoadout& bare, c
 
 }  // namespace detail
 
+// One head against the rock: stock when stock is enough, with the passive
+// modules that do most for this rock when not, and with active ones as well
+// only where no passive mix holds it. A crafted head goes in with its bonus.
+inline LaserSuggestion suggestionFor(const MiningLaser& l, const RockStats& rock, float craftedPower = 0.0f) {
+    const float givesBack = rock.mass * modelOf(rock).decayPerMass;
+    const auto through = [&](const LaserOutput& o) {
+        return o.atRange * resistanceLetsThrough(rock.resistance, o.resistance);
+    };
+    MiningLoadout bare;
+    bare.laser = &l;
+    bare.craftedPower = craftedPower;
+    const LaserOutput plain = outputOf(bare, rock.distance);
+
+    LaserSuggestion pick;
+    pick.laser = &l;
+    pick.crafted = craftedPower;
+    pick.power = through(plain);
+    pick.passivePower = pick.power;
+    pick.stock = true;
+
+    // Stock is enough? Then that is the answer, and no module is named.
+    if (pick.power > 0 && givesBack / pick.power <= 1.0f) {
+        pick.throttle = givesBack / pick.power * 100.0f;
+        pick.breaks = true;
+    } else if (l.slots > 0) {
+        // Otherwise the passive modules that get the most through this
+        // rock; where those do not hold it, the mix with active ones.
+        MiningLoadout fitted = bare;
+        fitted.modules = detail::bestModules(bare, rock, false);
+        pick.passive = fitted.modules;
+        pick.passivePower = through(outputOf(fitted, rock.distance));
+        if (!(pick.passivePower > 0 && givesBack / pick.passivePower <= 1.0f)) {
+            fitted.modules = detail::bestModules(bare, rock);
+        }
+        const LaserOutput best = outputOf(fitted, rock.distance);
+        pick.modules = fitted.modules;
+        pick.power = through(best);
+        pick.stock = false;
+        pick.breaks = pick.power > 0 && givesBack / pick.power <= 1.0f;
+        pick.throttle = pick.power > 0 ? givesBack / pick.power * 100.0f : 0.0f;
+    }
+    return pick;
+}
+
 // Every head that fits this ship, ranked by whether it can hold the rock and
 // then by how much room it leaves. Each one is reported once: stock when stock
-// is enough, with the modules that do most for this rock when not - because
-// "it works as it is" is a better answer than "buy three modules".
+// is enough, with the passive modules that do most for this rock when not,
+// and with active ones as well only where no passive mix holds it - because
+// "it works as it is" is a better answer than "buy three modules", and a
+// hold that lasts beats one that lasts while a charge runs (Surge's 15 s).
+// Of the heads that hold it, one that holds it without a charge comes first.
+//
+// A crafted head on board (`aboard`, the ship's heads) is one more: the same
+// head with its bonus and the modules that do most for the rock - other
+// modules on a head one has rather than a head one has not. It comes first
+// of those that hold the rock the same way, with a charge or without. A
+// crafted head is reported once, however many mounts carry it.
 //
 // The rock's resistance goes in as its OWN figure, and each head takes it
 // through its own factor: a Klein at -45 % gets more of its power through a
@@ -836,14 +965,9 @@ inline std::vector<const MiningModule*> bestModules(const MiningLoadout& bare, c
 // Golem's Pitman - is named only when that ship is the one asking.
 inline std::vector<LaserSuggestion> suggestLasers(const RockStats& rock,
                                                   int8_t hardpointSize,
-                                                  float craftedPower = 0.0f,
-                                                  const MiningShip* ship = nullptr) {
+                                                  const MiningShip* ship = nullptr,
+                                                  const std::vector<MiningLoadout>& aboard = {}) {
     std::vector<LaserSuggestion> out;
-    const float givesBack = rock.mass * BREAK_DECAY_PER_MASS;
-    const auto through = [&](const LaserOutput& o) {
-        return o.atRange * resistanceLetsThrough(rock.resistance, o.resistance);
-    };
-
     for (int i = 0; i < MINING_LASER_COUNT; i++) {
         const MiningLaser& l = MINING_LASERS[i];
         // the mount's own size only, as the game has it (laserFits)
@@ -851,41 +975,28 @@ inline std::vector<LaserSuggestion> suggestLasers(const RockStats& rock,
         // ...but never a head made for another ship
         const MiningShip* only = onlyShipFor(l);
         if (only && only != ship) continue;
-
-        MiningLoadout bare;
-        bare.laser = &l;
-        bare.craftedPower = craftedPower;
-        const LaserOutput plain = outputOf(bare, rock.distance);
-
-        LaserSuggestion pick;
-        pick.laser = &l;
-        pick.power = through(plain);
-        pick.stock = true;
-
-        // Stock is enough? Then that is the answer, and no module is named.
-        if (pick.power > 0 && givesBack / pick.power <= 1.0f) {
-            pick.throttle = givesBack / pick.power * 100.0f;
-            pick.breaks = true;
-        } else if (l.slots > 0) {
-            // Otherwise: the modules that get the most through this rock.
-            MiningLoadout fitted = bare;
-            fitted.modules = detail::bestModules(bare, rock);
-            const LaserOutput best = outputOf(fitted, rock.distance);
-            pick.modules = fitted.modules;
-            pick.power = through(best);
-            pick.stock = false;
-            pick.breaks = pick.power > 0 && givesBack / pick.power <= 1.0f;
-            pick.throttle = pick.power > 0 ? givesBack / pick.power * 100.0f : 0.0f;
-        }
-        out.push_back(pick);
+        out.push_back(suggestionFor(l, rock));
+    }
+    for (const MiningLoadout& head : aboard) {
+        if (!head.laser || head.craftedPower == 0.0f || head.laser->size != hardpointSize) continue;
+        const bool seen = std::any_of(out.begin(), out.end(), [&](const LaserSuggestion& p) {
+            return p.crafted != 0.0f && p.laser == head.laser && p.crafted == head.craftedPower;
+        });
+        if (!seen) out.push_back(suggestionFor(*head.laser, rock, head.craftedPower));
     }
 
-    // What holds the rock first, and among those what leaves the most room.
+    // What holds the rock first; of those, what holds it without a charge,
+    // then a crafted head on board, then what leaves the most room.
     for (size_t i = 1; i < out.size(); i++) {
         for (size_t j = i; j > 0; j--) {
-            const bool better = (out[j].breaks && !out[j - 1].breaks) ||
-                                (out[j].breaks == out[j - 1].breaks &&
-                                 out[j].power > out[j - 1].power);
+            const LaserSuggestion& a = out[j];
+            const LaserSuggestion& b = out[j - 1];
+            const bool aOwn = a.crafted != 0.0f, bOwn = b.crafted != 0.0f;
+            const bool better = a.breaks != b.breaks                                     ? a.breaks
+                                : !a.breaks                                            ? a.power > b.power
+                                : runsOut(a.modules) != runsOut(b.modules)             ? !runsOut(a.modules)
+                                : aOwn != bOwn                                         ? aOwn
+                                                                                       : a.power > b.power;
             if (!better) break;
             const LaserSuggestion t = out[j]; out[j] = out[j - 1]; out[j - 1] = t;
         }
@@ -921,13 +1032,13 @@ inline const MiningGadget* gadgetById(const char* id) {
 // then what it costs - the order of the game's own description - each the
 // strongest first. Between two as strong, the one it is the best of the six
 // at goes first: Sabir's resistance before its window.
-struct GadgetEffect {
+struct GearEffect {
     const char* what;   // in the rock view's words
     float by;           // per cent
     bool helps;
 };
 
-inline std::vector<GadgetEffect> gadgetEffects(const MiningGadget& g) {
+inline std::vector<GearEffect> gadgetEffects(const MiningGadget& g) {
     struct Axis {
         const char* what;
         float MiningGadget::* field;
@@ -941,7 +1052,7 @@ inline std::vector<GadgetEffect> gadgetEffects(const MiningGadget& g) {
         {"Useful ore clustering", &MiningGadget::cluster, false},
     };
     struct Ranked {
-        GadgetEffect effect;
+        GearEffect effect;
         bool best;
         int axis;
     };
@@ -963,9 +1074,66 @@ inline std::vector<GadgetEffect> gadgetEffects(const MiningGadget& g) {
         if (x.best != y.best) return x.best;
         return x.axis < y.axis;
     });
-    std::vector<GadgetEffect> out;
+    std::vector<GearEffect> out;
     for (const Ranked& r : ranked) out.push_back(r.effect);
     return out;
+}
+
+// The same for a laser head or a module, for the i on their lists: what it
+// helps with, then what it costs, each the strongest first, two as strong
+// in the order given. The figures are the item file's, worded and signed as
+// the game's descriptions print them: a filter, the per cent less inert
+// material drawn in, is the Inert Material Level the game prints negative
+// (Helix II's 40: -40 %), and a module's power, a factor, counts as a per
+// cent on the laser's (Rieger-C3's 1.25: +25 %).
+struct GearAxis {
+    const char* what;
+    float by;
+    bool lessHelps;   // resistance, instability, inert material and the hazards help by going down
+};
+
+inline std::vector<GearEffect> rankedGearEffects(const GearAxis* axes, size_t count) {
+    std::vector<std::pair<GearEffect, size_t>> ranked;
+    for (size_t a = 0; a < count; a++) {
+        // (a power factor's float leaves a crumb: 1.02 is +2.0000005)
+        const float by = std::round(axes[a].by * 100.0f) / 100.0f;
+        if (by == 0) continue;
+        ranked.push_back({{axes[a].what, by, axes[a].lessHelps ? by < 0 : by > 0}, a});
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [](const auto& x, const auto& y) {
+        if (x.first.helps != y.first.helps) return x.first.helps;
+        if (std::fabs(x.first.by) != std::fabs(y.first.by)) return std::fabs(x.first.by) > std::fabs(y.first.by);
+        return x.second < y.second;
+    });
+    std::vector<GearEffect> out;
+    for (const auto& r : ranked) out.push_back(r.first);
+    return out;
+}
+
+inline std::vector<GearEffect> laserEffects(const MiningLaser& l) {
+    const GearAxis axes[] = {
+        {"Resistance", l.resistance, true},
+        {"Instability", l.instability, true},
+        {"Optimal charge window", l.window, false},
+        {"Optimal charge rate", l.rate, false},
+        {"Inert material", -l.filter, true},
+    };
+    return rankedGearEffects(axes, sizeof(axes) / sizeof(axes[0]));
+}
+
+inline std::vector<GearEffect> moduleEffects(const MiningModule& m) {
+    const GearAxis axes[] = {
+        {"Laser power", (m.power - 1.0f) * 100.0f, false},
+        {"Extraction power", m.extraction, false},
+        {"Resistance", m.resistance, true},
+        {"Instability", m.instability, true},
+        {"Optimal charge window", m.window, false},
+        {"Optimal charge rate", m.rate, false},
+        {"Inert material", -m.filter, true},
+        {"Shatter damage", m.shatter, true},
+        {"Catastrophic charge rate", m.danger, true},
+    };
+    return rankedGearEffects(axes, sizeof(axes) / sizeof(axes[0]));
 }
 
 }  // namespace SCMiner

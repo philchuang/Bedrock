@@ -10,6 +10,8 @@
 #include "OCREngine.h"
 #include "MiningAdvice.h"
 #include "ScanPanel.h"
+#include "PanelFive.h"
+#include "PanelKeep.h"
 #include <deque>
 #include <map>
 #include "SignatureAnalyzer.h"
@@ -24,6 +26,7 @@
 #include "LoadoutReader.h"
 #include "RockContents.h"
 #include "RockScans.h"
+#include "Feedback.h"
 #include "RefineryOrders.h"
 #include "FrameRecorder.h"
 #include "UexPrices.h"
@@ -182,17 +185,44 @@ private:
     // signature reader watches - and that is dear enough at 5120x1440 to be
     // on a clock of its own rather than on every scan.
     void lookForRock();
-    bool shipCanMine() const;   // the ship the log names can mine, or none is named yet
+    bool shipCanMine() const;   // panelsWanted: anywhere but in the seat of a ship that cannot mine
     // One line per look at a scan panel into debug\rock_readings.csv - what
     // was read, and what the median made of it. steady is null for a look that
     // did not name enough figures to count. rangeMetres is what the LASER
     // RANGE gauge read on the same look, 0 for nothing.
     void logRockReading(const ScanPanel& panel, const RockStats* steady, int rangeMetres,
                         const std::string& notTaken = std::string());
-    void noteRockScan(const RockStats& look);
-    void keepRockScans();
+    void noteRockScan(const RockStats& look, int rows, float labelScale);
+    // The rocks done (Recorder::done) to rock_scans.csv and the share queue:
+    // those whose wait is over, or with `all` every rock off view
+    void keepRockScans(bool all = false);
+    // Once a second: the rocks whose wait is over; the game put away, the
+    // rock on view waits too; the game closed, every rock is done and goes
+    // to the service at once
+    void tendRockScans();
+    std::chrono::steady_clock::time_point rockScansTended_{};
+    bool rockGameUp_ = false;   // the game's window seen since the game last closed (tendRockScans)
     void setRockShare(bool on);
     void serviceRockShare();
+    // A message from the Feedback page (Feedback.h): when Send is clicked the
+    // message, and with the page's tick the debug folder zipped after it
+    // (DebugZip.h), all on one job off the UI thread - no second try,
+    // nothing kept. The page is told how far the zip's upload is, what came
+    // of it all, and what goes along with a message whenever that changes:
+    // the game's version as the rock scans send it, and whether the
+    // installation number.
+    void sendFeedback(const std::string& text, const std::string& name, bool debugFolder);
+    void serviceFeedback();
+    int feedbackGame();
+    // ...how far the zip's upload is: its bytes out and its size, 0 until it
+    // starts - the job's to write; serviceFeedback reads them for the page
+    struct FeedbackUpload {
+        std::atomic<std::int64_t> sent{0}, total{0};
+    };
+    std::shared_ptr<FeedbackUpload> feedbackUpload_;
+    std::future<Feedback::Result> feedbackJob_;   // one going: what came of it
+    int feedbackGameTold_ = -1;                   // what the page was last told
+    bool feedbackInstallTold_ = false;
     // The laser's range to the rock: the middle of the gauge's last five
     // readings, none older than RANGE_KEPT; 0 when there is none, which the
     // rock view reads as full power. A look that reads no gauge leaves the
@@ -206,7 +236,7 @@ private:
     RockStats shownRock_;
     // The rock to the view with the gauge's range on it. A rock of another
     // mass than the one on view drops the readings taken before this look.
-    void rockToView(RockStats rock, std::chrono::steady_clock::time_point look);
+    void rockToView(RockStats& rock, std::chrono::steady_clock::time_point look);
     // Whether the rock view is fed at all; see the definition
     static bool rockViewWanted();
     std::chrono::steady_clock::time_point lastRockLook_{};
@@ -225,13 +255,21 @@ private:
     // move.
     std::deque<RockStats> rockReadings_;
     int rockMissShots_ = 0;      // pictures kept of a panel the shapes missed
+    PanelKeep panelKeep_;        // ...and of the panel, one per rock, for a bug report
+    // ...written beside the readings: the cut of `frame` where panelKeep_
+    // says so (PanelKeep.h)
+    void keepPanelPicture(const cv::Mat& frame, const ScanPanel& panel, bool toneMapped,
+                          std::chrono::steady_clock::time_point now);
     static RockStats steadyRock(const std::deque<RockStats>& readings);
+    // Whether the rock is made of the 5.0 numbers (RockStats::v5)
+    void rockModelFor(RockStats& rock) const;
     // The shape reader's looks, read as one - see PanelSteadier. The median
     // above is left for the face reader, which stands in when the shape
     // reader cannot find the panel's labels at all.
     PanelSteadier rockSteadier_;
     int rockUnsettled_ = 0;       // looks in a row that found a panel and settled nothing
     RockScans::LookCheck rockCheck_;  // figures no rock can have wait, as unsettled ones do
+    RockScans::MassCheck massCheck_;  // a line or face look's mass a numeral off the view's waits for a second
     RockScans::Recorder rockScans_;   // the rocks the view took, for rock_scans.csv
     // ...and sent to the service (RockScans) unless the player takes the tick
     // off in Settings (sharerocks=0), where the build carries the service's
@@ -270,6 +308,10 @@ private:
     // with no turret's HUD in view, take it back.
     void readTurretOnHud(const cv::Mat& frame);
     void takeTurretLaser(const MiningLaser* laser);
+    // The ship the scan panels show, where the log has the player in no
+    // seat: its fit is chosen (PanelShipWitness). A MOLE's turret laser is
+    // only read with a MOLE's fit chosen.
+    PanelShipWitness panelShip_;
     std::future<const MiningLaser*> turretJob_;
     std::chrono::steady_clock::time_point lastTurretRead_{};
     std::string turretSeen_;            // the last reading's laser, by id
@@ -303,11 +345,17 @@ private:
     // the panel's figures, read off the window's thread while the view has
     // none for this rock, and handed to it once two readings say the same.
     void readContentsOnHud(const cv::Mat& frame, const ScanPanel& panel, const RockStats& rock);
+    // A reading come back, before the look: to the rock it was read for, and
+    // to that rock's line of rock_scans.csv whichever rock is on view by now.
+    // True: it was the first of two for the rock on view, and the second is
+    // read off a look taken at once rather than 0.7 s later.
+    bool collectRockContents();
     void takeRockContents(const RockContents& read, const RockStats& rock);
     void clearRockView();                    // the rock off the view, and its list with it
     void rockGone(const char* why);          // ...and what was read of it: the view is the signatures'
     std::future<RockContents> contentsJob_;  // a reading under way
     float contentsJobMass_ = 0;              // ...and the rock it was asked for
+    RockScans::ListReadings listReadings_;   // the lists read whole, a few rocks back (rock_scans.csv)
     float contentsFor_ = 0;                  // the mass of the rock the view's list is of; 0: it has none
     std::string contentsOre_;                // ...and its ore
     std::string contentsShown_;              // ...and the list itself, as one line
@@ -474,21 +522,26 @@ private:
     static constexpr int UEX_RETRY_MINUTES = 10;
     // The shops that sell the mining gear (WhereToBuy.h): UEX's items_prices
     // of category 28 (gadgets), 29 (laser heads) and 30 (modules), kept in
-    // uex\ and fetched again once half a day old - asked for only while the
-    // GUI wants them (gearListsWanted). One that cannot be fetched leaves
-    // the one kept in place, however old.
+    // uex\ and fetched again once half a day old. Asked for from the start,
+    // so the Gear page has them when it opens: first the lists kept from
+    // before, however old, without asking UEX - then whichever of them is
+    // half a day old is fetched. One that cannot be fetched leaves the one
+    // kept in place, however old.
 public:
     struct UexShopsOutcome {
         std::shared_ptr<const UexShops> shops;   // null where there is nothing to show
         std::string note;                        // why not, or why not fresh; "" when all went well
+        bool keptOnly = false;                   // only the lists kept, without asking UEX
     };
-    // (static, and of the folder given: the self-test reads one it has kept)
-    static UexShopsOutcome loadUexShops(const std::filesystem::path& folder);
+    // (static, and of the folder given: the self-test reads one it has kept).
+    // keptOnly: the lists kept, whatever their age, and nothing asked of UEX
+    static UexShopsOutcome loadUexShops(const std::filesystem::path& folder, bool keptOnly = false);
 private:
     void serviceUexShops();
     std::future<UexShopsOutcome> uexShopsJob_;
     std::shared_ptr<const UexShops> uexShops_;
     std::string uexShopsNote_;
+    bool uexShopsKeptRead_ = false;   // the lists kept from before have been read in
     bool uexShopsTried_ = false;
     std::chrono::steady_clock::time_point uexShopsTriedAt_{};
     static constexpr int UEX_SHOPS_HOURS = 12;
@@ -660,6 +713,13 @@ private:
     int snapshotKeep_ = 50;   // a tester's snapshots are the data that comes back
     int scanThreads_ = 0;           // 0 = worked out from the machine
     int effectiveIntervalMs() const;
+    // Whether Star Citizen runs (its window, or else its process)...
+    bool gameUp();
+    // ...and is not minimised: the screen is read only then
+    bool gameOnScreen();
+    bool gameProcessUp();   // its process, looked for every two seconds at the most
+    std::chrono::steady_clock::time_point gameProcessChecked_{};
+    bool gameProcess_ = false;
     int hotkeyVkCode_ = VK_F9;      // default: F9
 
     // Live mode: last recognized signature (to avoid duplicate updates)

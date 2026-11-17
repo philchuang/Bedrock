@@ -26,6 +26,10 @@ struct SeenLoadout {
     cv::Point table;
     double scale = 0;
     double score = -1;
+    // ...and which of the game's two tables it is (PanelShapes.h): 'F' as
+    // the HUD drew it up to Star Citizen 4.10.2, 'S' since 4.10.3 - each has
+    // its line, its list, its Head column and its icons at places of its own
+    char tableShape = 0;
     // the line over the table, as the second reader gave it, and the laser
     // it names
     std::string laserText;
@@ -41,7 +45,7 @@ struct SeenLoadout {
     bool iconPastList = false;
     // the table's Head column as read, FRACTURE PWR to WINDOW SIZE in per
     // cent (-1: not read), and whether it is what the laser and the modules
-    // read make of it
+    // read make of it. SHATTER DMG, the seventh row since 4.10.3, is not read.
     int head[6] = {-1, -1, -1, -1, -1, -1};
     double headSure[6] = {0, 0, 0, 0, 0, 0};   // the reader's mean certainty
     bool headAgrees = false;
@@ -52,8 +56,9 @@ struct SeenLoadout {
     bool complete() const { return laser != nullptr && modulesRead; }
 };
 
-// The laser's table, left of the middle of the screen. False when the mining
-// HUD is not up.
+// The laser's table, left of the middle of the screen, in either of the
+// shapes the game has drawn it in (SeenLoadout::tableShape). False when the
+// mining HUD is not up.
 bool findLaserTable(const cv::Mat& frame, SeenLoadout& seen);
 
 // ...and the laser and its modules, read by the second reader. Costs a line
@@ -100,5 +105,35 @@ bool headColumnAgrees(const MiningLaser& laser, const std::vector<const MiningMo
 // player sitting in. The HUD lists the laser and its modules as soon as the
 // mining mode is on, before any rock is scanned.
 const char* hudShipOf(char glyph, const std::string& logShip, bool inSeat);
+
+// The ship a scan panel's label column belongs to: the Prospector's (L, M),
+// the MOLE's pilot seat (K, P, Q) and turrets (T, W), the Golem's (G, H).
+// Null for any other column and for none.
+const char* panelShipOf(char glyph);
+
+// Whether to look for a scan panel at all: not while the log has the player
+// in the seat of a ship that cannot mine. Out of the seat the player may
+// have boarded a mining ship the log did not name (PanelShipWitness).
+bool panelsWanted(const std::string& logShip, bool inSeat);
+
+// The ship the scan panels show the player in, where the log has no seat
+// to say it. The log names a ship boarded only by its crew channel ("You
+// have joined channel"), and on 16 November 2026 the game stopped writing
+// that line three hours into a session: a MOLE and a Golem were boarded
+// without it, and Bedrock kept the Prospector's fit. Two sure panels of one
+// ship in a row name it, once: a fit picked by hand afterwards stays. A
+// seat the log names starts it over.
+class PanelShipWitness {
+public:
+    // One look: the label column of a panel read for sure, 0 for none, and
+    // whether the log has the player in a seat. The ship to switch the fit
+    // to, by id, or null.
+    const char* look(char glyph, bool logSeat);
+
+private:
+    const char* seen_ = nullptr;   // the ship the last sure panel named
+    int running_ = 0;              // ...and sure panels in a row that named it
+    const char* said_ = nullptr;   // the ship last switched to
+};
 
 }  // namespace SCMiner

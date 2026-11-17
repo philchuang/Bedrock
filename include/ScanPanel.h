@@ -394,6 +394,20 @@ std::string oreByLine(const cv::Mat& frame, const cv::Rect& row, TextLineReader&
 // the search over every size is then tried only every fourth look.
 void throttlePanelSearch(bool throttled);
 
+// Which game draws the panel, as the game log's header says: 5 and up is
+// Star Citizen 5.0, whose panel only PanelFive reads - the 4.10 readers
+// misread it; anything below, or 0 for not known, is read by the 4.10
+// readers alone. For the bench: BEDROCK_PANEL_GENERATION.
+void setPanelGeneration(int generation);
+int panelGeneration();
+
+// Whether the pictures come off an HDR desktop, tone mapped in the app
+// (ToneMap.h): the Golem's lettering has another colour there than in an SDR
+// capture, and is looked for in another ink. For the bench and the tools,
+// which are given such a picture as a file: BEDROCK_PANEL_HDR=1.
+void setPanelToneMapped(bool toneMapped);
+bool panelToneMapped();
+
 // For the tools: where the label column is - the labels' left edge and the
 // MASS label's top - at what size, and how well it matched.
 bool findPanelLabels(const cv::Mat& frame, cv::Point& labels, double& scale, double& score);

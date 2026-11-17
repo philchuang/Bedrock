@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(StarCitizenMiner VERSION 3.0.3 LANGUAGES CXX)
+project(StarCitizenMiner VERSION 3.0.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -230,10 +230,15 @@ set(CORE_SOURCES
     src/GameState.cpp
     src/GamePlaces.cpp
     src/ScanPanel.cpp
+    src/PanelFive.cpp
+    src/PanelKeep.cpp
     src/LoadoutReader.cpp
     src/LaserRange.cpp
     src/RockContents.cpp
     src/RockScans.cpp
+    src/Feedback.cpp
+    src/DebugZip.cpp
+    src/TextField.cpp
     src/RefineryTerminal.cpp
     src/RefineryOrders.cpp
     src/RefineryShare.cpp
@@ -290,6 +295,8 @@ set(HEADERS
     include/MinerGUI.h
     include/BlueprintLibrary.h
     include/CraftQuality.h
+    include/CraftedOnly.h
+    include/OrePlaces.h
     include/Reputation.h
     include/GameState.h
     include/GamePlaces.h
@@ -303,7 +310,13 @@ set(HEADERS
     include/LaserRange.h
     include/GaugeDigits.h
     include/RockContents.h
+    include/PanelFive.h
+    include/PanelFiveShapes.h
+    include/PanelKeep.h
     include/RockScans.h
+    include/Feedback.h
+    include/DebugZip.h
+    include/TextField.h
     include/RefineryTerminal.h
     include/RefineryOrders.h
     include/TradeBook.h

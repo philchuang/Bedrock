@@ -8,9 +8,11 @@
 #include "DataBackup.h"
 #include "GameFiles.h"
 #include "MiningLocations.h"
+#include "OrePlaces.h"
 #include "GamePlaces.h"
 #include "CraftingData.h"
 #include "CraftQuality.h"
+#include "CraftedOnly.h"
 #include "RefineryData.h"
 #include "RefiningData.h"
 #include "RefineryShare.h"
@@ -83,6 +85,7 @@ constexpr int ORE_ROWS_BUTTON_W = 40;   // the overlay's Rows/Line switch
 #define TIMER_SETTINGS_PULSE 13 // the settings' preview, blinking as the overlay does
 #define TIMER_PHONE        14   // the phone's pictures, drawn again where the window changed
 #define TIMER_DR_INTRO     15   // the Datarunner's introduction, moving on by itself
+#define TIMER_FEEDBACK     16   // the Feedback page's caret, blinking
 #ifndef WM_APP
 #define WM_APP 0x8000   // (the Linux shim has none)
 #endif
@@ -785,7 +788,8 @@ void drawPuzzle(Gdiplus::Graphics& g, float cx, float cy, float size, const Gdip
 // unit `s` pixels - a scope for the scan, a flask for the refinery, a lens
 // for the Ore Finder, a laser head for the gear, a sheet for the blueprints,
 // a pencil for the notes, an arrow up for the Datarunner, a jigsaw piece for
-// the plugins, a sun of spokes for the settings
+// the plugins, a sun of spokes for the settings, a speech bubble for the
+// feedback
 void drawRailIcon(Gdiplus::Graphics& g, MinerGUI::RailItem item, float x, float y, float s,
                   const Gdiplus::Color& ink) {
     using R = MinerGUI::RailItem;
@@ -891,6 +895,25 @@ void drawRailIcon(Gdiplus::Graphics& g, MinerGUI::RailItem item, float x, float 
             Gdiplus::GraphicsPath square;
             addRoundRect(square, Gdiplus::RectF(x + 3 * s, y + 3 * s, 14 * s, 14 * s), 4.0f * s);
             g.DrawPath(&pen, &square);
+            break;
+        }
+        case R::Feedback: {
+            // a speech bubble, its tail at the bottom left, and two lines
+            // written in it. One figure: the outline round by its corners,
+            // out to the tail's tip and back.
+            const auto at = [&](float u) { return u * s; };
+            const float d = at(5);   // the corners' arcs
+            Gdiplus::GraphicsPath bubble;
+            bubble.AddArc(x + at(2.5f), y + at(3), d, d, 180.0f, 90.0f);
+            bubble.AddArc(x + at(17.5f) - d, y + at(3), d, d, 270.0f, 90.0f);
+            bubble.AddArc(x + at(17.5f) - d, y + at(13.5f) - d, d, d, 0.0f, 90.0f);
+            bubble.AddLine(x + at(10), y + at(13.5f), x + at(6), y + at(17.2f));
+            bubble.AddLine(x + at(6), y + at(17.2f), x + at(6), y + at(13.5f));
+            bubble.AddArc(x + at(2.5f), y + at(13.5f) - d, d, d, 90.0f, 90.0f);
+            bubble.CloseFigure();
+            g.DrawPath(&pen, &bubble);
+            line(6.5f, 7, 13.5f, 7);
+            line(6.5f, 10, 11, 10);
             break;
         }
     }
@@ -2539,6 +2562,7 @@ void MinerGUI::setUexThreads(std::shared_ptr<const UexThreads> threads) {
 void MinerGUI::openUexTabForShot(const char* ore, const char* gem) {
     if (ore) {
         plannerUex_ = true;
+        plannerByPlace_ = false;
         plannerMineral_ = ore;
         plannerGem_ = gem ? gem : "";
         plannerPlace_.clear();
@@ -2797,9 +2821,28 @@ bool MinerGUI::processMessages() {
         //
         // Esc and Enter still arrive either way: the window procedure closes
         // the list and leaves the field on them.
+        //
+        // The Feedback page's two fields likewise - and while one of them
+        // has the caret, a key that goes to one of the window's own buttons
+        // (Live, clicked in the middle of a sentence, has the focus then) is
+        // the field's as well: the caret says where the letters go, and Q is
+        // not to quit the app with a message half written.
+        if (feedbackTyping() && msg.hwnd != hwnd_ &&
+            (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP || msg.message == WM_CHAR ||
+             msg.message == WM_SYSKEYDOWN)) {
+            // (the header's buttons only: the tools' windows have the main
+            // window for their parent too, and their keys are their own)
+            for (HWND button : {btnLiveMode_, btnPlan_, btnCraft_, btnNotes_, btnKeys_, btnOverlay_, btnRefinery_,
+                                btnAbout_, btnSettings_, btnPlugins_}) {
+                if (!button || button != msg.hwnd) continue;
+                SetFocus(hwnd_);
+                msg.hwnd = hwnd_;
+                break;
+            }
+        }
         const bool typingHere = (lookingOpen_ || datarunnerOpen_ ||
                                  (loadoutOpen_ && (craftedEditing_ || nameEditing_ || modulePicker_ >= 0)) ||
-                                 (pluginPageUp() && !pluginTyping_.empty())) &&
+                                 (pluginPageUp() && !pluginTyping_.empty()) || feedbackTyping()) &&
             msg.hwnd == hwnd_ &&
             (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP ||
              msg.message == WM_CHAR || msg.message == WM_SYSKEYDOWN);
@@ -3178,6 +3221,12 @@ LRESULT MinerGUI::handleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 dragOverlayGrip();
                 return 0;
             }
+            // the button held down in a field of the Feedback page: what
+            // the pointer passes is marked
+            if (fbDragging_) {
+                dragFeedback(hwnd, (float)((short)LOWORD(lParam) - railWidth()), (float)(short)HIWORD(lParam));
+                return 0;
+            }
             trackHover(hwnd, hoverMain_, lParam);
             break;
         case WM_LBUTTONUP:
@@ -3189,8 +3238,14 @@ LRESULT MinerGUI::handleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 ReleaseCapture();   // WM_CAPTURECHANGED ends the drag
                 return 0;
             }
+            if (fbDragging_) {
+                fbDragging_ = false;
+                if (GetCapture() == hwnd) ReleaseCapture();
+                return 0;
+            }
             break;
         case WM_CAPTURECHANGED:
+            fbDragging_ = false;
             if (moduleScrollDrag_) {
                 moduleScrollDrag_ = false;
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -3212,6 +3267,26 @@ LRESULT MinerGUI::handleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                     SetCursor(LoadCursor(nullptr, IDC_SIZENWSE));
                     return TRUE;
                 }
+            }
+            // over a field of the Feedback page, the text's own pointer
+            if (feedbackPageUp() && LOWORD(lParam) == HTCLIENT &&
+                !(keysOpen_ || aboutOpen_ || backupOpen_ || whatsNewOpen_ || uexWelcome_.step)) {
+                POINT at = {};
+                GetCursorPos(&at);
+                ScreenToClient(hwnd, &at);
+                const float px = (float)(at.x - railWidth()), py = (float)at.y;
+                if (fbDragging_ || fbTextRect_.Contains(px, py) || fbNameRect_.Contains(px, py)) {
+                    SetCursor(LoadCursor(nullptr, IDC_IBEAM));
+                    return TRUE;
+                }
+            }
+            break;
+        // The Feedback page's caret shows while the window has the keys
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS:
+            if (feedbackPage_ && !headless_) {
+                fbCaretOn_ = uMsg == WM_SETFOCUS;
+                InvalidateRect(hwnd, nullptr, FALSE);
             }
             break;
         case WM_MOUSELEAVE:
@@ -3292,6 +3367,12 @@ LRESULT MinerGUI::handleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         }
 
         case WM_CHAR: {
+            // The Feedback page: what is typed goes into the field with the
+            // caret, and nowhere else
+            if (feedbackTyping()) {
+                feedbackChar(hwnd, wParam);
+                return 0;
+            }
             // The Datarunner's card: a figure typed into a value, letters
             // narrowing a list, Esc letting go of either - or of the card
             if (datarunnerOpen_) {
@@ -3378,6 +3459,12 @@ LRESULT MinerGUI::handleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         }
 
         case WM_KEYDOWN:
+            // The Feedback page's fields: every key is theirs while one has
+            // the caret, taken or not - none is a shortcut then
+            if (feedbackTyping()) {
+                feedbackKey(hwnd, wParam);
+                return 0;
+            }
             if (loadoutOpen_ && (modulePicker_ >= 0 || laserPickerOpen_) && wParam == VK_ESCAPE) {
                 if (modulePicker_ >= 0) {
                     modulePicker_ = -1;
@@ -3449,6 +3536,11 @@ LRESULT MinerGUI::handleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 gearScroll_ = (std::max)(0.0f, gearScroll_ - GET_WHEEL_DELTA_WPARAM(wParam) / (float)WHEEL_DELTA *
                                                                  scaleF(56));
                 InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            // ...and on the Feedback page a message longer than its field
+            if (feedbackPageUp() && !(keysOpen_ || aboutOpen_ || backupOpen_ || uexWelcome_.step)) {
+                wheelFeedback(hwnd, GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA);
                 return 0;
             }
             break;
@@ -3637,6 +3729,11 @@ LRESULT MinerGUI::handleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
             // the scan page, takes its clicks below.)
             if (gearPageUp() && !phoneTapping_ && !loadoutOpen_) {
                 pressGear(hwnd, px, py);
+                return 0;
+            }
+            // The Feedback page: its fields and Send
+            if (feedbackPageUp() && !phoneTapping_) {
+                pressFeedback(hwnd, px, py, (wParam & MK_SHIFT) != 0);
                 return 0;
             }
             // What lies over the page takes the click before anything under
@@ -4012,6 +4109,18 @@ LRESULT MinerGUI::handleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 drIntroTick();
                 return 0;
             }
+            if (wParam == TIMER_FEEDBACK) {
+                // the caret, on and off - while a field has it, the window
+                // has the keys and nothing lies over the page (a sheet's
+                // glass keeps the picture under it, which is not to change)
+                if (!feedbackPage_) {
+                    KillTimer(hwnd, TIMER_FEEDBACK);
+                } else if (feedbackTyping() && GetFocus() == hwnd) {
+                    fbCaretOn_ = !fbCaretOn_;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
             if (wParam == 1) {
                 pulseOn_ = !pulseOn_;
                 // ...and for a match the shopping list wants, which blinks
@@ -4160,6 +4269,12 @@ void MinerGUI::paintWindowBody(Gdiplus::Graphics& g, int cw, int ch) {
             drawGearPage(b, cw, ch);
             return;
         }
+        // ...or the Feedback page
+        if (feedbackPageUp()) {
+            drawHeader(b, cw, true);
+            drawFeedbackPage(b, cw, ch);
+            return;
+        }
         drawHeader(b, cw);
         lookHits_.clear();
         drawContextCard(b, cw);
@@ -4183,7 +4298,7 @@ void MinerGUI::paintWindowBody(Gdiplus::Graphics& g, int cw, int ch) {
     // The three lists that drop out of their fields: the ores, the
     // ship, the place
     auto paintLists = [&](Gdiplus::Graphics& b) {
-        if (pluginPageUp()) return;   // (the scan page's own)
+        if (pluginPageUp() || feedbackPageUp()) return;   // (the scan page's own)
         if (lookingOpen_) drawLookingPanel(b, cw, ch);
         if (shipPickerOpen_) drawShipPicker(b, cw);
         if (placePickerOpen_) drawPlacePicker(b, cw, ch);
@@ -4203,7 +4318,7 @@ void MinerGUI::paintWindowBody(Gdiplus::Graphics& g, int cw, int ch) {
     const bool backupUp = backupOpen_ && pcCards, uexUp = uexWelcome_.step && pcCards,
                datarunnerUp = datarunnerOpen_ && pcCards;
     const bool sheet = keysOpen_ || aboutOpen_ || backupUp || whatsNewOpen_ || loadoutOpen_ || uexUp || datarunnerUp;
-    const bool lists = !pluginPageUp() && (lookingOpen_ || shipPickerOpen_ || placePickerOpen_);
+    const bool lists = !pluginPageUp() && !feedbackPageUp() && (lookingOpen_ || shipPickerOpen_ || placePickerOpen_);
     if (sheet || lists) {
         Gdiplus::Bitmap base(cw, ch, PixelFormat32bppPARGB);
         const POINT hover = hoverMain_;
@@ -4258,8 +4373,9 @@ void MinerGUI::paintWindowBody(Gdiplus::Graphics& g, int cw, int ch) {
 // Down the full window's left, a step darker than the window: Bedrock's
 // mark at the head, the pages - the scan, each plugin and the plugins' list -
 // and the tools that have windows of their own, lit while those are open;
-// the settings and the Datarunner at the foot. A count where the window has
-// one: the Datarunner's pictures waiting, the Refinery's work orders done.
+// the feedback, the settings and the Datarunner at the foot. A count where
+// the window has one: the Datarunner's pictures waiting, the Refinery's work
+// orders done.
 void MinerGUI::drawRail(Gdiplus::Graphics& g, int rw, int ch) {
     railHits_.clear();
     if (rw <= 0) return;
@@ -4277,13 +4393,16 @@ void MinerGUI::drawRail(Gdiplus::Graphics& g, int rw, int ch) {
 
     const float itemW = 60 * s, itemH = 52 * s, gap = 2 * s;
     const float x = ((float)rw - itemW) / 2.0f;
-    const float footY = (float)ch - 12 * s - 2 * itemH - gap;   // the settings, the Datarunner under them
+    // the foot: the feedback - where the build can send it -, the settings
+    // under it and the Datarunner last
+    const int footItems = fbAvailable_ ? 3 : 2;
+    const float footY = (float)ch - 12 * s - footItems * itemH - (footItems - 1) * gap;
     // Bedrock's amber square at the head, over the pages
     const float mark = 14 * s;
     fillRoundRect(g, Gdiplus::RectF(((float)rw - mark) / 2.0f, 12 * s + (40 * s - mark) / 2.0f, mark, mark), 4 * s,
                   COL_ACCENT);
     float y = 52 * s;
-    const bool page = !pluginPage_ && !gearPage_;   // the scan's page, or the Datarunner's over it
+    const bool page = !pluginPage_ && !gearPage_ && !feedbackPage_;   // the scan's page, or the Datarunner's over it
     const auto item = [&](R kind, const std::wstring& label, const std::string& id, bool active, int count,
                           const Gdiplus::Color& face) {
         const Gdiplus::RectF box(x, y, itemW, itemH);
@@ -4330,7 +4449,7 @@ void MinerGUI::drawRail(Gdiplus::Graphics& g, int rw, int ch) {
     y = lineY + 9 * s;
     for (const auto& e : pluginList_) {
         if (!e.installed || !e.problem.empty()) continue;
-        // (as many as leave room for the list's own above the settings)
+        // (as many as leave room for the list's own above the foot)
         if (y + 2 * itemH + gap > footY - gap) break;
         item(R::Plugin, toW(e.name.empty() ? e.id : e.name), e.id, pluginPage_ && pluginShown_ == e.id, 0,
              COL_ACCENT);
@@ -4338,6 +4457,7 @@ void MinerGUI::drawRail(Gdiplus::Graphics& g, int rw, int ch) {
     item(R::Plugins, L"Plugins", "", pluginPage_ && pluginShown_.empty(), 0, COL_ACCENT);
 
     y = (std::max)(y, footY);
+    if (fbAvailable_) item(R::Feedback, L"Feedback", "", feedbackPage_, 0, COL_ACCENT);
     item(R::Settings, L"Settings", "", settingsVisible_, 0, COL_ACCENT);
     item(R::Datarunner, L"Datarunner", "", page && datarunnerOpen_, datarunnerWaiting(), COL_ACCENT);
 }
@@ -4346,7 +4466,7 @@ void MinerGUI::railPick(RailItem item, const std::string& id) {
     using R = RailItem;
     const bool datarunnerWasOpen = datarunnerOpen_;
     const bool aPage = item == R::Scan || item == R::Gear || item == R::Datarunner || item == R::Plugins ||
-                       item == R::Plugin;
+                       item == R::Plugin || item == R::Feedback;
     // a card over the page goes, as a click beside it would take it away;
     // the Datarunner's is a page, and goes for another page only
     if (aPage) closeOtherSheets(pluginPage_);
@@ -4387,6 +4507,9 @@ void MinerGUI::railPick(RailItem item, const std::string& id) {
         case R::Plugin:
             showPluginPage(id);
             break;
+        case R::Feedback:
+            showFeedbackPage();
+            break;
     }
     // the page has the keys: a search typed into, the arrows scrolling
     if (aPage && hwnd_ && !headless_) SetFocus(hwnd_);
@@ -4394,10 +4517,10 @@ void MinerGUI::railPick(RailItem item, const std::string& id) {
 }
 
 void MinerGUI::toScanPage() {
-    // the Gear page goes, and its lists are no longer asked for
+    // the Gear page goes, or the Feedback page
+    leaveFeedbackPage();
     if (gearPage_) {
         gearPage_ = false;
-        gearListsWanted_ = false;
         if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
     }
     if (!pluginPage_) return;
@@ -4514,11 +4637,16 @@ void MinerGUI::drawHeader(Gdiplus::Graphics& g, int cw, bool stripOnly) {
         const float x = M - scaleF(5), metaX = M - scaleF(3);
         const bool plugin = pluginPageUp();
         const bool gear = gearPageUp();
-        const std::wstring title = plugin ? toW(pluginCurrent_.title) : std::wstring(gear ? L"Gear" : L"Scan");
+        const bool feedback = feedbackPageUp();
+        const std::wstring title = plugin ? toW(pluginCurrent_.title)
+                                          : std::wstring(gear ? L"Gear" : feedback ? L"Feedback" : L"Scan");
         g.DrawString(title.c_str(), -1, &titleFont, Gdiplus::RectF(x, scaleF(5), subRight - x, scaleF(31)), &oneLine,
                      &textBrush);
         if (plugin) {
             g.DrawString(toW(pluginCurrent_.subtitle).c_str(), -1, &metaFont,
+                         Gdiplus::RectF(metaX, scaleF(33), subRight - metaX, scaleF(17)), &oneLine, &dimBrush);
+        } else if (feedback) {
+            g.DrawString(L"Bug reports and ideas", -1, &metaFont,
                          Gdiplus::RectF(metaX, scaleF(33), subRight - metaX, scaleF(17)), &oneLine, &dimBrush);
         } else if (gear) {
             // the game, and where the shops' distances are from
@@ -5129,6 +5257,11 @@ LaserOutput MinerGUI::firingOutput() const {
 // through the head that coloured it (see rockOwnResistance).
 float MinerGUI::rockOwnResistanceBare() const {
     if (rock_.resistance <= 0) return 0.0f;     // none, or not read
+    // 5.0 prints the laser's modifier beside the figure, and the figure
+    // already carries it: the rock's own is the figure taken back through it
+    if (rock_.deltasRead) {
+        return rockOwnResistance(rock_.resistance, rock_.resistanceDelta != 0, 1.0f + rock_.resistanceDelta / 100.0f);
+    }
     // In a turret the panel is coloured by that turret's head alone
     const int own = ownHead();
     if (own >= 0) {
@@ -5289,7 +5422,7 @@ float MinerGUI::shareForHead(int head) const {
     if (!heads_[head].laser) return -1;
     const LaserOutput one = onRock(head);
     if (one.atRange <= 0) return -1;
-    return rock_.mass * BREAK_DECAY_PER_MASS / one.atRange;
+    return rock_.mass * modelOf(rock_).decayPerMass / one.atRange;
 }
 
 // The heads that can do it on their own, the safest of them first.
@@ -5328,7 +5461,7 @@ std::vector<int> MinerGUI::headsThatHoldAlone() const {
 std::vector<int> MinerGUI::fewestHeadsNeeded() const {
     std::vector<int> picked;
     if (rock_.mass <= 0) return picked;
-    const float needs = rock_.mass * BREAK_DECAY_PER_MASS;
+    const float needs = rock_.mass * modelOf(rock_).decayPerMass;
 
     // Strongest first, because the question is how FEW. Widest window first
     // answers a different one: on a MOLE with a Hofstede and two Helixes it
@@ -5673,17 +5806,18 @@ static std::string moduleShortName(const MiningModule& m) {
 
 // Every figure the module moves, the biggest first and the rest in the order
 // they are stored. The first segment says whether it is fired or always on.
-// Power is a factor, the rest are per cent. Power alone says nothing about a
-// Focus III (0.95 power, +40 window), nor about the modules that leave power
-// where it is. Empty means it moves nothing, and then it is not a module
-// worth a row.
+// Power is a factor, the rest are per cent; inert material goes down by what
+// the filter takes out, and is signed so, as the game prints it (FLTR: -20%
+// inert). Power alone says nothing about a Focus III (0.95 power, +40
+// window), nor about the modules that leave power where it is. Empty means
+// it moves nothing, and then it is not a module worth a row.
 static std::wstring moduleEffect(const MiningModule& m) {
     struct Moved { float by; const wchar_t* what; };
     const Moved all[] = {
         {(m.power - 1.0f) * 100.0f, L"pwr"},
         {m.window, L"win"},
         {m.rate, L"rate"},
-        {m.filter, L"inert"},
+        {-m.filter, L"inert"},
         {m.resistance, L"res"},
         {m.instability, L"inst"},
         {m.shatter, L"shat"},
@@ -6693,13 +6827,13 @@ void MinerGUI::showGearPage() {
     closeOtherSheets(gearPage_);   // the scan page's lists and cards go
     endPluginTyping(false);
     pluginPage_ = false;
+    leaveFeedbackPage();   // (one page at a time)
     if (!gearPage_) {
         // a fresh look: the list at its top, nothing unfolded
         gearScroll_ = 0.0f;
         gearOpen_.clear();
     }
     gearPage_ = true;
-    gearListsWanted_ = true;   // UEX is asked for the lists while the page is up
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -7015,13 +7149,33 @@ void MinerGUI::drawGearPage(Gdiplus::Graphics& g, int cw, int ch) {
                          &dimBrush);
             nameEnd = priceX;
         }
-        // the name, a module's effect right behind it, a head's figures
-        // under it as Edit ship prints them
+        // the name, a module's effect behind it, a head's figures under it as
+        // Edit ship prints them
         const float nameRoom = (std::max)(scaleF(40), nameEnd - scaleF(10) - left);
         g.DrawString(r.name.c_str(), -1, &nameFont, Gdiplus::RectF(left, rowY, nameRoom, scaleF(20)), &oneLine,
                      r.fitted ? &greenBrush : &textBrush);
+        // the i, right behind the name, on its capitals' middle: under the
+        // pointer it lights, and what the item is and does comes up over
+        // the list (drawn last, below)
+        const float nameW = lineWidth(g, r.name, nameFont);
+        float effectX = left + nameW + scaleF(3);
+        if (r.index >= 0) {
+            const float d = scaleF(12);
+            const float iconX = std::round(left + nameW + scaleF(2));
+            if (iconX + d < left + nameRoom) {
+                const Gdiplus::RectF icon(iconX, std::round(rowY + capMiddle - d / 2), d, d);
+                const Gdiplus::RectF iconHit(icon.X - scaleF(4), icon.Y - scaleF(4), d + scaleF(8), d + scaleF(8));
+                const bool asked = seen(iconHit);
+                drawInfoMark(g, icon, asked ? COL_ACCENT : COL_TEXT_FAINT);
+                if (asked) {
+                    infoFor = r.index;
+                    infoIcon = icon;
+                }
+                hit(iconHit, 10, r.index, r.item);
+                effectX = icon.GetRight() + scaleF(5);
+            }
+        }
         if (!r.effect.empty()) {
-            const float effectX = left + lineWidth(g, r.name, nameFont) + scaleF(3);
             if (effectX < left + nameRoom - scaleF(24)) {
                 Gdiplus::SolidBrush effectBrush(r.fitted ? tint(COL_GREEN, 190) : COL_TEXT_DIM);
                 g.DrawString(r.effect.c_str(), -1, &smallFont,
@@ -7033,31 +7187,15 @@ void MinerGUI::drawGearPage(Gdiplus::Graphics& g, int cw, int ch) {
         if (!r.stats.empty()) {
             g.DrawString(r.stats.c_str(), -1, &smallFont, Gdiplus::PointF(left, rowY + scaleF(19)), &dimBrush);
         }
-        // a gadget's i, right behind its name, on its capitals' middle:
-        // under the pointer it lights, and what the gadget does comes up
-        // over the list (drawn last, below)
-        if (tab == 2 && r.index >= 0) {
-            const float d = scaleF(12);
-            const float iconX = std::round(left + lineWidth(g, r.name, nameFont) + scaleF(2));
-            if (iconX + d < left + nameRoom) {
-                const Gdiplus::RectF icon(iconX, std::round(rowY + capMiddle - d / 2), d, d);
-                const Gdiplus::RectF iconHit(icon.X - scaleF(4), icon.Y - scaleF(4), d + scaleF(8), d + scaleF(8));
-                const bool asked = seen(iconHit);
-                drawInfoMark(g, icon, asked ? COL_ACCENT : COL_TEXT_FAINT);
-                if (asked) {
-                    infoFor = r.index;
-                    infoIcon = icon;
-                }
-                hit(iconHit, 10, r.index, r.item);
-            }
-        }
         // where it is sold: the nearest places, as many as the line holds -
         // a click unfolds every shop under it
         const float lineY = rowY + scaleF(headsList ? 34.0f : 19.0f);
         const float lineRoom = right - left;
         if (gearShops_ && r.shops.empty()) {
-            g.DrawString(L"No shop known to UEX", -1, &smallFont, Gdiplus::RectF(left, lineY, lineRoom, scaleF(16)),
-                         &oneLine, &faintBrush);
+            // none known: made, not bought, where the game has a blueprint
+            // of it (Clearcut, Deluge, Overrun, the Golem's Pitman)
+            g.DrawString(noShopWords(r.item), -1, &smallFont, Gdiplus::RectF(left, lineY, lineRoom, scaleF(16)), &oneLine,
+                         &faintBrush);
         } else if (r.open) {
             // Unfolded: the shops in a panel of their own under the row, a
             // tone under the card - a line a shop, nearest first: the place,
@@ -7145,64 +7283,109 @@ void MinerGUI::drawGearPage(Gdiplus::Graphics& g, int cw, int ch) {
         addRoundRect(shape, fade, scaleF(R_CARD));
         g.FillPath(&shade, &shape);
     }
-    // What the gadget under the pointer does, over the list, hanging from
-    // its i - or above it where the window ends first: what it helps with
-    // in green and what it costs in red, as much as its item file gives
-    // (OptiMax's resistance -25 %, where the game's text says -30), then
-    // the game's own words about it
+    // What the item under the pointer is and does, over the list, hanging
+    // from its i - or above it where the window ends first: a head's own
+    // figures and an active module's uses and how long each runs, in the
+    // plain ink; what it helps with in green and what it costs in red, as
+    // much as its item file gives (OptiMax's resistance -25 %, where the
+    // game's text says -30); then the game's own words about it
     if (infoFor >= 0) {
-        const MiningGadget& gd = MINING_GADGETS[infoFor];
         Gdiplus::Font effectFont(&numeralFamily(), scaleF(Type::BODY), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-        const std::vector<GadgetEffect> effects = gadgetEffects(gd);
+        struct InfoLine {
+            std::wstring label, value;
+            int ink = 0;   // 0 a figure, 1 helps, 2 costs
+        };
+        std::vector<InfoLine> figures, effects;
+        std::vector<GearEffect> listed;
+        const char* blurb = "";
+        if (tab == 0) {
+            const MiningLaser& l = MINING_LASERS[infoFor];
+            // its power from the least the throttle lets down to, to the
+            // most - a range, as the game's own description gives it
+            figures.push_back({L"Laser power", formatNumber((int)std::lround(l.fracture * l.throttleMin)) + L"\u2013" +
+                                                   formatNumber((int)std::lround(l.fracture))});
+            figures.push_back({L"Extraction power", formatNumber((int)std::lround(l.extraction))});
+            wchar_t metres[32];
+            std::swprintf(metres, 32, L"%.0f m", l.fullRange);
+            figures.push_back({L"Optimal range", metres});
+            std::swprintf(metres, 32, L"%.0f m", l.zeroRange);
+            figures.push_back({L"Maximum range", metres});
+            figures.push_back({L"Module slots", std::to_wstring((int)l.slots)});
+            listed = laserEffects(l);
+            blurb = l.blurb;
+        } else if (tab == 1) {
+            const MiningModule& m = MINING_MODULES[infoFor];
+            if (m.active) {
+                figures.push_back({L"Uses", std::to_wstring((int)m.uses)});
+                figures.push_back({L"Duration", std::to_wstring((int)m.seconds) + L" s"});
+            }
+            listed = moduleEffects(m);
+            blurb = m.blurb;
+        } else {
+            const MiningGadget& gd = MINING_GADGETS[infoFor];
+            listed = gadgetEffects(gd);
+            blurb = gd.blurb;
+        }
+        for (const GearEffect& e : listed) {
+            // a whole figure as such, a part where the file has one (Overrun's resistance -24.8)
+            wchar_t v[32];
+            std::swprintf(v, 32, e.by == std::round(e.by) ? L"%+.0f %%" : L"%+.1f %%", e.by);
+            effects.push_back({toW(e.what), v, e.helps ? 1 : 2});
+        }
         const float pad = scaleF(12);
         const float popW = (std::min)(scaleF(340), cardW - scaleF(8));
         const float popX = std::round((std::max)(cardX + scaleF(4), (std::min)(left - scaleF(8), cardX + cardW - scaleF(4) - popW)));
         const float textX = popX + pad, textW = popW - 2 * pad;
-        std::vector<std::wstring> labels, values;
         float labelW = 0, valueW = 0;
-        for (const GadgetEffect& e : effects) {
-            wchar_t v[32];
-            std::swprintf(v, 32, L"%+.0f %%", e.by);
-            labels.push_back(toW(e.what));
-            values.push_back(v);
-            labelW = (std::max)(labelW, lineWidth(g, labels.back(), smallFont));
-            valueW = (std::max)(valueW, lineWidth(g, values.back(), effectFont));
+        for (const std::vector<InfoLine>* group : {&figures, &effects}) {
+            for (const InfoLine& line : *group) {
+                labelW = (std::max)(labelW, lineWidth(g, line.label, smallFont));
+                valueW = (std::max)(valueW, lineWidth(g, line.value, effectFont));
+            }
         }
-        const float effectStep = scaleF(17), wordsGap = scaleF(7);
+        const float effectStep = scaleF(17);
+        const float groupGap = figures.empty() || effects.empty() ? 0.0f : scaleF(6);
+        const float linesH = effectStep * (float)(figures.size() + effects.size()) + groupGap;
         // (broken a little short of the box: the Linux build sets 12.1 px
         // at 12, and a line broken at its width would wrap once more in
         // Windows' wider letters)
-        const Fitted words = fitLines(g, toW(gd.blurb), smallFont, textW - scaleF(4));
+        const Fitted words = fitLines(g, toW(blurb), smallFont, textW - scaleF(4));
         Gdiplus::RectF lineBox;
         g.MeasureString(L"Ag", -1, &smallFont, Gdiplus::PointF(0, 0), &lineBox);
-        const float wordsH = lineBox.Height + words.more;
-        const float popH = std::round(scaleF(9) + effectStep * (float)effects.size() + wordsGap + wordsH + scaleF(8));
+        const float wordsGap = words.text.empty() ? 0.0f : scaleF(7);
+        const float wordsH = words.text.empty() ? 0.0f : lineBox.Height + words.more;
+        const float popH = std::round(scaleF(9) + linesH + wordsGap + wordsH + scaleF(8));
         float popY = infoIcon.GetBottom() + scaleF(6);
         if (popY + popH > (float)ch - scaleF(8)) popY = (std::max)(scaleF(8), infoIcon.Y - scaleF(6) - popH);
         const Gdiplus::RectF pop(popX, std::round(popY), popW, popH);
         dropShadow(g, pop, radius, scaleF(8));
         fillRoundRect(g, pop, radius, COL_CARD_HI);
-        // each effect on one baseline: its words, its figure at the right
-        // of a column of its own
+        // each line on one baseline: its words, its figure at the right of a
+        // column of its own
         Gdiplus::StringFormat rightTop;
         rightTop.SetAlignment(Gdiplus::StringAlignmentFar);
         rightTop.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
         Gdiplus::SolidBrush redBrush(COL_RED);
         const float valueX = textX + labelW + scaleF(16);
         float baseline = pop.Y + scaleF(9) + scaleF(13);
-        for (size_t k = 0; k < effects.size(); k++) {
-            g.DrawString(labels[k].c_str(), -1, &smallFont,
+        const auto drawLine = [&](const InfoLine& line) {
+            g.DrawString(line.label.c_str(), -1, &smallFont,
                          Gdiplus::PointF(textX, std::round(baseline - fontAscent(smallFont))), &dimBrush);
             const float valueTop = std::round(baseline - fontAscent(effectFont));
-            g.DrawString(values[k].c_str(), -1, &effectFont, Gdiplus::RectF(valueX, valueTop, valueW, scaleF(18)),
-                         &rightTop, effects[k].helps ? &greenBrush : &redBrush);
+            g.DrawString(line.value.c_str(), -1, &effectFont, Gdiplus::RectF(valueX, valueTop, valueW, scaleF(18)),
+                         &rightTop, line.ink == 1 ? &greenBrush : line.ink == 2 ? &redBrush : &textBrush);
             baseline += effectStep;
+        };
+        for (const InfoLine& line : figures) drawLine(line);
+        baseline += groupGap;
+        for (const InfoLine& line : effects) drawLine(line);
+        if (!words.text.empty()) {
+            Gdiplus::StringFormat lines;   // broken by fitLines: in a box as wide as it was broken for
+            lines.SetTrimming(Gdiplus::StringTrimmingNone);
+            const float wordsY = pop.Y + scaleF(9) + linesH + wordsGap;
+            g.DrawString(words.text.c_str(), -1, &smallFont, Gdiplus::RectF(textX, wordsY, textW, wordsH + scaleF(2)),
+                         &lines, &faintBrush);
         }
-        Gdiplus::StringFormat lines;   // broken by fitLines: in a box as wide as it was broken for
-        lines.SetTrimming(Gdiplus::StringTrimmingNone);
-        const float wordsY = pop.Y + scaleF(9) + effectStep * (float)effects.size() + wordsGap;
-        g.DrawString(words.text.c_str(), -1, &smallFont, Gdiplus::RectF(textX, wordsY, textW, wordsH + scaleF(2)),
-                     &lines, &faintBrush);
     }
 }
 
@@ -7433,7 +7616,7 @@ float MinerGUI::holdWithoutActives(const std::vector<const MiningLoadout*>& fits
         through += alone.atRange * resistanceLetsThrough(resistance, alone.resistance);
     }
     if (through <= 0) return -1;
-    const float share = rock_.mass * BREAK_DECAY_PER_MASS / through;
+    const float share = rock_.mass * modelOf(rock_).decayPerMass / through;
     return share <= BREAK_EDGE ? share * 100.0f : -1.0f;
 }
 
@@ -7475,7 +7658,7 @@ MinerGUI::RockVerdict MinerGUI::rockVerdict() const {
     }
 
     const LaserOutput out = firingOutput();
-    const float needs = rock_.mass * BREAK_DECAY_PER_MASS;
+    const float needs = rock_.mass * modelOf(rock_).decayPerMass;
     const int heads = firingCount();
     v.sway = rock_.instability > 1.0f ? 4.0f : 0.0f;
 
@@ -7574,7 +7757,8 @@ MinerGUI::RockVerdict MinerGUI::rockVerdict() const {
                 note += (note.empty() ? L"Also capable - " : L", ") + std::wstring(text);
             }
             if (heads > 1) {
-                const ThrottleAdvice all = throttleFor(rock_.mass, loadout_.laser, out.atRange);
+                const ThrottleAdvice all = throttleFor(rock_.mass, loadout_.laser, out.atRange,
+                                                       modelOf(rock_).decayPerMass);
                 std::swprintf(text, 256, L"All %d lasers together at approximately %s power each", heads,
                               powerWords(all.toHold, v.sway).c_str());
                 if (!note.empty()) note += L"  ·  ";
@@ -7591,7 +7775,7 @@ MinerGUI::RockVerdict MinerGUI::rockVerdict() const {
             return v;
         }
         const std::vector<int> together = fewestHeadsNeeded();
-        const ThrottleAdvice all = throttleFor(rock_.mass, loadout_.laser, out.atRange);
+        const ThrottleAdvice all = throttleFor(rock_.mass, loadout_.laser, out.atRange, modelOf(rock_).decayPerMass);
         if (!together.empty()) {
             float have = 0, floor = 0;
             std::wstring which;
@@ -7637,7 +7821,7 @@ MinerGUI::RockVerdict MinerGUI::rockVerdict() const {
             return v;
         }
     } else {
-        const ThrottleAdvice one = throttleFor(rock_.mass, loadout_.laser, out.atRange);
+        const ThrottleAdvice one = throttleFor(rock_.mass, loadout_.laser, out.atRange, modelOf(rock_).decayPerMass);
         if (one.possible && one.overpowered) {
             tooStrong(loadout_, -1, one.toHold / 100.0f);
             return v;
@@ -8078,7 +8262,8 @@ int MinerGUI::drawRockOutput(Gdiplus::Graphics& g, int cw, int yPos) {
             state.words = powerWords(v.hold, 0.0f);
             state.standing = v.kind == RockVerdict::Solo && v.good ? 2 : 1;
         } else if (v.kind == RockVerdict::WontHold) {
-            const ThrottleAdvice one = throttleFor(rock_.mass, loadout_.laser, firingOutput().atRange);
+            const ThrottleAdvice one = throttleFor(rock_.mass, loadout_.laser, firingOutput().atRange,
+                                                   modelOf(rock_).decayPerMass);
             wchar_t needsText[48];
             std::swprintf(needsText, 48, L"Requires %.0f %%", one.toHold);
             state.words = one.toHold > 0 ? needsText : L"—";
@@ -8165,7 +8350,7 @@ int MinerGUI::drawRockOutput(Gdiplus::Graphics& g, int cw, int yPos) {
     if (v.kind != RockVerdict::HeadsOff && rock_.mass > 0) {
         const int own = ownHead();
         const LaserOutput out = own >= 0 ? onRock(own) : firingOutput();
-        const float needs = rock_.mass * BREAK_DECAY_PER_MASS;
+        const float needs = rock_.mass * modelOf(rock_).decayPerMass;
         wchar_t part[192];
         std::swprintf(part, 192, L"Effective power %s  ·  Required power %s", formatNumber((int)out.atRange).c_str(),
                       formatNumber((int)needs).c_str());
@@ -8217,9 +8402,10 @@ int MinerGUI::drawRockOutput(Gdiplus::Graphics& g, int cw, int yPos) {
 }
 
 // When what is on the ship will not hold the rock: the head that would, off
-// the shop shelf - stock if stock is enough, with the strongest modules it
-// has room for if not - or the plain word that nothing that fits this ship
-// does. On a Golem the Pitman it came with is one of them.
+// the shop shelf - stock if stock is enough, with the passive modules it has
+// room for if those are, with active ones only if nothing else holds it, and
+// then for as long as they run - or the plain word that nothing that fits
+// this ship does. On a Golem the Pitman it came with is one of them.
 MinerGUI::Suggestion MinerGUI::headSuggestion() const {
     Suggestion s;
     if (rock_.mass <= 0 || !loadout_.laser) return s;
@@ -8227,11 +8413,15 @@ MinerGUI::Suggestion MinerGUI::headSuggestion() const {
     // the rock as it stands, gadget and all, by its own resistance
     RockStats own = rock_;
     own.resistance = rockResistanceForBreak();
-    const float needs = own.mass * BREAK_DECAY_PER_MASS;
+    const float needs = own.mass * modelOf(own).decayPerMass;
     wchar_t text[192];
 
     const int8_t size = ship_ ? ship_->size : loadout_.laser->size;
-    const std::vector<LaserSuggestion> picks = suggestLasers(own, size, 0.0f, ship_);
+    // the heads on board, for a crafted one among them: the same head with
+    // other modules is an answer too
+    std::vector<MiningLoadout> aboard = heads_;
+    aboard.push_back(loadout_);
+    const std::vector<LaserSuggestion> picks = suggestLasers(own, size, ship_, aboard);
     const LaserSuggestion* best = nullptr;
     for (const LaserSuggestion& p : picks) {
         if (!p.laser || (ship_ && !laserFits(*p.laser, *ship_))) continue;
@@ -8241,28 +8431,48 @@ MinerGUI::Suggestion MinerGUI::headSuggestion() const {
         }
     }
     if (best) {
-        s.line = laserShortName(*best->laser) + moduleWords(best->modules);
-        std::swprintf(text, 192, L"%.0f %% laser power will hold charge steady, more power will raise it%s", best->throttle,
-                      best->stock ? L"  ·  No modules required" : L"");
+        MiningLoadout fit;
+        fit.laser = best->laser;
+        fit.modules = best->modules;
+        fit.craftedPower = best->crafted;
+        s.line = fitWords(fit, true);
+        const std::wstring lasts = toW(whileRuns(best->modules));
+        if (!lasts.empty()) {
+            std::swprintf(text, 192, L"%.0f %% laser power will hold charge steady%ls", best->throttle, lasts.c_str());
+        } else {
+            std::swprintf(text, 192, L"%.0f %% laser power will hold charge steady, more power will raise it%s",
+                          best->throttle, best->stock ? L"  ·  No modules required" : L"");
+        }
         s.note = text;
         s.good = true;
         return s;
     }
     s.line = L"NO COMPATIBLE LASER CAN BREAK DEPOSIT SOLO";
-    // ...but several of the strongest might, on a ship with the heads
+    // ...but several of the strongest might, on a ship with the heads: on
+    // passive modules where those are enough between them, as above. Then
+    // the heads and their modules are the card's line, as one head's are,
+    // and how they hold it the note under it. Heads off the shelf only: a
+    // crafted head is one of a kind.
     const LaserSuggestion* strongest = nullptr;
+    const LaserSuggestion* steadiest = nullptr;  // the strongest on passive modules alone
     for (const LaserSuggestion& p : picks) {
-        if (p.laser && (!ship_ || laserFits(*p.laser, *ship_)) && p.power > 0 &&
-            (!strongest || p.power > strongest->power)) {
-            strongest = &p;
-        }
+        if (!p.laser || p.crafted != 0.0f || (ship_ && !laserFits(*p.laser, *ship_))) continue;
+        if (p.power > 0 && (!strongest || p.power > strongest->power)) strongest = &p;
+        if (p.passivePower > 0 && (!steadiest || p.passivePower > steadiest->passivePower)) steadiest = &p;
     }
     const int arms = ship_ ? ship_->heads : 1;
-    if (strongest && arms > 1 && needs / (strongest->power * arms) <= 1.0f) {
-        std::swprintf(text, 192, L"%d × %s required working together, at approximately %.0f %% each", arms,
-                      (laserShortName(*strongest->laser) + moduleWords(strongest->modules)).c_str(),
-                      needs / (strongest->power * arms) * 100.0f);
+    if (steadiest && arms > 1 && needs / (steadiest->passivePower * arms) <= 1.0f) {
+        s.line = std::to_wstring(arms) + L" × " + laserShortName(*steadiest->laser) + moduleWords(steadiest->passive);
+        std::swprintf(text, 192, L"Required working together, at approximately %.0f %% each",
+                      needs / (steadiest->passivePower * arms) * 100.0f);
         s.note = text;
+        s.together = true;
+    } else if (strongest && arms > 1 && needs / (strongest->power * arms) <= 1.0f) {
+        s.line = std::to_wstring(arms) + L" × " + laserShortName(*strongest->laser) + moduleWords(strongest->modules);
+        std::swprintf(text, 192, L"Required working together, at approximately %.0f %% each%ls",
+                      needs / (strongest->power * arms) * 100.0f, toW(whileRuns(strongest->modules)).c_str());
+        s.note = text;
+        s.together = true;
     } else if (arms > 1) {
         s.note = L"Combining the full power of all available lasers on the ship would not break deposit";
     } else {
@@ -8344,7 +8554,7 @@ MinerGUI::GadgetWords MinerGUI::gadgetWords() const {
     }
 
     BreakBalance balance;
-    balance.needs = rock_.mass * BREAK_DECAY_PER_MASS;
+    balance.needs = rock_.mass * modelOf(rock_).decayPerMass;
     balance.ownResistance = rockOwnResistanceBare();
     balance.powerThrough = [this](float own) { return powerThroughSolo(own); };
     // the range is the head's the rock view speaks to, not the card's
@@ -10135,6 +10345,26 @@ bool MinerGUI::pointInPlannerForShot(int kind, const std::string& value, bool cl
     return false;
 }
 
+bool MinerGUI::wheelPlannerForShot(bool places, int notches) {
+    if (!planner_) return false;
+    hoverPlan_ = {-1, -1};
+    if (HDC dc = GetDC(planner_)) {
+        paintPlanner(dc);
+        ReleaseDC(planner_, dc);
+    }
+    RECT rc;
+    GetClientRect(planner_, &rc);
+    // over the middle of the list of places, or of the card
+    const Gdiplus::RectF over = places ? plannerPlaceList_
+                                       : Gdiplus::RectF((float)rc.right - scaleF(120), (float)rc.bottom / 2, 1, 1);
+    if (over.Width <= 0) return false;
+    POINT at = {(LONG)(over.X + over.Width / 2), (LONG)(over.Y + over.Height / 2)};
+    ClientToScreen(planner_, &at);
+    SendMessageW(planner_, WM_MOUSEWHEEL, MAKEWPARAM(0, (WORD)(short)(notches * WHEEL_DELTA)),
+                 MAKELPARAM((WORD)(short)at.x, (WORD)(short)at.y));
+    return true;
+}
+
 // A name being typed into the open note, and what the notebook offers for
 // it, so the screenshot for the website shows the autocomplete. The letters
 // go in the way a paste would, the caret ends behind them, and the list is
@@ -11792,6 +12022,13 @@ void MinerGUI::showSystemFinderFor(const std::string& system) {
     for (auto& c : upper) c = (char)toupper((unsigned char)c);
     plannerPlace_.clear();
     plannerSystem_ = upper;
+    // (the list of places stays on its tab, on a place of that system, and
+    // the player's own system waits until they move on)
+    plannerPresetFor_ = plannerPresetKey();
+    if (plannerByPlace_) {
+        plannerPlaceScroll_ = 0;
+        settlePlannerPlace();
+    }
     if (!plannerVisible_) togglePlanner();
     else if (planner_) {
         InvalidateRect(planner_, nullptr, TRUE);
@@ -11800,13 +12037,52 @@ void MinerGUI::showSystemFinderFor(const std::string& system) {
 }
 
 void MinerGUI::showPlaceFinderFor(const std::string& place) {
-    plannerPlace_ = place;
+    const std::string named = placeNamed(place);
+    plannerPlace_ = named.empty() ? place : named;
     plannerSystem_ = "ALL";
+    // ...on the list of places, picked there and brought into view
+    plannerByPlace_ = true;
+    plannerUex_ = false;
+    plannerPlacePick_ = plannerPlace_;
+    plannerRevealPlace_ = true;
+    plannerPresetFor_ = plannerPresetKey();
     if (!plannerVisible_) togglePlanner();
     else if (planner_) {
         InvalidateRect(planner_, nullptr, TRUE);
         SetForegroundWindow(planner_);
     }
+}
+
+std::string MinerGUI::plannerPresetKey() const {
+    std::string system = currentSystem_;
+    for (char& c : system) c = (char)toupper((unsigned char)c);
+    return system + "|" + placeNamed(fromW(placeOre_));
+}
+
+bool MinerGUI::presetPlannerPlaces() {
+    const std::string key = plannerPresetKey();
+    if (key == plannerPresetFor_) return false;
+    plannerPresetFor_ = key;
+    const size_t bar = key.find('|');
+    const std::string system = key.substr(0, bar), here = key.substr(bar + 1);
+    if (!system.empty() && !placeGroups(system).empty()) plannerSystem_ = system;
+    if (!here.empty()) plannerPlace_ = here;   // (settlePlannerPlace checks it is listed)
+    plannerPlaceScroll_ = 0;
+    plannerRevealPlace_ = true;
+    return true;
+}
+
+void MinerGUI::settlePlannerPlace() {
+    const std::vector<PlaceGroup> groups = placeGroups(plannerSystem_);
+    const std::string here = placeNamed(fromW(placeOre_));
+    for (const std::string& place : {plannerPlace_, plannerPlacePick_, here}) {
+        if (place.empty() || !placeListed(groups, place)) continue;
+        if (place != plannerPlace_) plannerRevealPlace_ = true;
+        plannerPlace_ = plannerPlacePick_ = place;
+        return;
+    }
+    plannerPlace_ = plannerPlacePick_ = groups.empty() ? std::string() : groups.front().places.front();
+    plannerRevealPlace_ = true;
 }
 
 std::vector<OreLocation> MinerGUI::minedAt(const std::string& place) {
@@ -12860,6 +13136,14 @@ void MinerGUI::grindOpenOnlyForShot(bool on) {
     if (grind_) InvalidateRect(grind_, nullptr, TRUE);
 }
 
+void MinerGUI::grindFromForShot(const std::vector<std::string>& outfits, bool open) {
+    grindFactions_ = outfits;
+    grindFactionPick_ = open;
+    grindScroll_ = 0;
+    grindOpen_ = -1;
+    if (grind_) InvalidateRect(grind_, nullptr, TRUE);
+}
+
 void MinerGUI::openBlueprint(int index) {
     craftOpen_ = index;
     craftDrag_ = -1;
@@ -12890,7 +13174,7 @@ void MinerGUI::openBlueprint(int index) {
 // finder already knows, so it opens on that ore rather than repeating it here
 void MinerGUI::showOreFinderFor(const std::string& material) {
     if (material.empty()) return;
-    plannerPlace_.clear();   // back to the ore-first list
+    plannerPlace_.clear();   // back to the ore-first list (and below to the list of ores)
     // The finder lists ship ore by name; ROC and hand-mined gems live under
     // their own families, and it opens those on the gem
     if (locationsFor(material, MiningFamily::Ship).empty()) {
@@ -12898,6 +13182,7 @@ void MinerGUI::showOreFinderFor(const std::string& material) {
             plannerMineral_ = "ROC deposits";
             plannerGem_ = material;
             plannerSystem_ = "ALL";
+            plannerByPlace_ = false;
             if (!plannerVisible_) togglePlanner();
             else if (planner_) { InvalidateRect(planner_, nullptr, TRUE); SetForegroundWindow(planner_); }
             return;
@@ -12906,6 +13191,7 @@ void MinerGUI::showOreFinderFor(const std::string& material) {
             plannerMineral_ = "Hand minables";
             plannerGem_ = material;
             plannerSystem_ = "ALL";
+            plannerByPlace_ = false;
             if (!plannerVisible_) togglePlanner();
             else if (planner_) { InvalidateRect(planner_, nullptr, TRUE); SetForegroundWindow(planner_); }
             return;
@@ -12914,6 +13200,7 @@ void MinerGUI::showOreFinderFor(const std::string& material) {
     }
     plannerMineral_ = material;
     plannerSystem_ = "ALL";
+    plannerByPlace_ = false;
     if (!plannerVisible_) {
         togglePlanner();
     } else if (planner_) {
@@ -16701,6 +16988,107 @@ void MinerGUI::drawWhatsNewCard(Gdiplus::Graphics& g, int cw, int ch) {
     // however softly put, turns that into a collection. The jar sits behind the
     // ? button and along the foot of the main window. Plain words, like a patch
     // note.
+    version(L"3.0.4", L"17 November");
+    note(L"Thanks to andydsm for reporting the MOLE issue and testing the fix!");
+    gap(10);
+    group(L"NEW");
+    item(L"Feedback");
+    note(L"Something wrong or missing? Feedback, at the bottom of the sidebar,");
+    note(L"sends your message to Bedrock\u2019s server. A name is optional. Bedrock\u2019s");
+    note(L"version, the game\u2019s version and your installation number go with it, and");
+    note(L"with Attach debug folder ticked the logs, your settings, the newest");
+    note(L"snapshots and the last ten pictures of the rock panel, your user name");
+    note(L"taken out. Bedrock keeps a picture of each rock\u2019s panel for this, so a");
+    note(L"wrong reading can still be looked at when you report it later. A game");
+    note(L"patch can break a reader overnight: the sooner someone says so, the");
+    note(L"sooner it is fixed.");
+    gap(6);
+    item(L"Ore Finder by place");
+    note(L"The list has two tabs: By ore as before, and By place with each system\u2019s");
+    note(L"planets, moons, asteroid fields, caves and events and how many ores each");
+    note(L"has. Click a place to see everything mined there.");
+    gap(6);
+    item(L"Laser heads and modules");
+    note(L"On the Gear page, point at the i next to a laser head or module to see its");
+    note(L"power and range, what it helps with and what it costs, and the game\u2019s");
+    note(L"description. Items no shop sells say Craftable only.");
+    gap(6);
+    item(L"Grind Planner");
+    note(L"FROM, between SYSTEM and YOUR RANK, narrows the list to the factions");
+    note(L"you pick: click Select faction and pick one or more.");
+    gap(10);
+    group(L"IMPROVED");
+    item(L"Recommended loadout");
+    note(L"Passive modules come first. Active ones only where nothing passive holds");
+    note(L"the rock, and then the card says for how long: while Surge runs, 15 s. A");
+    note(L"crafted head on board is weighed with its bonus.");
+    gap(6);
+    item(L"Rock lists");
+    note(L"Lists of Hephaestanite and Quartz rocks come through without the ore");
+    note(L"names read: the rock\u2019s parts tell the two apart.");
+    gap(6);
+    item(L"Rock densities");
+    note(L"Aslarite, Gold, Quartz, Silicon and Tin now weigh what 501 shared rock");
+    note(L"scans say they weigh. Thank you for sharing them.");
+    gap(6);
+    item(L"Gear");
+    note(L"The shop lists load when Bedrock starts, so the page has its prices as soon");
+    note(L"as you open it.");
+    gap(10);
+    group(L"CHANGED");
+    item(L"Scanning");
+    note(L"Bedrock reads the screen only while Star Citizen runs and isn\u2019t minimized.");
+    note(L"Before, it went on reading whatever else was there.");
+    gap(6);
+    item(L"Rock scans");
+    note(L"Each rock is sent once, with its list even when the list is read late, and with");
+    note(L"a place the Ore Finder knows or none. A scan also says how Bedrock saw");
+    note(L"the rock: the height of the game picture, the size of the panel and");
+    note(L"whether the list was read. Rocks still waiting when you close the game are");
+    note(L"sent at once.");
+    gap(10);
+    group(L"FIXED");
+    item(L"MOLE in 4.10.3");
+    note(L"4.10.3 draws the rock panel smaller in the MOLE\u2019s turrets and its labels");
+    note(L"larger in the pilot seat. Bedrock looks for the panel at the sizes it knows,");
+    note(L"so it found neither and read nothing in the MOLE. It reads both again,");
+    note(L"and in a turret it knows again which laser you\u2019re on. After the MOLE, the");
+    note(L"Prospector\u2019s panel is read without restarting Bedrock.");
+    gap(6);
+    item(L"MOLE pilot seat");
+    note(L"On an HDR desktop the pilot seat\u2019s figures have colored edges. Bedrock");
+    note(L"took one for a numeral now and then, a mass of 11294 read as 111294,");
+    note(L"and missed the SCU. It counts the mass\u2019s numerals in the figure itself now");
+    note(L"and reads the SCU there too.");
+    gap(6);
+    item(L"SCU");
+    note(L"A rock\u2019s SCU stays on the card between looks. It went blank now and");
+    note(L"then, and the SCU of each part of the list with it.");
+    gap(6);
+    item(L"Laser and modules");
+    note(L"4.10.3 added a row to the laser\u2019s table on the Prospector\u2019s and the");
+    note(L"Golem\u2019s HUD. Bedrock reads the laser and the modules off it again.");
+    gap(6);
+    item(L"Golem");
+    note(L"On an HDR desktop, Bedrock reads the Golem\u2019s rock panel too.");
+    gap(6);
+    item(L"Ship");
+    note(L"When the game\u2019s log misses which ship you boarded, Bedrock tells the");
+    note(L"Prospector, the MOLE and the Golem apart by their rock panels and picks");
+    note(L"that ship\u2019s fit.");
+    gap(6);
+    item(L"Gear");
+    note(L"A FLTR module\u2019s row says -20% inert, as the game does. It said +20%.");
+    gap(10);
+    group(L"NEXT");
+    item(L"Star Citizen 5.0");
+    note(L"5.0 replaces the mining HUD: the rock panel, the laser\u2019s table and the");
+    note(L"turrets\u2019 view look different in every ship, and Bedrock needs new readers");
+    note(L"for all of them. That is where the work goes now, rather than into more");
+    note(L"fixes for the 4.10 HUD. On the PTU, Bedrock finds the new rock panel and");
+    note(L"knows the rocks of Nyx I by their signatures. It does not read the panel\u2019s");
+    note(L"figures reliably yet, so the rock view stays empty there for now.");
+    gap(10);
     version(L"3.0.3", L"12 November");
     group(L"NEW");
     item(L"Rock scans");
@@ -18136,7 +18524,10 @@ void MinerGUI::drawCompactRock(Gdiplus::Graphics& g, int cw, int ch) {
         const Suggestion s = headSuggestion();
         if (!s.line.empty()) {
             Gdiplus::SolidBrush sBrush(s.good ? COL_GREEN : COL_YELLOW);
-            line(s.good ? L"RECOMMENDED LOADOUT - " + s.line : s.line, infoFont, sBrush);
+            line(s.good       ? L"RECOMMENDED LOADOUT - " + s.line
+                 : s.together ? L"ALTERNATIVE LOADOUT - " + s.line
+                              : s.line,
+                 infoFont, sBrush);
             line(s.note, infoFont, faintBrush);
         }
     } else {
@@ -18596,6 +18987,9 @@ void MinerGUI::togglePlanner() {
     haloMenu_ = 0;      // ...nor one of places
     if (plannerVisible_) {
         plannerScroll_ = 0;
+        // the list of places on where the player is, if they have moved on
+        // since it last was
+        if (plannerByPlace_ && presetPlannerPlaces()) settlePlannerPlace();
         placePlanner();
         ShowWindow(planner_, headless_ ? SW_SHOWNOACTIVATE : SW_SHOW);
         InvalidateRect(planner_, nullptr, TRUE);
@@ -18626,8 +19020,18 @@ LRESULT MinerGUI::handlePlannerMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
             // The wheel walks the list of places (or of ores, for a place)
             // when it is longer than its card; the painting keeps it in
             // range. Not under the UEX card, nor on the market tab.
-            if (uexCard_.step || plannerUex_) return 0;
+            if (uexCard_.step) return 0;
             const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+            // ...and over the list of places on the left, that one: three
+            // rows a notch, as Windows scrolls a list
+            POINT at = {(LONG)(short)LOWORD(lParam), (LONG)(short)HIWORD(lParam)};
+            ScreenToClient(hwnd, &at);
+            if (plannerByPlace_ && plannerPlaceList_.Contains((float)at.x, (float)at.y)) {
+                plannerPlaceScroll_ = (std::max)(0, plannerPlaceScroll_ - 3 * notches);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (plannerUex_) return 0;
             plannerScroll_ = (std::max)(0, plannerScroll_ - notches);
             InvalidateRect(hwnd, nullptr, TRUE);
             return 0;
@@ -18709,7 +19113,9 @@ LRESULT MinerGUI::handlePlannerMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
                     return 0;
                 }
                 if (hit.kind == 6) {
+                    // the market is an ore's: the list of ores beside it
                     plannerUex_ = true;
+                    plannerByPlace_ = false;
                     plannerPlace_.clear();
                     InvalidateRect(hwnd, nullptr, TRUE);
                     return 0;
@@ -18757,6 +19163,31 @@ LRESULT MinerGUI::handlePlannerMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
                     return 0;
                 }
                 if (hit.kind == 16) return 0;   // (a place in a list that has just shut)
+                if (hit.kind == 17) {
+                    // a place in the list of places: what is mined there
+                    plannerPlace_ = plannerPlacePick_ = hit.value;
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                    return 0;
+                }
+                if (hit.kind == 18) {
+                    if (hit.value == "place") {
+                        // the list of places: on the player's own system and
+                        // place if they have moved on since it last was, the
+                        // card on its pick (again, after an ore of the card)
+                        plannerUex_ = false;
+                        if (!plannerByPlace_) {
+                            plannerByPlace_ = true;
+                            presetPlannerPlaces();
+                        }
+                        settlePlannerPlace();
+                    } else {
+                        // ...the list of ores, the card on the ore picked
+                        plannerByPlace_ = false;
+                        plannerPlace_.clear();
+                    }
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                    return 0;
+                }
                 if (hit.kind == 1) {
                     plannerUex_ = false;
                     plannerSystem_ = hit.value;
@@ -18767,7 +19198,13 @@ LRESULT MinerGUI::handlePlannerMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
                         !oreInSystem(plannerMineral_, plannerSystem_)) {
                         plannerMineral_.clear();
                     }
-                    plannerPlace_.clear();
+                    // the list of places stays, the card on a place of it
+                    if (plannerByPlace_) {
+                        plannerPlaceScroll_ = 0;
+                        settlePlannerPlace();
+                    } else {
+                        plannerPlace_.clear();
+                    }
                 }
                 else if (hit.kind == 3) {
                     // ...and the main window has to hear about it: the field
@@ -20553,7 +20990,8 @@ void MinerGUI::paintGemMenu(Gdiplus::Graphics& g, int ch) {
     const float listH = entryH * (float)entries.size() + 2 * pad;
     const float lx = gemMenuAnchor_.X;
     float ly = gemMenuAnchor_.GetBottom() + scaleF(4);
-    if (ly + listH > (float)ch - scaleF(8)) ly = (std::max)(scaleF(8), gemMenuAnchor_.Y - scaleF(4) - listH);
+    // under its row where it ends above the footer, else over the row
+    if (ly + listH > (float)ch - scaleF(24)) ly = (std::max)(scaleF(8), gemMenuAnchor_.Y - scaleF(4) - listH);
     gemMenuList_ = Gdiplus::RectF(lx, ly, listW, listH);
     dropShadow(g, gemMenuList_, scaleF(R_CONTROL), scaleF(10));
     fillRoundRect(g, gemMenuList_, scaleF(R_CONTROL), COL_CARD_HI);
@@ -21194,7 +21632,9 @@ void MinerGUI::paintPlanner(HDC hdc) {
                                      4, "https://uexcorp.space"});
             }
         }
-        g.DrawString(L"Select an ore before the trip \u00B7 Locations where it is the main ore, highest chance first",
+        g.DrawString(plannerByPlace_
+                         ? L"Select a place before the trip \u00B7 Ores mined there, highest chance first"
+                         : L"Select an ore before the trip \u00B7 Locations where it is the main ore, highest chance first",
                      -1, &subFont, Gdiplus::PointF(M + scaleF(15), (float)scale(36)), &dimBrush);
 
         // System tabs: words, the one in use bright with an amber bar lying
@@ -21246,7 +21686,7 @@ void MinerGUI::paintPlanner(HDC hdc) {
         // The ore that fetches most once refined, of those listed: its row
         // blinks red - by the best price UEX knows for a SCU of it, anywhere
         std::string paysMost;
-        if (uexEnabled_ && uexPrices_) {
+        if (uexEnabled_ && uexPrices_ && !plannerByPlace_) {
             std::vector<std::string> listed;
             for (const auto& m : MINERAL_SIGNATURES) {
                 if (oreInSystem(m.name, plannerSystem_)) listed.push_back(m.name);
@@ -21255,11 +21695,37 @@ void MinerGUI::paintPlanner(HDC hdc) {
         }
         planBlinkRow_ = Gdiplus::RectF();
 
-        // Left column: the ship ores by rarity, then the ground families
+        // Left column: the ship ores by rarity, then the ground families -
+        // or the places. Two tabs over it, as the Blueprints window has
+        // them over its two lists: the words alone, the chosen one in full
+        // ink on a short amber rule, both on one hairline.
         const float listTop = (float)scale(108);
         const float leftW = scaleF(214);
         const float rowH = scaleF(21), groupH = scaleF(20);
-        float y = listTop;
+        {
+            const wchar_t* lists[2] = {L"By ore", L"By place"};
+            hairline(g, M, listTop + scaleF(17), M + leftW);
+            float tx = M;
+            for (int i = 0; i < 2; i++) {
+                const bool on = plannerByPlace_ == (i == 1);
+                Gdiplus::RectF tab(tx, listTop - scaleF(4), leftW / 2 - scaleF(2), scaleF(22));
+                const bool hot = isHot(hoverPlan_, tab);
+                g.DrawString(lists[i], -1, &tabFont, tab, &centered, (on || hot) ? &textBrush : &dimBrush);
+                if (on) {
+                    Gdiplus::RectF w;
+                    g.MeasureString(lists[i], -1, &tabFont, Gdiplus::PointF(0, 0), &w);
+                    const float lineW = w.Width - scaleF(2);
+                    fillRoundRect(g, Gdiplus::RectF(tab.X + (tab.Width - lineW) / 2, tab.GetBottom() - scaleF(2),
+                                                    lineW, scaleF(2)),
+                                  scaleF(1), COL_ACCENT);
+                }
+                planHits_.push_back({tab, 18, i == 1 ? "place" : "ore"});
+                tx += leftW / 2 + scaleF(4);
+            }
+        }
+        float y = listTop + scaleF(26);
+        plannerPlaceList_ = Gdiplus::RectF();
+        bool placesScroll = false;   // (the footer says how to see the rest)
         const Rarity order[5] = {Rarity::Legendary, Rarity::Epic, Rarity::Rare, Rarity::Uncommon, Rarity::Common};
         auto oreRow = [&](const std::string& name, const Gdiplus::Color& chipColor, const std::wstring& right,
                           int kind, bool chosen) {
@@ -21318,6 +21784,7 @@ void MinerGUI::paintPlanner(HDC hdc) {
             y += rowH;
         };
         for (Rarity rarity : order) {
+            if (plannerByPlace_) break;
             // Counted first: a heading with nothing under it reads worse than
             // no heading at all, and with a system picked most groups lose
             // members - Stanton has no Legendary ore of its own.
@@ -21341,7 +21808,7 @@ void MinerGUI::paintPlanner(HDC hdc) {
         const bool anyRoc = familyInSystem((int)MiningFamily::ROC, plannerSystem_);
         const bool anyFps = familyInSystem((int)MiningFamily::FPS, plannerSystem_);
         gemMenuAnchor_ = Gdiplus::RectF();
-        if (anyRoc || anyFps) {
+        if ((anyRoc || anyFps) && !plannerByPlace_) {
             y += scaleF(4);
             g.DrawString(L"GROUND", -1, &smallFont, Gdiplus::PointF(M, y + scaleF(4)), &faintBrush);
             y += groupH;
@@ -21352,6 +21819,92 @@ void MinerGUI::paintPlanner(HDC hdc) {
             if (anyFps) {
                 oreRow("Hand minables", COL_GREEN, L"3,000 / node", 2,
                        !byPlace && plannerMineral_ == "Hand minables");
+            }
+        }
+        if (plannerByPlace_) {
+            // The places in the system on the tabs, each kind under its
+            // heading (OrePlaces.h), the figure how many ores the card lists
+            // for it. Over all systems the list is longer than the column:
+            // the wheel walks it, a group's heading staying on top while its
+            // rows go by, and a bar at the column's side shows where in it
+            // the view is. A heading counts as a row.
+            struct PlaceItem { std::wstring heading; std::string place; int group; };
+            std::vector<PlaceItem> items;
+            int pickAt = -1;
+            for (const PlaceGroup& group : placeGroups(plannerSystem_)) {
+                std::wstring head = toW(group.kind);
+                if (!group.system.empty()) head = toW(group.system) + L"  \u00B7  " + head;
+                std::transform(head.begin(), head.end(), head.begin(), ::towupper);
+                const int at = (int)items.size();
+                items.push_back({head, "", at});
+                for (const std::string& place : group.places) {
+                    if (place == plannerPlace_) pickAt = (int)items.size();
+                    items.push_back({L"", place, at});
+                }
+            }
+            const float top = y;
+            const float room = (float)ch - scaleF(28) - top;   // down to the footer
+            auto itemH = [&](int i) { return items[(size_t)i].heading.empty() ? rowH : groupH; };
+            // how many fit from `first` on, under its group's heading kept on
+            // top - and no heading last with none of its rows under it
+            auto fitFrom = [&](int first) {
+                float h = items[(size_t)first].heading.empty() ? groupH : 0.0f;
+                int n = 0;
+                for (int i = first; i < (int)items.size() && h + itemH(i) <= room; i++, n++) h += itemH(i);
+                if (n > 1 && !items[(size_t)(first + n - 1)].heading.empty()) n--;
+                return n;
+            };
+            int lastFirst = 0;   // the first row in view with the list's end in view
+            while (lastFirst < (int)items.size() && lastFirst + fitFrom(lastFirst) < (int)items.size()) lastFirst++;
+            plannerPlaceScroll_ = std::clamp(plannerPlaceScroll_, 0, lastFirst);
+            if (plannerRevealPlace_ && pickAt >= 0 &&
+                (pickAt < plannerPlaceScroll_ || pickAt >= plannerPlaceScroll_ + fitFrom(plannerPlaceScroll_))) {
+                // the pick out of view: its group from the top
+                plannerPlaceScroll_ = (std::min)(items[(size_t)pickAt].group, lastFirst);
+            }
+            plannerRevealPlace_ = false;
+            const int first = plannerPlaceScroll_;
+            const int shown = items.empty() ? 0 : fitFrom(first);
+            plannerPlaceList_ = Gdiplus::RectF(0, top, M + leftW + M / 2, room);
+            placesScroll = lastFirst > 0;
+            auto heading = [&](const std::wstring& words) {
+                g.DrawString(words.c_str(), -1, &smallFont, Gdiplus::PointF(M, y + scaleF(4)), &faintBrush);
+                y += groupH;
+            };
+            Gdiplus::StringFormat trimmed;   // (no name is too long today, at any scale)
+            trimmed.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            trimmed.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+            if (shown > 0 && items[(size_t)first].heading.empty()) heading(items[(size_t)items[(size_t)first].group].heading);
+            for (int i = first; i < first + shown; i++) {
+                const PlaceItem& item = items[(size_t)i];
+                if (!item.heading.empty()) {
+                    heading(item.heading);
+                    continue;
+                }
+                Gdiplus::RectF row(M, y, leftW, rowH);
+                const bool chosen = item.place == plannerPlace_;
+                if (chosen) selectionFrame(g, row, scaleF(R_CONTROL));
+                else if (isHot(hoverPlan_, row)) fillRoundRect(g, row, scaleF(R_CONTROL), COL_CARD_HI);
+                const std::wstring count = std::to_wstring(oresAtCount(item.place));
+                g.DrawString(count.c_str(), -1, &numFont, Gdiplus::RectF(M, y + scaleF(4), leftW - scaleF(8), rowH),
+                             &rightAlign, &faintBrush);
+                // a place has neither box nor dot: its name further left than
+                // an ore's, where the Blueprints window's lists have theirs
+                const float nx = M + scaleF(22);
+                const float nameW = M + leftW - scaleF(8) - lineWidth(g, count, numFont) - scaleF(6) - nx;
+                g.DrawString(toW(item.place).c_str(), -1, &rowFont, Gdiplus::RectF(nx, y + scaleF(2), nameW, rowH),
+                             &trimmed, chosen ? &textBrush : &dimBrush);
+                planHits_.push_back({row, 17, item.place});
+                y += rowH;
+            }
+            if (placesScroll) {
+                // as the What's new card has it: the track only just there,
+                // the part in view clearly on it
+                const float thumb = (std::max)(scaleF(28), room * (float)shown / (float)items.size());
+                const float at = (room - thumb) * (float)first / (float)lastFirst;
+                const float bx = M + leftW + scaleF(4);
+                fillRoundRect(g, Gdiplus::RectF(bx, top, scaleF(3), room), scaleF(1.5f), tint(COL_TEXT, 18));
+                fillRoundRect(g, Gdiplus::RectF(bx, top + at, scaleF(3), thumb), scaleF(1.5f), tint(COL_TEXT, 80));
             }
         }
         // a list whose family is not in the system on the tabs goes with it
@@ -22119,7 +22672,9 @@ void MinerGUI::paintPlanner(HDC hdc) {
             footerRoom = lx - scaleF(12);
         }
         // the left's words, as many of them as end before it
-        std::wstring footer = L"F / Esc: Close  \u00B7  Tick an ore to highlight it in scans";
+        std::wstring footer = plannerByPlace_ ? L"F / Esc: Close"
+                                              : L"F / Esc: Close  \u00B7  Tick an ore to highlight it in scans";
+        if (placesScroll) footer += L"  \u00B7  Scroll for more places";
         if (!paysMost.empty()) {
             // (not "red": the colour is the player's to pick - the beat is not)
             const std::wstring longer = footer + L"  \u00B7  Blinking: highest price right now";
@@ -22621,18 +23176,39 @@ unsigned MinerGUI::grindMask() const {
     return 1 | 2 | 4;   // nothing known: everywhere, rather than nothing
 }
 
-std::vector<MinerGUI::GrindSet> MinerGUI::grindSets(bool filtered) const {
+// FROM's test for one contract. A list held to a card's set keeps all of
+// that set's missions, whatever is picked.
+bool MinerGUI::grindFromHas(int source) const {
+    if (grindFactions_.empty() || grindGroup_ >= 0) return true;
+    if (source < 0 || source >= CRAFT_SOURCE_COUNT) return false;
+    return std::find(grindFactions_.begin(), grindFactions_.end(), CRAFT_SOURCES[source].faction) !=
+           grindFactions_.end();
+}
+
+std::vector<MinerGUI::GrindSet> MinerGUI::grindSets(bool filtered, bool byOutfit) const {
     const unsigned want = grindMask();
     // What the finder holds, folded for the comparison: any part of a name
     const std::wstring needle = filtered ? foldForSearch(grindQuery_) : std::wstring();
     const int onlyGroup = filtered ? grindGroup_ : -1;
+    // FROM: a set stays when a picked outfit feeds it, and only that
+    // outfit's missions count - its ladder, where it runs, the sets they
+    // also pay into
+    const bool byFrom = filtered && byOutfit && onlyGroup < 0 && !grindFactions_.empty();
     auto has = [&](const std::wstring& text) {
         return needle.empty() || foldForSearch(text).find(needle) != std::wstring::npos;
     };
     std::vector<GrindSet> out;
+    std::vector<int> fromPicked;
     for (int gi = 0; gi < (int)poolGroups().size(); gi++) {
         if (onlyGroup >= 0 && gi != onlyGroup) continue;
-        const std::vector<int>& group = poolGroups()[gi];
+        if (byFrom) {
+            fromPicked.clear();
+            for (int i : poolGroups()[gi]) {
+                if (grindFromHas(i)) fromPicked.push_back(i);
+            }
+            if (fromPicked.empty()) continue;
+        }
+        const std::vector<int>& group = byFrom ? fromPicked : poolGroups()[gi];
         GrindSet set = {};
         set.group = gi;
         set.best = group.front();
@@ -22781,6 +23357,33 @@ std::vector<MinerGUI::GrindSet> MinerGUI::grindSets(bool filtered) const {
         return std::string(CRAFT_SOURCES[a.best].title) < CRAFT_SOURCES[b.best].title;
     });
     return out;
+}
+
+std::string MinerGUI::grindFromCheckForShot(const std::string& outfit) {
+    const std::vector<std::string> before = grindFactions_;
+    grindFactions_ = {outfit};
+    const std::vector<GrindSet> sets = grindSets();
+    // the sets it feeds, counted without FROM
+    int feeds = 0;
+    for (const auto& set : grindSets(true, false)) {
+        bool fed = false;
+        for (int i : poolGroups()[set.group]) fed = fed || outfit == CRAFT_SOURCES[i].faction;
+        feeds += fed ? 1 : 0;
+    }
+    std::string wrong;
+    if (sets.empty()) wrong = "no set left";
+    else if ((int)sets.size() != feeds) {
+        wrong = std::to_string(sets.size()) + " sets, it feeds " + std::to_string(feeds);
+    }
+    for (const auto& set : sets) {
+        for (int r : set.rungs) {
+            if (wrong.empty() && outfit != CRAFT_SOURCES[r].faction) {
+                wrong = std::string("\"") + CRAFT_SOURCES[r].title + "\" of " + CRAFT_SOURCES[r].faction;
+            }
+        }
+    }
+    grindFactions_ = before;
+    return wrong;
 }
 
 // Whether the notice has been read. Kept beside the player's things rather
@@ -22979,6 +23582,9 @@ void MinerGUI::openGrindForShot() {
 void MinerGUI::openGrindFor(const std::wstring& query) {
     grindQuery_ = query;
     grindGroup_ = -1;
+    // a question from outside: FROM would answer it for some outfits only
+    grindFactions_.clear();
+    grindFactionPick_ = false;
     grindTyping_ = false;
     grindScroll_ = 0;
     grindOpen_ = query.empty() ? -1 : 0;
@@ -23148,7 +23754,7 @@ void MinerGUI::paintGrindList(Gdiplus::Graphics& g, int cw, int ch) {
         int here = 0;
         for (const auto& set : sets) here += (set.inSystem > 0) ? 1 : 0;
         std::wstring sub = std::to_wstring(missing) + L" recipes not in library  \u00B7  ";
-        if (grindQuery_.empty() && grindGroup_ < 0) {
+        if (grindQuery_.empty() && grindGroup_ < 0 && grindFactions_.empty()) {
             if (grindOpenOnly_ && ranksKnown_) {
                 sub += std::to_wstring((int)sets.size()) + L" of " + std::to_wstring((int)grindSets(false).size()) +
                        L" reward sets have an available mission";
@@ -23159,7 +23765,7 @@ void MinerGUI::paintGrindList(Gdiplus::Graphics& g, int cw, int ch) {
                 sub += L", " + std::to_wstring(here) + L" at your location";
             }
         } else {
-            // the finder narrowed it: say so, against the whole
+            // the finder or FROM narrowed it: say so, against the whole
             const int all = (int)grindSets(false).size();
             sub += grindGroup_ >= 0 ? L"One set, from a contract card  \u00B7  "
                                     : std::to_wstring((int)sets.size()) + L" of " + std::to_wstring(all) +
@@ -23313,13 +23919,97 @@ void MinerGUI::paintGrindList(Gdiplus::Graphics& g, int cw, int ch) {
         }
     }
 
+    // ---- FROM: the outfits ----
+    // The Blueprints window's control: "Any", or the outfits picked, their
+    // chips in lines under the row while it is open, the outfit with the
+    // most sets in the list first. One picked and since gone from the list
+    // keeps its chip, or there would be no way back out of it.
+    float rankTop = 0.0f;
+    {
+        const float fy = (float)scale(90);
+        const float s = scaleF(1.0f);
+        const float ctrlH = scaleF(26), chipH = scaleF(22), pad = scaleF(8);
+        Gdiplus::Font figureFont(&numeralFamily(), scaleF(Type::BODY), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        g.DrawString(L"FROM", -1, &headFont, Gdiplus::PointF(left, fy + scaleF(7)), &faintBrush);
+        std::vector<Segment> from(2);
+        from[0].text = L"Any";
+        from[0].on = grindFactions_.empty();
+        from[1].text = L"Select faction";
+        if (!grindFactions_.empty()) from[1].text += L"  \u00B7  " + std::to_wstring((int)grindFactions_.size());
+        from[1].on = !grindFactions_.empty();
+        from[1].open = grindFactionPick_;
+        from[1].chevron = true;
+        const std::vector<Gdiplus::RectF> places =
+            drawSegmented(g, left + scaleF(54), fy, ctrlH, from, chipFont, figureFont, pad, s, hoverGrind_);
+        grindHits_.push_back({places[0], 10, -1});
+        grindHits_.push_back({places[1], 11, grindFactionPick_ ? 0 : 1});
+        float bottom = fy + ctrlH;
+        grindFactionHits_.clear();
+        if (grindFactionPick_) {
+            std::vector<std::pair<std::string, int>> outfits;   // and the sets of the list each feeds
+            for (const auto& set : grindSets(true, false)) {
+                std::vector<std::string> feeding;
+                for (int i : poolGroups()[set.group]) {
+                    const char* outfit = CRAFT_SOURCES[i].faction;
+                    if (*outfit && std::find(feeding.begin(), feeding.end(), outfit) == feeding.end()) {
+                        feeding.push_back(outfit);
+                    }
+                }
+                for (const auto& outfit : feeding) {
+                    auto at = std::find_if(outfits.begin(), outfits.end(),
+                                           [&](const std::pair<std::string, int>& o) { return o.first == outfit; });
+                    if (at == outfits.end()) outfits.push_back({outfit, 1});
+                    else at->second++;
+                }
+            }
+            std::stable_sort(outfits.begin(), outfits.end(),
+                             [](const std::pair<std::string, int>& a, const std::pair<std::string, int>& b) {
+                                 return a.second > b.second;
+                             });
+            for (const auto& picked : grindFactions_) {
+                if (std::find_if(outfits.begin(), outfits.end(), [&](const std::pair<std::string, int>& o) {
+                        return o.first == picked;
+                    }) == outfits.end()) {
+                    outfits.push_back({picked, 0});
+                }
+            }
+            Gdiplus::StringFormat oneLine;
+            oneLine.SetAlignment(Gdiplus::StringAlignmentCenter);
+            oneLine.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            oneLine.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            const float radius = (R_CONTROL - SEGMENT_INSET) * s;
+            float px = left, py = bottom + scaleF(8);
+            for (const auto& outfit : outfits) {
+                const bool on = std::find(grindFactions_.begin(), grindFactions_.end(), outfit.first) !=
+                                grindFactions_.end();
+                const std::wstring text = toW(outfit.first);
+                Gdiplus::RectF w;
+                g.MeasureString(text.c_str(), -1, &chipFont, Gdiplus::PointF(0, 0), &w);
+                const float pw = w.Width + 2.0f * pad;
+                if (px > left && px + pw > edge) {
+                    px = left;
+                    py += chipH + scaleF(6);
+                }
+                const Gdiplus::RectF box(px, py, pw, chipH);
+                fillRoundRect(g, box, radius, COL_CARD_HI);
+                Gdiplus::SolidBrush ink(choiceFace(g, box, radius, on, isHot(hoverGrind_, box), false));
+                g.DrawString(text.c_str(), -1, &chipFont, box, &oneLine, &ink);
+                grindHits_.push_back({box, 10, (int)grindFactionHits_.size()});
+                grindFactionHits_.push_back(outfit.first);
+                px += pw + scaleF(4);
+            }
+            if (!outfits.empty()) bottom = py + chipH;
+        }
+        rankTop = std::floor(bottom + scaleF(8) + 0.5f);
+    }
+
     // ---- the player's rank with the outfits of the list ----
     // Out of their own logs, one per outfit and ladder, in the order the
     // list names them. A click opens the ladder's ranks under the pill, to
     // set the one held (paintGrindRankMenu).
     bool rankMenuAnchored = false;
     {
-        const float ry = (float)scale(92);
+        const float ry = rankTop;
         const float pillH = scaleF(20);
         g.DrawString(L"YOUR RANK", -1, &headFont, Gdiplus::PointF(left, ry + scaleF(4)), &faintBrush);
         float rx = left + scaleF(74);
@@ -23384,7 +24074,7 @@ void MinerGUI::paintGrindList(Gdiplus::Graphics& g, int cw, int ch) {
     if (!rankMenuAnchored) grindRankMenu_ = -1;
 
     // ---- column heads ----
-    const float top = (float)scale(126);
+    const float top = rankTop + (float)scale(34);
     // The right-hand columns. WHERE is the widest of them because it holds
     // place names - "Pyro IV, Pyro V, Terminus" is one region, not three.
     const float whereW = scaleF(176);
@@ -23422,12 +24112,17 @@ void MinerGUI::paintGrindList(Gdiplus::Graphics& g, int cw, int ch) {
     const float footY = (float)ch - scaleF(46);
     float y = top + scaleF(26);
     if (sets.empty()) {
+        std::wstring outfits;
+        for (const auto& outfit : grindFactions_) outfits += (outfits.empty() ? L"" : L", ") + toW(outfit);
         const std::wstring why =
             grindGroup_ >= 0 ? L"All blueprints of this set are in your library"
             : !grindQuery_.empty()
                 ? L"No missing blueprint matches \u201C" + grindQuery_ +
                       L"\u201D - Already in library, or no mission, "
                       L"blueprint or outfit with that name"
+            : !grindFactions_.empty()
+                ? (grindOpenOnly_ && ranksKnown_ ? L"No mission from " + outfits + L" is open to you"
+                                                 : L"Nothing left to earn from " + outfits)
                 : L"Nothing left to earn - Every reward set in the game files is in your library";
         g.DrawString(why.c_str(), -1, &bodyFont,
                      Gdiplus::RectF(left, y, edge - left, scaleF(40)), nullptr, &dimBrush);
@@ -23510,7 +24205,7 @@ void MinerGUI::paintGrindList(Gdiplus::Graphics& g, int cw, int ch) {
             };
             std::vector<std::wstring> places;
             for (int m : poolGroups()[set.group]) {
-                if (!(craftSystemsOf(CRAFT_SOURCES[m]) & want)) continue;
+                if (!(craftSystemsOf(CRAFT_SOURCES[m]) & want) || !grindFromHas(m)) continue;
                 for (const std::wstring& place : placesOf(jurisdictionOf(CRAFT_SOURCES[m]))) {
                     if (std::find(places.begin(), places.end(), place) == places.end()) places.push_back(place);
                 }
@@ -24255,6 +24950,31 @@ LRESULT MinerGUI::handleGrindMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
                     // a pill in the rank line: its ladder's ranks open under
                     // it, or shut again
                     grindRankMenu_ = (menuWas == hit.value) ? -1 : hit.value;
+                } else if (hit.kind == 10 || hit.kind == 11) {
+                    // FROM. Held to a card's set, it lets go of the set
+                    // first, as the finder does.
+                    bool changed = grindGroup_ >= 0;
+                    if (changed) {
+                        grindGroup_ = -1;
+                        grindQuery_.clear();
+                    }
+                    if (hit.kind == 11) {
+                        grindFactionPick_ = (hit.value == 1);
+                    } else if (hit.value < 0) {
+                        changed = changed || !grindFactions_.empty();
+                        grindFactions_.clear();     // "Any": every outfit again
+                    } else if (hit.value < (int)grindFactionHits_.size()) {
+                        // each chip its own switch: a second one widens the list
+                        const std::string outfit = grindFactionHits_[hit.value];
+                        auto at = std::find(grindFactions_.begin(), grindFactions_.end(), outfit);
+                        if (at == grindFactions_.end()) grindFactions_.push_back(outfit);
+                        else grindFactions_.erase(at);
+                        changed = true;
+                    }
+                    if (changed) {
+                        grindScroll_ = 0;
+                        grindOpen_ = -1;
+                    }
                 }
                 InvalidateRect(hwnd, nullptr, TRUE);
                 return 0;
@@ -24301,9 +25021,9 @@ LRESULT MinerGUI::handleGrindMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
             switch (wParam) {
                 case VK_ESCAPE:
                     // Esc shuts the rank list first, lets go of what the
-                    // finder holds next, then folds the open row, then
-                    // closes: a list narrowed or a row opened on purpose is
-                    // not worth losing to a stray key
+                    // finder holds next, then of FROM, then folds the open
+                    // row, then closes: a list narrowed or a row opened on
+                    // purpose is not worth losing to a stray key
                     if (!grindWarned_) return 0;      // the notice is read first
                     if (grindRankMenu_ >= 0) {
                         grindRankMenu_ = -1;
@@ -24315,6 +25035,16 @@ LRESULT MinerGUI::handleGrindMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
                         grindGroup_ = -1;
                         grindScroll_ = 0;
                         grindOpen_ = -1;
+                        InvalidateRect(hwnd, nullptr, TRUE);
+                        return 0;
+                    }
+                    if (!grindFactions_.empty() || grindFactionPick_) {
+                        if (!grindFactions_.empty()) {
+                            grindScroll_ = 0;
+                            grindOpen_ = -1;
+                        }
+                        grindFactions_.clear();
+                        grindFactionPick_ = false;
                         InvalidateRect(hwnd, nullptr, TRUE);
                         return 0;
                     }
@@ -25694,6 +26424,12 @@ void MinerGUI::setShip(const std::string& label, bool inSeat, const std::string&
             }
         }
     }
+    InvalidateRect(hwnd_, nullptr, TRUE);
+}
+
+void MinerGUI::shipSeenOnHud(const MiningShip& kind) {
+    if (fit_ >= 0 && fit_ < (int)fits_.size() && fits_[(size_t)fit_].ship == &kind) return;
+    pickShipKind(kind, false);
     InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
@@ -27347,6 +28083,806 @@ static bool putOnClipboard(HWND owner, const std::wstring& text) {
     return done;
 }
 
+// ---- the Feedback page ------------------------------------------------------
+// A message for the developer, and who it is from: two fields the window
+// paints itself. TextField.h holds what is typed, the caret and what is
+// marked; here it is measured, drawn and given the keys and the pointer.
+// Send hands both to the application (setFeedbackCallback), which answers
+// with the service's status (feedbackAnswered). Nothing of it is written
+// anywhere: what is typed stays until the app closes.
+
+namespace {
+
+// How wide a piece of a typed text is as it is drawn: from its first
+// letter's left edge to its last one's right, a space at its end counted
+float typedWidth(Gdiplus::Graphics& g, const Gdiplus::Font& font, const std::u32string& text, size_t from, size_t to) {
+    to = (std::min)(to, text.size());
+    if (to <= from) return 0.0f;
+    const std::wstring part = Chars::toWide(text.substr(from, to - from));
+    Gdiplus::StringFormat typed;
+    typed.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap | Gdiplus::StringFormatFlagsMeasureTrailingSpaces);
+    Gdiplus::RectF w;
+    g.MeasureString(part.c_str(), (INT)part.size(), &font, Gdiplus::PointF(0, 0), &typed, &w);
+    // (less GDI+'s room before and after a line, a sixth of the em each)
+    return (std::max)(0.0f, w.Width - font.GetSize() / 3.0f);
+}
+
+// ...and as Windows lays it, which is what a field's lines are broken by:
+// the Linux build measures at the font's advances, 3 % narrower (lineWidth),
+// and its pictures are to break where Windows does
+float typedRoom(float width) {
+#ifdef _WIN32
+    return width;
+#else
+    return width * 1.03f;
+#endif
+}
+
+// The clipboard's text
+std::u32string clipboardTyped(HWND owner) {
+    std::wstring text;
+    if (!OpenClipboard(owner)) return {};
+    if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
+        if (const wchar_t* chars = static_cast<const wchar_t*>(GlobalLock(data))) {
+            text = chars;
+            GlobalUnlock(data);
+        }
+    }
+    CloseClipboard();
+    return Chars::fromWide(text);
+}
+
+constexpr int FEEDBACK_ROWS = 12;   // the lines of a message its field shows
+
+}  // namespace
+
+void MinerGUI::setFeedback(bool available, int gameVersion, bool installSent) {
+    if (fbAvailable_ == available && fbGame_ == gameVersion && fbInstallSent_ == installSent) return;
+    fbAvailable_ = available;
+    fbGame_ = gameVersion;
+    fbInstallSent_ = installSent;
+    if (!available && feedbackPage_) toScanPage();
+    railRepaint();   // the rail has its entry, or has it no more
+}
+
+void MinerGUI::showFeedbackPage() {
+    closeOtherSheets(feedbackPage_);   // the scan page's lists and cards go
+    endPluginTyping(false);
+    pluginPage_ = false;
+    gearPage_ = false;   // (one page at a time)
+    if (!feedbackPage_) {
+        // a fresh look: the caret in the message, and what came of an
+        // earlier one gone. What was typed and not sent is still there.
+        fbTyping_ = 1;
+        if (fbState_ == FeedbackState::Answered) fbState_ = FeedbackState::Idle;
+        fbCaretOn_ = true;
+        fbToCaret_ = true;
+        fbDragging_ = false;
+        fbClicks_ = 0;
+        if (hwnd_ && !headless_) SetTimer(hwnd_, TIMER_FEEDBACK, GetCaretBlinkTime(), nullptr);
+    }
+    feedbackPage_ = true;
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MinerGUI::leaveFeedbackPage() {
+    if (!feedbackPage_) return;
+    feedbackPage_ = false;
+    const bool dragging = fbDragging_;
+    fbDragging_ = false;
+    if (!hwnd_) return;
+    KillTimer(hwnd_, TIMER_FEEDBACK);
+    if (dragging && GetCapture() == hwnd_) ReleaseCapture();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MinerGUI::feedbackAnswered(const Feedback::Result& result) {
+    if (fbState_ != FeedbackState::Sending) return;
+    fbState_ = FeedbackState::Answered;
+    fbStatus_ = result.status;
+    fbDebug_ = result.debug;
+    fbDebugStatus_ = result.debugStatus;
+    fbUpSent_ = fbUpTotal_ = 0;
+    if (Feedback::outcome(result.status) == Feedback::Outcome::Sent) {
+        // it went: the field is empty for the next one, the name stays
+        fbText_.set(U"");
+        fbScroll_ = 0.0f;
+        if (fbTyping_ == 1) {
+            fbCaretAtEnd_ = false;
+            fbGoalX_ = -1.0f;
+        }
+    }
+    fbCaretOn_ = true;
+    if (hwnd_ && feedbackPage_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MinerGUI::feedbackProgress(std::int64_t sent, std::int64_t total) {
+    if (fbState_ != FeedbackState::Sending) return;
+    // drawn again only where what the page shows changes: whole MB
+    const auto shown = [](std::int64_t s, std::int64_t t) {
+        return t > 0 ? std::make_pair(Feedback::megabytes(s), Feedback::megabytes(t)) : std::make_pair(0, 0);
+    };
+    const bool changed = shown(sent, total) != shown(fbUpSent_, fbUpTotal_);
+    fbUpSent_ = sent;
+    fbUpTotal_ = total;
+    if (changed && hwnd_ && feedbackPage_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MinerGUI::sendFeedback() {
+    if (fbState_ == FeedbackState::Sending || !onFeedback_) return;
+    const std::string text = Chars::toUtf8(fbText_.text()), name = Chars::toUtf8(fbName_.text());
+    if (Feedback::fault(text, name) != Feedback::Fault::None) return;
+    fbState_ = FeedbackState::Sending;
+    fbStatus_ = 0;
+    fbDebug_ = Feedback::DebugOutcome::None;
+    fbDebugStatus_ = 0;
+    fbUpSent_ = fbUpTotal_ = 0;
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+    onFeedback_(text, name, fbAttach_);   // (the answer may come at once)
+}
+
+void MinerGUI::feedbackForShot(const std::wstring& text, const std::wstring& name, int typing, int state, int status) {
+    fbText_.set(Chars::fromWide(text));
+    fbName_.set(Chars::fromWide(name));
+    fbTyping_ = std::clamp(typing, 0, 2);
+    fbState_ = state == 1 ? FeedbackState::Sending : state == 2 ? FeedbackState::Answered : FeedbackState::Idle;
+    fbStatus_ = status;
+    fbAttach_ = true;
+    fbDebug_ = Feedback::DebugOutcome::None;
+    fbDebugStatus_ = 0;
+    fbUpSent_ = fbUpTotal_ = 0;
+    fbCaretOn_ = true;
+    fbCaretAtEnd_ = false;
+    fbGoalX_ = -1.0f;
+    fbScroll_ = 0.0f;
+    fbNameScroll_ = 0.0f;
+    fbToCaret_ = true;
+    fbDragging_ = false;
+    fbClicks_ = 0;
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MinerGUI::feedbackDebugForShot(bool attach, Feedback::DebugOutcome debug, int debugStatus, std::int64_t sent,
+                                    std::int64_t total) {
+    fbAttach_ = attach;
+    fbDebug_ = debug;
+    fbDebugStatus_ = debugStatus;
+    fbUpSent_ = sent;
+    fbUpTotal_ = total;
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+std::string MinerGUI::feedbackStateForShot() const {
+    const auto shown = [](const std::u32string& text) {
+        std::string out;
+        for (char c : Chars::toUtf8(text)) {
+            if (c == '\n') out += "\\n";
+            else out += c;
+        }
+        return out;
+    };
+    const auto field = [&](const char* what, const TextField& f) {
+        std::string out = std::string(what) + " \"" + shown(f.text()) + "\" caret " + std::to_string(f.caret());
+        if (f.marked()) out += " marked " + std::to_string(f.markFrom()) + "-" + std::to_string(f.markTo());
+        return out;
+    };
+    return "typing " + std::to_string(fbTyping_) + ", " + field("message", fbText_) + ", " + field("name", fbName_) +
+           ", lines " + std::to_string(fbLines_.size()) + ", scroll " + std::to_string((int)std::lround(fbScroll_)) +
+           ", state " + std::to_string((int)fbState_) + " status " + std::to_string(fbStatus_) + ", attach " +
+           std::to_string((int)fbAttach_) + ", debug " + std::to_string((int)fbDebug_) + " status " +
+           std::to_string(fbDebugStatus_) + ", upload " + std::to_string(fbUpSent_) + " of " + std::to_string(fbUpTotal_) +
+           (feedbackPage_ ? "" : ", page not up");
+}
+
+// A line of typed text, top to top
+float MinerGUI::feedbackPitch() const {
+    return std::round(scaleF(17));
+}
+
+// Where a field's text stands: in from its edges - and in the message's
+// field short of the bar that says how far down it is scrolled, there or
+// not, so that the lines do not break anew when it comes
+Gdiplus::RectF MinerGUI::feedbackInside(int field) const {
+    if (field == 2) {
+        return Gdiplus::RectF(fbNameRect_.X + scaleF(10), fbNameRect_.Y, fbNameRect_.Width - scaleF(20), fbNameRect_.Height);
+    }
+    return Gdiplus::RectF(fbTextRect_.X + scaleF(10), fbTextRect_.Y + scaleF(8), fbTextRect_.Width - scaleF(24),
+                          FEEDBACK_ROWS * feedbackPitch());
+}
+
+const std::vector<TextLine>& MinerGUI::feedbackLines(Gdiplus::Graphics& g, const Gdiplus::Font& font, float room) {
+    if (fbLinesOf_ != fbText_.changes() || fbLinesRoom_ != room || fbLinesSize_ != font.GetSize()) {
+        const std::u32string& text = fbText_.text();
+        fbLines_ = wrapLines(text, room, [&](size_t from, size_t to) { return typedRoom(typedWidth(g, font, text, from, to)); });
+        fbLinesOf_ = fbText_.changes();
+        fbLinesRoom_ = room;
+        fbLinesSize_ = font.GetSize();
+    }
+    return fbLines_;
+}
+
+size_t MinerGUI::feedbackPlaceAt(Gdiplus::Graphics& g, int field, float px, float py, bool& atEnd) {
+    atEnd = false;
+    Gdiplus::Font font(&textFamily(), scaleF(Type::BODY), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    const Gdiplus::RectF inside = feedbackInside(field);
+    if (field == 2) {
+        const std::u32string& text = fbName_.text();
+        const TextLine all{0, text.size(), true};
+        return placeAt(all, px - inside.X + fbNameScroll_,
+                       [&](size_t from, size_t to) { return typedWidth(g, font, text, from, to); });
+    }
+    const std::u32string& text = fbText_.text();
+    const std::vector<TextLine>& lines = feedbackLines(g, font, inside.Width);
+    const float down = py - inside.Y + fbScroll_;
+    const size_t k = down <= 0 ? 0 : (std::min)(lines.size() - 1, (size_t)(down / feedbackPitch()));
+    const TextLine& line = lines[k];
+    size_t at = placeAt(line, px - inside.X, [&](size_t from, size_t to) { return typedWidth(g, font, text, from, to); });
+    // a line the field's width broke ends before the spaces it ends in -
+    // and one broken inside a word keeps the caret at its own end
+    if (!line.hard) {
+        at = (std::min)(at, lineEnd(text, line));
+        atEnd = at == line.to;
+    }
+    return at;
+}
+
+void MinerGUI::feedbackTouched(HWND hwnd, bool edited) {
+    fbCaretOn_ = true;
+    fbToCaret_ = true;
+    // a message changed after its answer is a new one
+    if (edited && fbState_ == FeedbackState::Answered) fbState_ = FeedbackState::Idle;
+    if (!hwnd) return;
+    // (the blink starts over: the caret shows while it is typed at)
+    if (!headless_) SetTimer(hwnd, TIMER_FEEDBACK, GetCaretBlinkTime(), nullptr);
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+void MinerGUI::pressFeedback(HWND hwnd, float px, float py, bool shift) {
+    const int field = fbTextRect_.Contains(px, py) ? 1 : fbNameRect_.Contains(px, py) ? 2 : 0;
+    if (field == 0) {
+        // Send, and the tick - not while a message is on its way, which
+        // goes as it was sent; beside everything the caret stays where it
+        // is, as it does beside a field of Windows' own
+        if (fbSendRect_.Contains(px, py)) {
+            sendFeedback();
+        } else if (fbTickRect_.Contains(px, py) && fbState_ != FeedbackState::Sending) {
+            fbAttach_ = !fbAttach_;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return;
+    }
+    Gdiplus::Bitmap scratch(1, 1, PixelFormat32bppPARGB);
+    Gdiplus::Graphics g(&scratch);
+    prepareGraphics(g);
+    bool atEnd = false;
+    const size_t at = feedbackPlaceAt(g, field, px, py, atEnd);
+    // a second click on the spot marks the word, a third the paragraph
+    const DWORD now = GetTickCount();
+    const bool again = field == fbTyping_ && fbClicks_ > 0 && now - fbClickAt_ <= GetDoubleClickTime() &&
+                       std::abs(px - (float)fbClickPlace_.x) <= scaleF(4) && std::abs(py - (float)fbClickPlace_.y) <= scaleF(4);
+    fbClicks_ = again ? fbClicks_ + 1 : 1;
+    fbClickAt_ = now;
+    fbClickPlace_ = {(LONG)std::lround(px), (LONG)std::lround(py)};
+    fbTyping_ = field;
+    TextField& typed = feedbackField();
+    if (fbClicks_ == 2) {
+        typed.markWord(at);
+    } else if (fbClicks_ >= 3) {
+        const std::u32string& text = typed.text();
+        const size_t before = at == 0 ? std::u32string::npos : text.rfind(U'\n', at - 1);
+        const size_t after = text.find(U'\n', at);
+        typed.moveTo(before == std::u32string::npos ? 0 : before + 1, false);
+        typed.moveTo(after == std::u32string::npos ? text.size() : after, true);
+    } else {
+        typed.moveTo(at, shift);
+    }
+    fbCaretAtEnd_ = fbClicks_ == 1 && atEnd;
+    fbGoalX_ = -1.0f;
+    // the button held and the pointer moved marks from here
+    fbDragging_ = fbClicks_ == 1;
+    if (!headless_) {
+        if (fbDragging_) SetCapture(hwnd);
+        SetFocus(hwnd);   // the letters have to land here
+    }
+    feedbackTouched(hwnd, false);
+}
+
+void MinerGUI::dragFeedback(HWND hwnd, float px, float py) {
+    if (fbTyping_ == 0) return;
+    Gdiplus::Bitmap scratch(1, 1, PixelFormat32bppPARGB);
+    Gdiplus::Graphics g(&scratch);
+    prepareGraphics(g);
+    bool atEnd = false;
+    // (past the field's top or bottom the place is on a line out of sight,
+    // and the painting brings it in: the message scrolls under the pointer)
+    const size_t at = feedbackPlaceAt(g, fbTyping_, px, py, atEnd);
+    TextField& typed = feedbackField();
+    if (at == typed.caret()) return;
+    typed.moveTo(at, true);
+    fbCaretAtEnd_ = atEnd;
+    fbGoalX_ = -1.0f;
+    feedbackTouched(hwnd, false);
+}
+
+void MinerGUI::wheelFeedback(HWND hwnd, int notches) {
+    // three lines a notch; held to the message's length as it is drawn
+    fbScroll_ = (std::max)(0.0f, fbScroll_ - (float)notches * 3.0f * feedbackPitch());
+    fbToCaret_ = false;
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+void MinerGUI::feedbackChar(HWND hwnd, WPARAM typedChar) {
+    char32_t c = (char32_t)typedChar;
+    // Windows sends a character beyond the Basic Multilingual Plane as its
+    // two halves, one after the other
+    if (c >= 0xD800 && c <= 0xDBFF) {
+        fbHalf_ = c;
+        return;
+    }
+    if (c >= 0xDC00 && c <= 0xDFFF) {
+        if (fbHalf_ == 0) return;
+        c = 0x10000 + ((fbHalf_ - 0xD800) << 10) + (c - 0xDC00);
+    }
+    fbHalf_ = 0;
+    // Enter, Backspace, Tab and Esc are keys (feedbackKey), and Ctrl with a
+    // letter comes as a control character as well: none of them is typed
+    if (c < 0x20 || c == 0x7F) return;
+    if (fbState_ == FeedbackState::Sending) return;   // on its way: it stays as it went
+    if (!feedbackField().type(c)) return;
+    fbCaretAtEnd_ = false;
+    fbGoalX_ = -1.0f;
+    feedbackTouched(hwnd, true);
+}
+
+bool MinerGUI::feedbackKey(HWND hwnd, WPARAM key) {
+    const bool message = fbTyping_ != 2;
+    TextField& typed = feedbackField();
+    const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+    const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0 && !alt;   // (AltGr is both, and types a character)
+    const bool locked = fbState_ == FeedbackState::Sending;               // on its way: it stays as it went
+    bool edited = false, moved = false, keepGoal = false;
+
+    const auto copy = [&]() {
+        if (!typed.marked()) return;
+        std::wstring text = Chars::toWide(typed.markedText());
+#ifdef _WIN32
+        // (a line break on Windows' clipboard is CR LF)
+        std::wstring lines;
+        for (wchar_t ch : text) {
+            if (ch == L'\n') lines += L'\r';
+            lines += ch;
+        }
+        text.swap(lines);
+#endif
+        putOnClipboard(hwnd, text);
+    };
+    // The caret a number of lines up or down, at the place nearest to where
+    // it stood across (the message only: a name is one line)
+    const auto byLines = [&](int count, int toEdge) {
+        Gdiplus::Bitmap scratch(1, 1, PixelFormat32bppPARGB);
+        Gdiplus::Graphics g(&scratch);
+        prepareGraphics(g);
+        Gdiplus::Font font(&textFamily(), scaleF(Type::BODY), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        const std::u32string& text = fbText_.text();
+        const std::vector<TextLine>& lines = feedbackLines(g, font, feedbackInside(1).Width);
+        const auto width = [&](size_t from, size_t to) { return typedWidth(g, font, text, from, to); };
+        const size_t k = lineOfCaret(lines, fbText_.caret(), fbCaretAtEnd_);
+        if (toEdge != 0) {
+            // Home and End: the line's start, and its end before the spaces
+            // a broken line ends in
+            const size_t at = toEdge < 0 ? lines[k].from : lineEnd(text, lines[k]);
+            fbText_.moveTo(at, shift);
+            fbCaretAtEnd_ = toEdge > 0 && !lines[k].hard && at == lines[k].to;
+            return;
+        }
+        const long long wanted = (long long)k + count;
+        const size_t to = (size_t)std::clamp<long long>(wanted, 0, (long long)lines.size() - 1);
+        if (to == k) return;
+        if (fbGoalX_ < 0) fbGoalX_ = width(lines[k].from, fbText_.caret());
+        size_t at = placeAt(lines[to], fbGoalX_, width);
+        bool atEnd = false;
+        if (!lines[to].hard) {
+            at = (std::min)(at, lineEnd(text, lines[to]));
+            atEnd = at == lines[to].to;
+        }
+        fbText_.moveTo(at, shift);
+        fbCaretAtEnd_ = atEnd;
+    };
+
+    switch (key) {
+        case VK_LEFT:
+            typed.left(shift, ctrl);
+            fbCaretAtEnd_ = false;
+            moved = true;
+            break;
+        case VK_RIGHT:
+            typed.right(shift, ctrl);
+            fbCaretAtEnd_ = false;
+            moved = true;
+            break;
+        case VK_UP:
+        case VK_DOWN:
+        case VK_PRIOR:
+        case VK_NEXT:
+            if (message) {
+                const int page = FEEDBACK_ROWS - 1;
+                byLines(key == VK_UP ? -1 : key == VK_DOWN ? 1 : key == VK_PRIOR ? -page : page, 0);
+                keepGoal = true;
+            }
+            moved = true;
+            break;
+        case VK_HOME:
+        case VK_END:
+            if (ctrl || !message) {
+                typed.moveTo(key == VK_HOME ? 0 : typed.text().size(), shift);
+                fbCaretAtEnd_ = false;
+            } else {
+                byLines(0, key == VK_HOME ? -1 : 1);
+            }
+            moved = true;
+            break;
+        case VK_BACK:
+            edited = !locked && typed.backspace(ctrl);
+            break;
+        case VK_DELETE:
+            if (locked) break;
+            if (shift && typed.marked()) copy();   // Shift+Del cuts
+            edited = typed.erase(ctrl);
+            break;
+        case VK_RETURN:
+            // a new line in the message; in the name it is no key
+            edited = !locked && message && typed.type(U'\n');
+            break;
+        case VK_TAB:
+            // from one field to the other, each caret where it was
+            fbTyping_ = message ? 2 : 1;
+            fbCaretAtEnd_ = false;
+            moved = true;
+            break;
+        case VK_ESCAPE:
+            // lets go of what is marked, and nothing else: the page stays
+            if (typed.marked()) {
+                typed.moveTo(typed.caret(), false);
+                moved = true;
+            }
+            break;
+        case VK_INSERT:
+            if (ctrl) copy();
+            else if (shift && !locked) edited = typed.put(clipboardTyped(hwnd));
+            break;
+        case 'A':
+            if (ctrl) {
+                typed.markAll();
+                fbCaretAtEnd_ = false;
+                moved = true;
+            }
+            break;
+        case 'C':
+            if (ctrl) copy();
+            break;
+        case 'X':
+            if (ctrl && !locked) {
+                copy();
+                edited = typed.cut();
+            }
+            break;
+        case 'V':
+            if (ctrl && !locked) edited = typed.put(clipboardTyped(hwnd));
+            break;
+        case 'Z':
+            if (ctrl && !locked) edited = shift ? typed.redo() : typed.undo();
+            break;
+        case 'Y':
+            if (ctrl && !locked) edited = typed.redo();
+            break;
+        default:
+            return false;
+    }
+    if (edited) fbCaretAtEnd_ = false;
+    if (edited || moved) {
+        if (!keepGoal) fbGoalX_ = -1.0f;
+        feedbackTouched(hwnd, edited);
+    }
+    return true;
+}
+
+void MinerGUI::drawFeedbackPage(Gdiplus::Graphics& g, int cw, int ch) {
+    Gdiplus::Font labelFont(&textFamily(), scaleF(Type::LABEL), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+    Gdiplus::Font textFont(&textFamily(), scaleF(Type::BODY), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::Font buttonFont(&markFamily(), scaleF(Type::BODY), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::Font smallFont(&textFamily(), scaleF(Type::SMALL), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::Font countFont(&numeralFamily(), scaleF(Type::SMALL), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::SolidBrush textBrush(COL_TEXT);
+    Gdiplus::SolidBrush dimBrush(COL_TEXT_DIM);
+    Gdiplus::SolidBrush faintBrush(COL_TEXT_FAINT);
+    Gdiplus::SolidBrush markBrush(tint(COL_ACCENT, 77));
+    Gdiplus::StringFormat typedLine;   // (a typed space moves the caret on)
+    typedLine.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap | Gdiplus::StringFormatFlagsMeasureTrailingSpaces);
+    Gdiplus::StringFormat lines;       // a text fitLines broke: as it is
+    Gdiplus::StringFormat centred;
+    centred.SetAlignment(Gdiplus::StringAlignmentCenter);
+    centred.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    centred.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    Gdiplus::StringFormat rightLine;
+    rightLine.SetAlignment(Gdiplus::StringAlignmentFar);
+    rightLine.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+
+    const float px = scaleF(1.0f);
+    const float M = (float)scale(MARGIN);
+    const float cardX = M - scaleF(6), cardW = (float)cw - 2 * M + scaleF(12);
+    const float left = M + scaleF(6), right = (float)cw - M - scaleF(6), wide = right - left;
+    const float radius = scaleF(R_CONTROL);
+    const float top = (float)scale(LY_CONTEXT);
+    const float pitch = feedbackPitch();
+    // how tall a text fitLines broke stands
+    const auto heightOf = [&](const Fitted& fit, const Gdiplus::Font& font) {
+        Gdiplus::RectF all;
+        g.MeasureString(fit.text.c_str(), -1, &font, Gdiplus::RectF(0, 0, 100000.0f, 100000.0f), &all);
+        return std::ceil(all.Height);
+    };
+
+    // ---- where everything goes: the card ends under its button
+    fbTextRect_ = Gdiplus::RectF(left, top + scaleF(26), wide, FEEDBACK_ROWS * pitch + 2 * scaleF(8));
+    const float nameLabelY = fbTextRect_.GetBottom() + scaleF(14);
+    fbNameRect_ = Gdiplus::RectF(left, nameLabelY + scaleF(16), wide, scaleF(28));
+    // the debug folder's tick under the name, as wide as its words: a quiet
+    // button carrying its box, as Settings has for the rock scans
+    const wchar_t* tickWords = L"Attach debug folder";
+    const float boxS = scaleF(11), boxPad = scaleF(10);
+    fbTickRect_ = Gdiplus::RectF(left, fbNameRect_.GetBottom() + scaleF(12),
+                                 std::ceil(boxPad + boxS + scaleF(7) + lineWidth(g, tickWords, buttonFont) + boxPad),
+                                 scaleF(28));
+    // what goes along with a message, broken where its parts meet (a few
+    // pixels short of the room: fitLines' note on 110 %) - its room the
+    // line's with the debug folder, for Send to stay put when the tick changes
+    const Fitted along = fitLines(g, toW(Feedback::sentWith(BEDROCK_VERSION, fbGame_, fbInstallSent_, fbAttach_)),
+                                  smallFont, wide - scaleF(4));
+    const Fitted alongMost = fitLines(g, toW(Feedback::sentWith(BEDROCK_VERSION, fbGame_, fbInstallSent_, true)),
+                                      smallFont, wide - scaleF(4));
+    const float alongY = fbTickRect_.GetBottom() + scaleF(12), alongH = heightOf(alongMost, smallFont);
+    fbSendRect_ = Gdiplus::RectF(left, alongY + alongH + scaleF(12), scaleF(100), scaleF(30));
+    const Gdiplus::RectF card(cardX, top, cardW, fbSendRect_.GetBottom() + scaleF(16) - top);
+    mainscanCard(g, card, px);
+
+    // ---- the message
+    g.DrawString(L"MESSAGE", -1, &labelFont, Gdiplus::PointF(left, top + scaleF(10)), &faintBrush);
+    {
+        // how much of its room is taken, once most of it is
+        const size_t count = fbText_.text().size();
+        if (count * 10 >= Feedback::TEXT_MOST * 9) {
+            const std::wstring taken = formatNumber((int)count) + L" / " + formatNumber((int)Feedback::TEXT_MOST);
+            Gdiplus::SolidBrush countBrush(count >= Feedback::TEXT_MOST ? COL_YELLOW : COL_TEXT_FAINT);
+            g.DrawString(taken.c_str(), -1, &countFont, Gdiplus::RectF(left, top + scaleF(9), wide, scaleF(15)), &rightLine,
+                         &countBrush);
+        }
+    }
+    const bool typing = feedbackTyping();
+    const float pad = textFont.GetSize() / 6.0f;   // GDI+'s room before a line's first letter
+    const float caretW = (std::max)(1.0f, std::floor(scaleF(1.5f)));
+    const float caretH = std::round(scaleF(16));
+    // the letters' middle below the top of their line (inkMiddle), for the
+    // capitals to stand in the middle of a line and of a field
+    const float inkAt = inkMiddle(L"H", textFamily(), Gdiplus::FontStyleRegular, scaleF(Type::BODY));
+    const auto surface = [&](int which, const Gdiplus::RectF& r) {
+        const bool has = fbTyping_ == which;
+        fillRoundRect(g, r, radius, !has && isHot(hoverMain_, r) ? COL_HOVER : COL_CARD_HI);
+        if (has) strokeRoundRect(g, r, radius, tint(COL_ACCENT, 220));
+    };
+    surface(1, fbTextRect_);
+    {
+        const Gdiplus::RectF inside = feedbackInside(1);
+        const std::u32string& text = fbText_.text();
+        const std::vector<TextLine>& rows = feedbackLines(g, textFont, inside.Width);
+        const auto width = [&](size_t from, size_t to) { return typedWidth(g, textFont, text, from, to); };
+        const float all = pitch * (float)rows.size();
+        const float scrollMost = (std::max)(0.0f, all - inside.Height);
+        const size_t caretRow = lineOfCaret(rows, fbText_.caret(), fbCaretAtEnd_);
+        if (fbToCaret_ && fbTyping_ == 1) {
+            // the caret's line into view
+            const float rowTop = pitch * (float)caretRow;
+            if (rowTop < fbScroll_) fbScroll_ = rowTop;
+            if (rowTop + pitch > fbScroll_ + inside.Height) fbScroll_ = rowTop + pitch - inside.Height;
+        }
+        fbScroll_ = std::clamp(fbScroll_, 0.0f, scrollMost);
+        const float textDy = std::round(pitch / 2 - inkAt);
+
+        const Gdiplus::GraphicsState unclipped = g.Save();
+        g.SetClip(Gdiplus::RectF(fbTextRect_.X, inside.Y, fbTextRect_.Width, inside.Height));
+        if (text.empty()) {
+            g.DrawString(L"What went wrong, or what is missing?", -1, &textFont,
+                         Gdiplus::PointF(inside.X - pad, inside.Y + textDy), &faintBrush);
+        }
+        const size_t markFrom = fbText_.markFrom(), markTo = fbText_.markTo();
+        for (size_t k = 0; k < rows.size(); k++) {
+            const TextLine& row = rows[k];
+            const float rowY = inside.Y - fbScroll_ + pitch * (float)k;
+            if (rowY + pitch <= inside.Y || rowY >= inside.GetBottom()) continue;
+            // what is marked of it - and a little more where the mark runs
+            // on over the line's end, for a line break marked to show
+            if (fbText_.marked() && markFrom <= row.to && markTo > row.from) {
+                const size_t a = (std::max)(markFrom, row.from), b = (std::min)(markTo, row.to);
+                const float x1 = std::round(inside.X + width(row.from, a));
+                float x2 = std::round(inside.X + width(row.from, b));
+                if (markTo > row.to && row.hard) x2 += scaleF(5);
+                if (x2 > x1) g.FillRectangle(&markBrush, Gdiplus::RectF(x1, rowY, x2 - x1, pitch));
+            }
+            if (row.to > row.from) {
+                const std::wstring shown = Chars::toWide(text.substr(row.from, row.to - row.from));
+                g.DrawString(shown.c_str(), (INT)shown.size(), &textFont, Gdiplus::PointF(inside.X - pad, rowY + textDy),
+                             &typedLine, &textBrush);
+            }
+            if (typing && fbTyping_ == 1 && fbCaretOn_ && k == caretRow) {
+                const float x = inside.X + width(row.from, fbText_.caret());
+                g.FillRectangle(&textBrush, Gdiplus::RectF(std::round(x), rowY + std::round((pitch - caretH) / 2),
+                                                           caretW, caretH));
+            }
+        }
+        g.Restore(unclipped);
+        // how far down it is, where there is more of it than the field shows
+        if (scrollMost > 0.5f) {
+            const float barH = (std::max)(scaleF(18), inside.Height * inside.Height / all);
+            const float barY = inside.Y + (inside.Height - barH) * (fbScroll_ / scrollMost);
+            fillRoundRect(g, Gdiplus::RectF(fbTextRect_.GetRight() - scaleF(8), barY, scaleF(3), barH), scaleF(1.5f),
+                          COL_TEXT_FAINT);
+        }
+    }
+
+    // ---- the name
+    g.DrawString(L"NAME  \u00B7  OPTIONAL", -1, &labelFont, Gdiplus::PointF(left, nameLabelY), &faintBrush);
+    surface(2, fbNameRect_);
+    {
+        const Gdiplus::RectF inside = feedbackInside(2);
+        const std::u32string& text = fbName_.text();
+        const auto width = [&](size_t from, size_t to) { return typedWidth(g, textFont, text, from, to); };
+        const float middle = fbNameRect_.Y + fbNameRect_.Height / 2;
+        const float textTop = std::round(middle - inkAt);
+        const float all = width(0, text.size());
+        const float caretX = width(0, fbName_.caret());
+        if (fbToCaret_ && fbTyping_ == 2) {
+            // the caret into view, a name longer than its field moved under it
+            if (caretX < fbNameScroll_) fbNameScroll_ = caretX;
+            if (caretX > fbNameScroll_ + inside.Width) fbNameScroll_ = caretX - inside.Width;
+        }
+        fbNameScroll_ = std::clamp(fbNameScroll_, 0.0f, (std::max)(0.0f, all - inside.Width));
+        const float x0 = inside.X - std::round(fbNameScroll_);
+
+        const Gdiplus::GraphicsState unclipped = g.Save();
+        g.SetClip(Gdiplus::RectF(inside.X - scaleF(2), fbNameRect_.Y, inside.Width + scaleF(4), fbNameRect_.Height));
+        if (text.empty()) {
+            g.DrawString(L"Discord or Spectrum name", -1, &textFont, Gdiplus::PointF(inside.X - pad, textTop), &faintBrush);
+        }
+        if (fbName_.marked()) {
+            const float x1 = std::round(x0 + width(0, fbName_.markFrom())), x2 = std::round(x0 + width(0, fbName_.markTo()));
+            g.FillRectangle(&markBrush, Gdiplus::RectF(x1, std::round(middle - pitch / 2), x2 - x1, pitch));
+        }
+        if (!text.empty()) {
+            const std::wstring shown = Chars::toWide(text);
+            g.DrawString(shown.c_str(), (INT)shown.size(), &textFont, Gdiplus::PointF(x0 - pad, textTop), &typedLine,
+                         &textBrush);
+        }
+        if (typing && fbTyping_ == 2 && fbCaretOn_) {
+            g.FillRectangle(&textBrush, Gdiplus::RectF(std::round(x0 + caretX), std::round(middle - caretH / 2),
+                                                       caretW, caretH));
+        }
+        g.Restore(unclipped);
+    }
+    fbToCaret_ = false;
+
+    // ---- the debug folder's tick: locked, as the fields are, while a
+    // message is on its way
+    {
+        const bool hot = fbState_ != FeedbackState::Sending && isHot(hoverMain_, fbTickRect_);
+        drawButton(g, fbTickRect_, L"", buttonFont, ButtonKind::Secondary, hot, radius);
+        const Gdiplus::RectF box(fbTickRect_.X + boxPad, fbTickRect_.Y + (fbTickRect_.Height - boxS) / 2.0f, boxS, boxS);
+        if (fbAttach_) {
+            fillRoundRect(g, box, scaleF(2), COL_ACCENT);
+            Gdiplus::Pen tick(COL_ACCENT_INK, scaleF(1.8f));
+            g.DrawLine(&tick, box.X + scaleF(2.5f), box.Y + scaleF(5.5f), box.X + scaleF(4.5f), box.Y + scaleF(8));
+            g.DrawLine(&tick, box.X + scaleF(4.5f), box.Y + scaleF(8), box.X + scaleF(8.5f), box.Y + scaleF(3));
+        } else {
+            strokeRoundRect(g, box, scaleF(2), hot ? COL_TEXT_DIM : COL_TEXT_FAINT);
+        }
+        Gdiplus::StringFormat middleLeft;
+        middleLeft.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        middleLeft.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+        Gdiplus::SolidBrush ink(hot ? COL_TEXT : tint(COL_TEXT, 215));
+        g.DrawString(tickWords, -1, &buttonFont,
+                     Gdiplus::RectF(box.GetRight() + scaleF(7), fbTickRect_.Y, fbTickRect_.GetRight() - box.GetRight(),
+                                    fbTickRect_.Height),
+                     &middleLeft, &ink);
+    }
+
+    // ---- what goes along, Send, and what came of it
+    g.DrawString(along.text.c_str(), -1, &smallFont, Gdiplus::RectF(left, alongY, wide, alongH), &lines, &dimBrush);
+    const bool sending = fbState_ == FeedbackState::Sending;
+    const bool ready = !sending &&
+                       Feedback::fault(Chars::toUtf8(fbText_.text()), Chars::toUtf8(fbName_.text())) == Feedback::Fault::None;
+    if (ready) {
+        drawButton(g, fbSendRect_, L"Send", buttonFont, ButtonKind::Primary, isHot(hoverMain_, fbSendRect_), radius);
+    } else {
+        // nothing to send, or one on its way: its outline, as Edit ship
+        // has without a ship
+        strokeRoundRect(g, fbSendRect_, radius, COL_BORDER);
+        g.DrawString(L"Send", -1, &buttonFont, fbSendRect_, &centred, &faintBrush);
+    }
+    std::wstring state;
+    Gdiplus::Color stateInk = COL_TEXT_DIM;
+    if (sending) {
+        state = L"SENDING";
+        // ...and once the debug folder goes up, how far it is
+        if (fbUpTotal_ > 0) {
+            state += L"  \u00B7  " + std::to_wstring(Feedback::megabytes(fbUpSent_)) + L" / " +
+                     std::to_wstring(Feedback::megabytes(fbUpTotal_)) + L" MB";
+        }
+    } else if (fbState_ == FeedbackState::Answered) {
+        // the message went and its debug folder did not: yellow, between
+        // the green of all sent and the red of nothing
+        const std::wstring folderNot = L"SENT - Debug folder not sent: ";
+        switch (Feedback::shown(Feedback::outcome(fbStatus_), fbDebug_)) {
+            case Feedback::Shown::Sent:
+                state = L"SENT - Thank you";
+                stateInk = COL_GREEN;
+                break;
+            case Feedback::Shown::DebugNoConnection:
+                state = folderNot + L"no connection";
+                stateInk = COL_YELLOW;
+                break;
+            case Feedback::Shown::DebugTooLarge:
+                state = folderNot + L"too large";
+                stateInk = COL_YELLOW;
+                break;
+            case Feedback::Shown::DebugFull:
+                state = folderNot + L"the server is full";
+                stateInk = COL_YELLOW;
+                break;
+            case Feedback::Shown::DebugTurnedDown:
+                state = folderNot + L"turned down (" + std::to_wstring(fbDebugStatus_) + L")";
+                stateInk = COL_YELLOW;
+                break;
+            case Feedback::Shown::DebugRefused:
+                state = folderNot + L"refused";
+                stateInk = COL_YELLOW;
+                break;
+            case Feedback::Shown::NoConnection:
+                state = L"NOT SENT - No connection to Bedrock's server. Try again.";
+                stateInk = COL_RED;
+                break;
+            case Feedback::Shown::Limited:
+                state = L"NOT SENT - Too many messages. Try again later.";
+                stateInk = COL_RED;
+                break;
+            case Feedback::Shown::Refused:
+                state = L"NOT SENT - The server turned it down (" + std::to_wstring(fbStatus_) + L")";
+                stateInk = COL_RED;
+                break;
+        }
+    }
+    if (!state.empty()) {
+        // beside the button, on its middle; too long for one line there, the
+        // state stands over what explains it
+        const float stateX = fbSendRect_.GetRight() + scaleF(12), room = right - stateX;
+        const Fitted fit = fitLines(g, state, textFont, room - scaleF(4), L" - ");
+        const float stateH = heightOf(fit, textFont);
+        Gdiplus::SolidBrush stateBrush(stateInk);
+        g.DrawString(fit.text.c_str(), -1, &textFont,
+                     Gdiplus::RectF(stateX, std::round(fbSendRect_.Y + (fbSendRect_.Height - stateH) / 2), room, stateH), &lines,
+                     &stateBrush);
+    }
+
+    // ---- under the card: what to do first where Bedrock read something wrong
+    const Fitted hint = fitLines(g, L"For a wrong reading, press Ctrl+Alt+S in the game first, then send with the debug "
+                                    L"folder attached.",
+                                 smallFont, wide - scaleF(4));
+    // (its box reaches down to the page's foot rather than ending under the
+    // last line: at 110 % the Linux build sets 12.1 px as 12, and the two
+    // lines it measures come out a fraction short of Windows' two)
+    const float hintY = card.GetBottom() + scaleF(12);
+    g.DrawString(hint.text.c_str(), -1, &smallFont,
+                 Gdiplus::RectF(left, hintY, wide, (std::max)(heightOf(hint, smallFont), (float)ch - hintY)), &lines,
+                 &dimBrush);
+}
+
 void MinerGUI::loadColours() {
     colours_ = Colours::defaults();
     // The screenshot run paints Bedrock's own, whatever lies in its folder
@@ -28703,7 +30239,7 @@ void MinerGUI::showPluginPage(const std::string& id) {
     if (!(pluginPage_ && pluginShown_ == id)) pluginScroll_ = 0;
     pluginPage_ = true;
     gearPage_ = false;   // (one page at a time)
-    gearListsWanted_ = false;
+    leaveFeedbackPage();
     pluginShown_ = id;
     // the server's list, once per start, as the window of their own has it
     if (!pluginsAsked_ && pluginAction_) {

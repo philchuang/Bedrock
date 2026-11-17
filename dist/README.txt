@@ -7,9 +7,10 @@ Reads the signature value off the mining marker in game (the number next to
 the map pin, e.g. "16,960") straight from the screen and tells you which ore
 in what amount is behind it. On top of that: a place map per ore (click a
 result row) and the ORE FINDER (key F), where you pick an ore BEFORE the trip
-and see where the odds stand - and where it sells best. Clicking the Aaron
-Halo there opens a calculator: at which distance left to leave quantum travel
-for each band.
+and see where the odds stand - and where it sells best. By place it goes the
+other way round: pick a planet, moon or asteroid field and see what is mined
+there. Clicking the Aaron Halo there opens a calculator: at which distance
+left to leave quantum travel for each band.
 
 Getting started
 ---------------
@@ -431,7 +432,16 @@ address) and, in the folder debug\:
                    that the newest replaces the oldest
   - region_config.txt     a copy of your settings, so that the folder debug\
                    holds everything on its own
-No screen recording, no video.
+  - panel_*.png/.txt      the rock panel as Bedrock saw it, cut out of the
+                   game picture: one per rock, and one when Bedrock sees
+                   a panel it can't read; twenty at most, after that the
+                   newest replaces the oldest
+  - panel5_*.png/.txt     the same for the Star Citizen 5.0 rock panel,
+                   twenty more
+Nothing in debug\ leaves your PC unless you send a message on the Feedback
+page with "Attach debug folder" ticked. It then carries the logs and the
+copy of your settings, the three newest snapshots and the ten newest panel
+pictures, your Windows user name taken out of the texts.
 With the box in Blueprints ticked (see Your library), also game_text_LIVE.ini
 - the game's text, kept until the game's files change - and, in the game's
 folder, data\Localization\english\global.ini and one line in user.cfg.
@@ -459,9 +469,9 @@ Five network requests of its own, and three more only if you switch them on:
   an update itself is only downloaded when you click it.
 - Prices from UEX: while the Ore Finder is open, Bedrock downloads the ore
   price list from uexcorp.space (at most every 30 minutes) and UEX's list of
-  terminals (once a week). While the Gear page is open, it downloads UEX's
-  prices of the laser heads, modules and gadgets (at most every 12 hours).
-  The UEX market tab loads the player listings for
+  terminals (once a week). For the Gear page, from the start, it downloads
+  UEX's prices of the laser heads, modules and gadgets (at most every 12
+  hours). The UEX market tab loads the player listings for
   the selected ore, and the rock view checks them when a rock contains ore of
   quality 900 or higher (each ore at most every 10 minutes). These requests
   include Bedrock's version, the platform and Bedrock's UEX app token, which
@@ -482,12 +492,15 @@ Five network requests of its own, and three more only if you switch them on:
 - Rock scans (on unless you untick "Share rock scans" in Settings): Bedrock
   sends Bedrock's server (the-forsaken.org) each rock the rock view showed:
   ore, mass, SCU, resistance, instability, the composition where it was
-  read, the laser's range, the ship type, the place and the game's
-  version, with your install's number and a random number made at each
-  start that groups one session's rocks. Nothing about you goes along, and
-  as with the refinery workloads the server doesn't keep your IP address.
-  The rocks are for working out rock sizes, densities and how the game
-  sets resistance and instability. At most one report every two minutes.
+  read, the laser's range, the ship type, the place, the game's version,
+  your screen's height in pixels, the size of the scan panel's labels on
+  it and whether the composition was read, with your install's number and
+  a random number made at each start that groups one session's rocks.
+  Nothing about you goes along, and as with the refinery workloads the
+  server doesn't keep your IP address. The rocks are for working out rock
+  sizes, densities and how the game sets resistance and instability, the
+  screen figures for finding out where Bedrock misses the composition. At
+  most one report every two minutes, and one when the game closes.
 - Plugins: the first time you open Plugins after a start, Bedrock downloads
   the list of plugins from the-forsaken.org, and a plugin when you click
   Install. A plugin's download carries your install's number (see below),

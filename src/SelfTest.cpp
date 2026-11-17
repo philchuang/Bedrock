@@ -13,6 +13,7 @@
 #include "ColourScheme.h"
 #include "CraftingData.h"
 #include "CraftQuality.h"
+#include "CraftedOnly.h"
 #include "DataBackup.h"
 #include "DevTools.h"
 #include "EmbeddedData.h"
@@ -27,8 +28,12 @@
 #include "P4kReader.h"
 #include "GameState.h"
 #include "MiningLocations.h"
+#include "OrePlaces.h"
 #include "NoteBook.h"
 #include "OCREngine.h"
+#include "PanelFive.h"
+#include "PanelFiveShapes.h"
+#include "PanelKeep.h"
 #include "PanelShapes.h"
 #include "PhoneServer.h"
 #include "Plugins.h"
@@ -38,6 +43,9 @@
 #include "ScanPanel.h"
 #include "RockContents.h"
 #include "RockScans.h"
+#include "Feedback.h"
+#include "DebugZip.h"
+#include "TextField.h"
 #include "RefineryTerminal.h"
 #include "RefineryOrders.h"
 #include "TradeBook.h"
@@ -56,6 +64,9 @@
 
 #include <zstd.h>
 #include <opencv2/opencv.hpp>
+#ifdef _WIN32
+#include <dwmapi.h>   // DWMWA_TRANSITIONS_FORCEDISABLED, for the minimised game's stand-in
+#endif
 
 // rpcndr.h, pulled in by <windows.h>, defines a "small" macro, and one of
 // the checks below names a rock that.
@@ -130,6 +141,42 @@ bool partsAre(const SCMiner::RockContents& contents, const std::vector<PartWante
         }
     }
     return true;
+}
+
+// The app's own picture of a 4.10 panel (PanelKeep.h): the panel's figure
+// lines, its heading (60 above the MASS label) and its composition list
+// (rockContentsRegion) inside it, and no more than 300 x 400 at the labels'
+// size
+static bool panelCutHolds(const SCMiner::ScanPanel& panel, const cv::Size& screen, std::string& got) {
+    const cv::Rect cut = SCMiner::PanelKeep::cut(panel, screen);
+    got = std::to_string(cut.x) + "," + std::to_string(cut.y) + " " + std::to_string(cut.width) + "x" +
+          std::to_string(cut.height);
+    const double s = panel.labelScale;
+    bool holds = cut.area() > 0 && s > 0 && cut.y <= panel.labels.y - 60 * s && cut.width <= 300 * s + 1 &&
+                 cut.height <= 400 * s + 1;
+    const std::vector<cv::Rect> lines = SCMiner::panelFigureLines(panel, screen);
+    if (!holds) got += "; size or top";
+    holds = holds && lines.size() == 4;
+    for (size_t i = 0; i < lines.size(); i++) {
+        // the ore's name line ends where the second reader's room for a long
+        // name ends, past the panel's own right edge (the rule's hook at 222)
+        const cv::Rect line = i == 0 ? cv::Rect(lines[i].x, lines[i].y, (std::min)(lines[i].width, cut.br().x - lines[i].x),
+                                                lines[i].height)
+                                     : lines[i];
+        if ((line & cut) != line) {
+            holds = false;
+            got += "; line " + std::to_string(line.x) + "," + std::to_string(line.y) + " " + std::to_string(line.width) +
+                   "x" + std::to_string(line.height);
+        }
+    }
+    const cv::Rect list = SCMiner::rockContentsRegion(panel, screen);
+    if ((list & cut) != list) {
+        got += "; list " + std::to_string(list.x) + "," + std::to_string(list.y) + " " + std::to_string(list.width) + "x" +
+               std::to_string(list.height);
+    }
+    got += "; labels " + std::to_string(panel.labels.x) + "," + std::to_string(panel.labels.y) + " x" +
+           std::to_string(s).substr(0, 5);
+    return holds && list.area() > 0 && (list & cut) == list;
 }
 
 // A test picture: beside the build where there is one, out of the exe where
@@ -617,7 +664,7 @@ int runSelfTest() {
             const auto listed = [](const char* id) {
                 std::string out;
                 bool costs = false;
-                for (const SCMiner::GadgetEffect& e : SCMiner::gadgetEffects(*SCMiner::gadgetById(id))) {
+                for (const SCMiner::GearEffect& e : SCMiner::gadgetEffects(*SCMiner::gadgetById(id))) {
                     if (!e.helps && !costs) {
                         out += " |";
                         costs = true;
@@ -630,7 +677,7 @@ int runSelfTest() {
             };
             bool eachBoth = true;
             for (int i = 0; i < SCMiner::MINING_GADGET_COUNT; i++) {
-                const std::vector<SCMiner::GadgetEffect> effects = SCMiner::gadgetEffects(SCMiner::MINING_GADGETS[i]);
+                const std::vector<SCMiner::GearEffect> effects = SCMiner::gadgetEffects(SCMiner::MINING_GADGETS[i]);
                 eachBoth &= !effects.empty() && effects.front().helps && !effects.back().helps;
             }
             allPassed &= check(listed("thcn_boremax") == " Instability -70 Useful ore clustering +30 | Resistance +10" &&
@@ -639,6 +686,54 @@ int runSelfTest() {
                                        " Useful ore clustering +60 Resistance -25 | Optimal charge window -30" &&
                                    eachBoth,
                                "a gadget's i lists what it helps with, the strongest first, then what it costs");
+        }
+
+        // ...and for a laser head and a module, signed as the game's own
+        // descriptions print them (Helix II: Resistance -30 %, Inert Material
+        // Level -40 %, Optimal Charge Window Size -40 %; Brandt: Mining Laser
+        // Power 135 %, Shatter Damage -30 %, Resistance +15 %, 60 seconds, 5
+        // uses). Every head and module says what it is for in the game's
+        // words, and an active module how often and how long it runs
+        {
+            const auto listed = [](const std::vector<SCMiner::GearEffect>& effects) {
+                std::string out;
+                bool costs = false;
+                for (const SCMiner::GearEffect& e : effects) {
+                    if (!e.helps && !costs) {
+                        out += " |";
+                        costs = true;
+                    }
+                    char one[64];
+                    std::snprintf(one, sizeof one, " %s %+g", e.what, e.by);
+                    out += one;
+                }
+                return out;
+            };
+            const SCMiner::MiningModule& brandt = *SCMiner::moduleById("active_brandt");
+            const SCMiner::MiningModule& surge = *SCMiner::moduleById("active_surge");
+            const std::string helix = listed(SCMiner::laserEffects(*SCMiner::laserById("thcn_helix_s2")));
+            const std::string brandtSays = listed(SCMiner::moduleEffects(brandt));
+            const std::string fltr = listed(SCMiner::moduleEffects(*SCMiner::moduleById("passive_fltr_mk1")));
+            const std::string overrun = listed(SCMiner::moduleEffects(*SCMiner::moduleById("passive_overrun")));
+            int said = 0, timed = 0, moving = 0;
+            for (const SCMiner::MiningLaser& l : SCMiner::MINING_LASERS) said += std::strlen(l.blurb) > 40 ? 1 : 0;
+            for (const SCMiner::MiningModule& m : SCMiner::MINING_MODULES) {
+                said += std::strlen(m.blurb) > 40 ? 1 : 0;
+                timed += (m.active ? m.uses > 0 && m.seconds > 0 : m.uses == 0 && m.seconds == 0) ? 1 : 0;
+                moving += SCMiner::moduleEffects(m).empty() ? 0 : 1;
+            }
+            const int all = SCMiner::MINING_LASER_COUNT + SCMiner::MINING_MODULE_COUNT;
+            allPassed &= check(helix == " Inert material -40 Resistance -30 | Optimal charge window -40" &&
+                                   brandtSays == " Laser power +35 Shatter damage -30 | Resistance +15.5" &&
+                                   fltr == " Inert material -20 | Extraction power -15" &&
+                                   overrun == " Resistance -24.8 Laser power +2 | Extraction power -15" &&
+                                   brandt.uses == 5 && brandt.seconds == 60 && surge.uses == 7 && surge.seconds == 15 &&
+                                   said == all && timed == SCMiner::MINING_MODULE_COUNT &&
+                                   moving == SCMiner::MINING_MODULE_COUNT,
+                               "a head's and a module's i list what they help with, then what they cost, as the "
+                               "game signs it; each says what it is for, an active module its uses and seconds (" +
+                                   std::to_string(said) + " of " + std::to_string(all) + " with words, Helix II" + helix +
+                                   ", Brandt" + brandtSays + ")");
         }
 
         // Figures no rock can have, and the panel's first picture of a rock
@@ -691,6 +786,83 @@ int runSelfTest() {
                                "have, wait - the same impossible figures on eight looks are taken");
         }
 
+        // Nyx I's rocks of 5.0 by their own numbers (RockModel): rocks of the
+        // Prospector with its stock Arbor MH1, 15 November 2026, and what the
+        // panel said of them
+        {
+            using namespace SCMiner;
+            using namespace SCMiner::RockScans;
+            auto rockOf = [](const char* ore, float mass, float scu, float resistance, float instability, bool v5) {
+                RockStats r;
+                r.ore = ore;
+                r.mass = mass;
+                r.scu = scu;
+                r.resistance = resistance;
+                r.instability = instability;
+                r.v5 = v5;
+                return r;
+            };
+            auto usual = [](RockStats r) {
+                r.v5 = false;
+                return r;
+            };
+            // Copper of 11:47:50, 78 kg to the SCU: lighter than any rock of
+            // the usual numbers, a Nyx I rock as it should be
+            const RockStats copper = rockOf("Copper", 929, 11.91f, 0, 4.10f, true);
+            const RockStats iron = rockOf("Iron", 13919, 18.88f, 0, 15.93f, false);   // Monox, 12 Nov
+            const bool weighed = impossible(copper).empty() &&
+                                 impossible(usual(copper)) == "lighter than its volume" && v5Fits(usual(copper)) &&
+                                 !v5Fits(iron) && std::fabs(usualKgPerScu(copper) - 848.0) < 1.0 &&
+                                 std::fabs(usualKgPerScu(iron) - 13919 / 18.88) < 0.1;
+            // ...its first picture, the volume as the mass, and SCU past the
+            // usual largest rock that its own model still holds
+            const RockStats first = rockOf("Copper", 157, 11.91f, 0, 0, true);
+            const RockStats big = rockOf("Copper", 6000, 70, 0, 4.0f, true);
+            const bool ownRules = notScannedYet(first) && !notScannedYet(usual(first)) && impossible(big).empty() &&
+                                  impossible(usual(big)) == "more SCU than the largest rock";
+            // EASY: Tin of 13:11:14, 1,255 kg at 0 %. IMPOSSIBLE: Aslarite of
+            // 13:13:35, 694 kg at 67 % with the Arbor's +25 % in it
+            const MiningLaser* arbor = nullptr;
+            for (int i = 0; i < MINING_LASER_COUNT; i++) {
+                if (std::string(MINING_LASERS[i].id) == "grin_arbor_s1") arbor = &MINING_LASERS[i];
+            }
+            const RockStats tin = rockOf("Tin", 1255, 16.20f, 0, 0.87f, true);
+            const RockStats aslarite = rockOf("Aslarite", 694, 21.05f, 67, 161.61f, true);
+            const float through = arbor ? arbor->fracture * resistanceLetsThrough(67 / 1.25f, 125) : 0;
+            const ThrottleAdvice easy =
+                throttleFor(tin.mass, arbor, arbor ? arbor->fracture : 0, modelOf(tin).decayPerMass);
+            const ThrottleAdvice hard = throttleFor(aslarite.mass, arbor, through, modelOf(aslarite).decayPerMass);
+            const ThrottleAdvice asIfUsual = throttleFor(aslarite.mass, arbor, through);
+            const bool holds = arbor && easy.possible && std::fabs(easy.toHold - 77.8f) < 0.1f && !hard.possible &&
+                               hard.toHold > 111 && hard.toHold < 113 && asIfUsual.possible;
+            // ...kept in rock_scans.csv, not sent: the service weighs by the
+            // usual numbers
+            Recorder recorder;
+            recorder.taken(copper, copper, 1794000000, "prospector", "Nyx - Nyx I");
+            recorder.gone();
+            const std::vector<Scan> kept = recorder.done();
+            Scan same = kept.empty() ? Scan() : kept[0];
+            same.v5 = false;
+            const bool notSent = kept.size() == 1 && kept[0].v5 && !sendable(kept[0]) && sendable(same);
+            // ...and which rocks are around, by the rule of the signatures
+            SignatureAnalyzer at;
+            at.setSystemFilter("NYX");
+            at.setPlaceFilter("Nyx I");
+            const bool own = at.rocksHere() == SignatureAnalyzer::Rocks::Own;
+            at.setPlaceFilter("");
+            at.setGround(SignatureAnalyzer::Ground::Unknown);
+            const bool either = at.rocksHere() == SignatureAnalyzer::Rocks::Either;
+            at.setGround(SignatureAnalyzer::Ground::Space);
+            const bool space = at.rocksHere() == SignatureAnalyzer::Rocks::Usual;
+            at.setSystemFilter("STANTON");
+            at.setGround(SignatureAnalyzer::Ground::Unknown);
+            const bool stanton = at.rocksHere() == SignatureAnalyzer::Rocks::Usual;
+            allPassed &= check(weighed && ownRules && holds && notSent && own && either && space && stanton,
+                               "Nyx I's rocks go by the 5.0 numbers - 13.141 kg to the SCU at density 1 and 1.45 "
+                               "taken back per kg: Tin 1,255 kg holds at 78 % of the Arbor MH1, the Aslarite of "
+                               "694 kg at 67 % not at all, as the panel said; kept, not sent");
+        }
+
         // The rocks of a session for rock_scans.csv, a line each
         {
             using namespace SCMiner::RockScans;
@@ -741,6 +913,200 @@ int runSelfTest() {
             if (!written) std::cout << "    rock_scans.csv line: " << line << std::endl;
         }
 
+        // ...a rock with another rock's SCU on view, a list read after the
+        // next rock came, and a look of the same rock back - each once, with
+        // what it has (the MOLE's turret, 12 November 2026: 15,223 kg came in
+        // once with the 4.73 SCU of the rock before it and once with 5.88)
+        {
+            using namespace SCMiner::RockScans;
+            auto rockOf = [](float mass, float scu, float resistance, float instability) {
+                SCMiner::RockStats r;
+                r.ore = "Savrilium";
+                r.mass = mass;
+                r.scu = scu;
+                r.resistance = resistance;
+                r.instability = instability;
+                return r;
+            };
+            const std::vector<ScanPart> list = {{"Savrilium", false, 11.09f, 580}, {"Savrilium", false, 28.99f, 322},
+                                                {"Gold", false, 9.85f, 553}, {"", true, 50.06f, 0}};
+            const SCMiner::RockStats before = rockOf(12229, 4.73f, 65, 130.88f);
+            const SCMiner::RockStats next = rockOf(15223, 5.88f, 61, 162.09f);
+            SCMiner::RockStats chimera = next;
+            chimera.scu = 4.73f;
+            Recorder recorder;
+            const long long t = 1794515246;
+            recorder.taken(before, before, t, "mole", "Nyx - Levski");
+            recorder.taken(before, before, t + 1, "mole", "Nyx - Levski");
+            recorder.taken(chimera, next, t + 59, "mole", "Nyx - Levski");   // the view still held the SCU
+            recorder.taken(next, next, t + 60, "mole", "Nyx - Levski");
+            recorder.taken(next, next, t + 61, "mole", "Nyx - Levski");
+            const bool waits = recorder.done(t + 61).size() == 1 && recorder.holding();
+            // the 15,223 kg rock leaves the view, its list comes back while
+            // the next is on view, and it is back within the wait
+            const SCMiner::RockStats third = rockOf(6069, 4.77f, 43, 54.97f);
+            recorder.taken(third, third, t + 70, "mole", "Nyx - Levski");
+            recorder.listed(15223, list);
+            recorder.taken(next, next, t + 80, "mole", "Nyx - Levski");
+            // a settled 15,223 read again as 15,228 with its SCU is that rock
+            SCMiner::RockStats misread = next;
+            misread.mass = 15228;
+            recorder.taken(misread, misread, t + 81, "mole", "Nyx - Levski");
+            recorder.gone();
+            const bool heldBack = recorder.done(t + 100).size() == 1;   // 6,069 kg: 30 s after its look
+            const std::vector<Scan> rest = recorder.done();
+            const bool once = rest.size() == 1 && rest[0].mass == 15223 && std::abs(rest[0].scu - 5.88f) < 0.005f &&
+                              rest[0].parts.size() == 4 && rest[0].observed == t + 59 && !recorder.holding();
+            Recorder late;
+            late.taken(before, before, t, "mole", "Nyx - Levski");
+            late.taken(next, next, t + 2, "mole", "Nyx - Levski");
+            late.listed(12229, list);
+            late.gone();
+            const std::vector<Scan> both = late.done();
+            const bool listedLate = both.size() == 2 && both[0].mass == 12229 && both[0].parts.size() == 4 &&
+                                    both[1].parts.empty();
+            // ...and a rock back after its wait counts once, its SCU read one
+            // numeral off (the MOLE's 54,501 kg rock: 39.56 SCU with its list,
+            // then 39.58 under the laser 109 s on)
+            Recorder again;
+            const SCMiner::RockStats first = rockOf(54501, 39.56f, 64, 502.04f);
+            SCMiner::RockStats lasered = rockOf(54501, 39.58f, 22, 184.08f);
+            lasered.resistanceAdjusted = true;
+            again.taken(first, first, t, "mole", "Nyx - Levski");
+            again.listed(54501, list);
+            again.gone();
+            again.taken(lasered, lasered, t + 109, "mole", "Nyx - Levski");
+            again.gone();
+            const std::vector<Scan> backAfter = again.done();
+            const bool countedOnce = backAfter.size() == 1 && backAfter[0].parts.size() == 4 &&
+                                     std::abs(backAfter[0].scu - 39.56f) < 0.005f;
+            // two readings alike for one mass, whichever rock is on view by
+            // the second; another reading in between starts it again
+            ListReadings readings;
+            const std::vector<ScanPart> other = {{"Savrilium", false, 11.09f, 580}, {"Savrilium", false, 28.99f, 322},
+                                                 {"Gold", false, 9.83f, 553}, {"", true, 50.08f, 0}};
+            const bool firstOnly = !readings.confirms(12229, list);
+            const bool notAnother = !readings.confirms(15223, list);
+            const bool second = readings.confirms(12229, list);
+            const bool misreadMass = readings.confirms(12223, list);   // one numeral off
+            const bool startsAgain = !readings.confirms(12229, other) && !readings.confirms(12229, list) &&
+                                     readings.confirms(12229, list);
+            allPassed &= check(waits && heldBack && once && listedLate && countedOnce && firstOnly && notAnother &&
+                                   second && misreadMass && startsAgain,
+                               "a rock is its ore and mass: an SCU the view held from the rock before does not make "
+                               "it two, it waits 30 s off view for a list read late, and two readings alike for one "
+                               "mass make the list that rock's");
+        }
+
+        // The face reader's looks are summed as one rock until a look is
+        // another rock's: its mass off by more than one numeral, and another
+        // figure with it
+        {
+            using namespace SCMiner::RockScans;
+            auto rockOf = [](float mass, float scu, float resistance, bool colour, float instability) {
+                SCMiner::RockStats r;
+                r.mass = mass;
+                r.scu = scu;
+                r.resistance = resistance;
+                r.resistanceAdjusted = colour;
+                r.instability = instability;
+                return r;
+            };
+            // the MOLE's turret, 12 November: 12,229 kg and then 15,223 kg,
+            // a quarter apart
+            const bool turret =
+                anotherRock(rockOf(12229, 4.73f, 65, false, 130.88f), rockOf(15223, 5.88f, 61, false, 162.09f));
+            // his Stileron of 17 September: 570 kg without its SCU read, then
+            // 457 kg at nearly the same instability - the resistance tells
+            const bool stileron =
+                anotherRock(rockOf(570, 0, 57, false, 12.30f), rockOf(457, 1.09f, 42, false, 12.35f));
+            // misreads: one numeral of the mass, or the mass alone off
+            const bool numeral =
+                !anotherRock(rockOf(21460, 30.12f, 36, false, 302.71f), rockOf(21464, 30.12f, 36, false, 302.71f));
+            const bool massAlone =
+                !anotherRock(rockOf(17474, 3.35f, 27, false, 50.1f), rockOf(1747, 3.35f, 27, false, 50.1f));
+            // a laser on the rock changes its resistance, not the rock
+            const bool laser =
+                !anotherRock(rockOf(17474, 3.35f, 27, false, 50.1f), rockOf(1747, 3.35f, 9, true, 50.1f));
+            // nothing else read on both: a quarter off says it
+            const bool byMass = anotherRock(rockOf(1000, 0, -1, false, -1), rockOf(1450, 0, -1, false, -1)) &&
+                                !anotherRock(rockOf(1000, 0, -1, false, -1), rockOf(1150, 0, -1, false, -1));
+            const bool numerals = oneNumeralApart(21460, 21464, 0) && !oneNumeralApart(6087, 6052, 0) &&
+                                  oneNumeralApart(39.56f, 39.58f, 2) && !oneNumeralApart(9, 10, 0) &&
+                                  !oneNumeralApart(0, 0, 0);
+            allPassed &= check(turret && stileron && numeral && massAlone && laser && byMass && numerals,
+                               "a look is another rock's when its mass is more than a misread off and another figure "
+                               "is too - not for a quarter off alone");
+        }
+
+        // A look of the rock on view that read no SCU keeps the view's: the
+        // MOLE's turret, 17 November 2026, 12,868 kg at 25.27 SCU, and the
+        // line reader's looks between, which read none
+        {
+            using namespace SCMiner::RockScans;
+            SCMiner::RockStats held;
+            held.mass = 12868;
+            held.scu = 25.27f;
+            held.resistance = 14;
+            held.resistanceAdjusted = true;
+            held.instability = 22.96f;
+            SCMiner::RockStats look = held;
+            look.scu = 0;
+            keepScu(held, look);
+            SCMiner::RockStats own = held;
+            own.scu = 25.21f;
+            keepScu(held, own);
+            SCMiner::RockStats other = look;
+            other.mass = 8460;
+            other.scu = 0;
+            keepScu(held, other);
+            SCMiner::RockStats oneOff = look;
+            oneOff.mass = 12866;
+            oneOff.scu = 0;
+            keepScu(held, oneOff);
+            allPassed &= check(std::fabs(look.scu - 25.27f) < 0.001f && std::fabs(own.scu - 25.21f) < 0.001f &&
+                                   other.scu == 0 && oneOff.scu == 0,
+                               "a look of the rock on view that read no SCU keeps the view's SCU - one that read its "
+                               "own keeps that, and neither another rock nor a mass one numeral off takes it");
+        }
+
+        // A line look whose mass is the view's misread waits for a second
+        // look: the MOLE's pilot seat, 17 November 2026, 11,294 kg at 33.38
+        // SCU read once as 112,943 - the view showed that mass and lost the
+        // SCU - and 8,966 once as 89,667
+        {
+            using namespace SCMiner::RockScans;
+            allPassed &= check(numeralOff(11294, 112943) && numeralOff(11294, 111294) && numeralOff(8966, 89667) &&
+                                   numeralOff(8966, 9966) && numeralOff(8966, 966) && !numeralOff(8966, 8966) &&
+                                   !numeralOff(8966, 8967) && !numeralOff(8966, 4586) && !numeralOff(11294, 1129400) &&
+                                   !numeralOff(0, 8966),
+                               "a mass with a numeral more, less or other is the view's misread (112943, 111294 and "
+                               "89667 for 11294 and 8966); the same to the kilogram, another rock and two numerals more "
+                               "are not");
+            SCMiner::RockStats shown;
+            shown.mass = 11294;
+            shown.scu = 33.38f;
+            shown.resistance = 50;
+            shown.instability = 513.11f;
+            SCMiner::RockStats misread = shown;
+            misread.mass = 112943;
+            misread.scu = 0;
+            misread.instability = 513.44f;
+            SCMiner::RockStats same = misread;
+            same.mass = 11294;
+            SCMiner::RockStats other = misread;
+            other.mass = 4586;
+            MassCheck view;
+            const bool first = view.takes(shown, misread);
+            const bool back = view.takes(shown, same);
+            const bool again = view.takes(shown, misread);
+            const bool twice = view.takes(shown, misread);
+            const bool another = view.takes(shown, other);
+            allPassed &= check(!first && back && !again && twice && another,
+                               "the view holds a look whose mass is its own misread (112943 for 11294) until a second "
+                               "look reads the same, and takes the same mass and another rock's at once");
+        }
+
         // ...and the report that shares them with the service
         // (server/refinery/README.md, "Rock scans")
         {
@@ -787,6 +1153,853 @@ int runSelfTest() {
                                "the rocks go to the service as it takes them, and only rocks it takes - a ship ore, "
                                "figures in its ranges");
             if (!same) std::cout << "    report: " << report << std::endl;
+
+            // ...and, where the app knows it, how Bedrock saw each rock: the
+            // screen's height, the size of the label column (0 without one)
+            // and how its list went - read, tried, or never begun
+            Recorder seen;
+            SCMiner::RockStats look;
+            look.ore = "Taranite";
+            look.mass = 25005;
+            look.scu = 32.38f;
+            look.resistance = 36;
+            look.instability = 302.71f;
+            seen.taken(look, look, 1794000000, "mole", "Stanton - Yela", 1440, 0.92f);
+            seen.tried(25005);
+            SCMiner::RockStats lesser = look;
+            lesser.mass = 4391;
+            lesser.scu = 5.69f;
+            seen.taken(lesser, lesser, 1794000100, "mole", "Stanton - Yela", 1080, 0.0f);
+            SCMiner::RockStats listedRock = look;
+            listedRock.mass = 24031;
+            listedRock.scu = 31.12f;
+            seen.taken(listedRock, listedRock, 1794000200, "mole", "Stanton - Yela", 1440, 0.93f);
+            seen.tried(24031);
+            seen.listed(24031, taranite.parts);
+            seen.gone();
+            const std::vector<Scan> three = seen.done();
+            const std::string sent = three.size() == 3 ? body(three, "3.0.3", 41002, "LIVE", "0123456789abcdef") : "";
+            const bool told =
+                sent.find("\"place\":\"Stanton - Yela\",\"rows\":1440,\"label\":0.92,\"list\":\"tried\",\"parts\":[]") !=
+                    std::string::npos &&
+                sent.find("\"rows\":1080,\"label\":0.00,\"list\":\"none\",\"parts\":[]") != std::string::npos &&
+                sent.find("\"rows\":1440,\"label\":0.93,\"list\":\"read\",\"parts\":[{") != std::string::npos &&
+                report.find("\"rows\"") == std::string::npos;
+            allPassed &= check(told, "a rock tells the service how Bedrock saw it - the screen's height, the label "
+                                     "column's size, how its list went - where the app knows");
+            if (!told) std::cout << "    report: " << sent << std::endl;
+        }
+
+        // ...and a player's message from the Feedback page, as the service
+        // takes it (Feedback.h; server/refinery/README.md, "Feedback")
+        {
+            namespace F = SCMiner::Feedback;
+            const std::string typed = "  The \"rock panel\" reads C:\\ nothing.\r\nSince 4.10.3 \xC3\xA4hnlich.\t(MOLE)\n\n ";
+            const std::string sent = F::body(typed, " Rock\nHound ", "3.0.4", 41003, "LIVE + HOTFIX", "windows");
+            const bool same = sent ==
+                              "{\"text\":\"The \\\"rock panel\\\" reads C:\\\\ nothing.\\nSince 4.10.3 \xC3\xA4hnlich. (MOLE)\","
+                              "\"name\":\"Rock Hound\",\"version\":\"3.0.4\",\"game\":41003,\"channel\":\"LIVE\","
+                              "\"os\":\"windows\"}";
+            // no name given, a game and a channel not known: the name and
+            // the channel left out, the game 0
+            const bool bare = F::body("a", "  ", "3.0.4", 0, "", "linux") ==
+                                  "{\"text\":\"a\",\"version\":\"3.0.4\",\"game\":0,\"os\":\"linux\"}" &&
+                              F::body("a", "", "3.0.4", 41003, "SOMETHING-NEW", "linux") ==
+                                  "{\"text\":\"a\",\"version\":\"3.0.4\",\"game\":41003,\"os\":\"linux\"}";
+            allPassed &= check(same && bare && std::string(F::platform()) ==
+#ifdef _WIN32
+                                                   "windows",
+#else
+                                                   "linux",
+#endif
+                               "a message goes to the service as it takes it - a quote, a backslash, a line break and "
+                               "an umlaut in it - and without a name where none was given");
+            if (!same) std::cout << "    message: " << sent << std::endl;
+
+            // what does not go, and what is taken out on the way
+            std::string most, over, faces;
+            for (size_t i = 0; i < F::TEXT_MOST; i++) most += "\xC3\xA4";
+            over = most + "b";
+            for (size_t i = 0; i < F::TEXT_MOST; i++) faces += "\xF0\x9F\x98\x80";   // four bytes each
+            const std::string name40(F::NAME_MOST, 'n');
+            const bool empties = F::fault("", "") == F::Fault::Empty && F::fault(" \r\n\t\xC2\xA0 ", "") == F::Fault::Empty &&
+                                 F::body(" \n ", "x", "3.0.4", 41003, "LIVE", "windows").empty();
+            const bool lengths = F::fault(most, "") == F::Fault::None && F::fault("  " + most + "\n", "") == F::Fault::None &&
+                                 F::fault(over, "") == F::Fault::TooLong &&
+                                 F::body(over, "", "3.0.4", 41003, "LIVE", "windows").empty() &&
+                                 F::fault("a", name40) == F::Fault::None &&
+                                 F::fault("a", name40 + "n") == F::Fault::NameTooLong;
+            const std::string widest = F::body(faces, std::string(F::NAME_MOST, 'n'), "3.0.4", 41003, "TECH-PREVIEW", "windows");
+            const bool fitsBody = !widest.empty() && widest.size() <= F::BODY_MOST && F::characters(faces) == F::TEXT_MOST;
+            const bool cleaned = F::message("a\x01" "b\x7F" "c") == "abc" && F::message("a\xC2\x85" "b") == "a\nb" &&
+                                 F::message("a\xE2\x80\xA8" "b\x0B" "c\rd") == "a\nb\nc\nd" &&
+                                 F::message("a\xFF" "b") == "a\xEF\xBF\xBD" "b" && F::name(" a\r\nb\tc ") == "a b c";
+            allPassed &= check(empties && lengths && fitsBody && cleaned,
+                               "a message of nothing or of white space alone does not go, nor one over 4,000 characters; "
+                               "control characters are taken out, a name is one line of 40 at most");
+
+            const bool statuses = F::outcome(201) == F::Outcome::Sent && F::outcome(200) == F::Outcome::Sent &&
+                                  F::outcome(0) == F::Outcome::NoConnection && F::outcome(503) == F::Outcome::NoConnection &&
+                                  F::outcome(429) == F::Outcome::Limited && F::outcome(400) == F::Outcome::Refused &&
+                                  F::outcome(413) == F::Outcome::Refused && F::outcome(415) == F::Outcome::Refused &&
+                                  F::outcome(404) == F::Outcome::Refused;
+            allPassed &= check(statuses, "the service's answer to a message: kept at 201 and 200, no connection without an "
+                                         "answer or at 5xx, too many at 429, turned down at 400, 413 and 415");
+
+            const std::string dot = "  \xC2\xB7  ";
+            const bool along =
+                F::sentWith("3.0.4", 41003, true) ==
+                    "Sent with it: Bedrock 3.0.4" + dot + "Star Citizen 4.10.3" + dot + "Installation number" &&
+                F::sentWith("3.0.4", 0, true) == "Sent with it: Bedrock 3.0.4" + dot + "Installation number" &&
+                F::sentWith("3.0.4", 41003, false) == "Sent with it: Bedrock 3.0.4" + dot + "Star Citizen 4.10.3" &&
+                F::sentWith("3.0.4", 0, false) == "Sent with it: Bedrock 3.0.4";
+            allPassed &= check(along, "the Feedback page names what goes with a message: Bedrock's version, the game's where "
+                                      "the log gave it, the installation number where one is sent");
+
+            // ...a bug report's: the size of its zip in the body, what the
+            // service answers to it, and the zip's own way (DebugZip.h)
+            const std::string withZip = F::body("a", "", "3.0.4", 41003, "LIVE", "windows", 1234567);
+            const std::string withoutZip =
+                "{\"text\":\"a\",\"version\":\"3.0.4\",\"game\":41003,\"channel\":\"LIVE\",\"os\":\"windows\"}";
+            const bool debugKey =
+                withZip == "{\"text\":\"a\",\"version\":\"3.0.4\",\"game\":41003,\"channel\":\"LIVE\",\"os\":\"windows\","
+                           "\"debug\":1234567}" &&
+                F::body("a", "", "3.0.4", 41003, "LIVE", "windows", 0) == withoutZip &&
+                F::body("a", "", "3.0.4", 41003, "LIVE", "windows") == withoutZip;
+            const std::string widestZip = F::body(faces, name40, "3.0.4", 41003, "TECH-PREVIEW", "windows",
+                                                  (std::int64_t)F::DEBUG_MOST);
+            allPassed &= check(debugKey && !widestZip.empty() && widestZip.size() <= F::BODY_MOST,
+                               "a message with a debug folder says the size of its zip as \"debug\", one without says "
+                               "nothing of it");
+            if (!debugKey) std::cout << "    message: " << withZip << std::endl;
+
+            const std::string token = "0123456789abcdef0123456789abcdef";
+            const F::Answer granted = F::answer("{\"ok\": true, \"stored\": true, \"id\": 42, \"upload\": \"" + token + "\"}");
+            const F::Answer refused = F::answer("{\"ok\": true, \"stored\": false,\n \"debug\" : \"refused\"}");
+            const F::Answer plain = F::answer("{\"ok\": true, \"stored\": true}");
+            const F::Answer shortToken = F::answer("{\"id\": 42, \"upload\": \"" + token.substr(1) + "\"}");
+            const F::Answer capitals = F::answer("{\"id\": 42, \"upload\": \"0123456789ABCDEF0123456789ABCDEF\"}");
+            bool junk = shortToken.id == 42 && shortToken.upload.empty() && capitals.upload.empty();
+            // an id that is no whole number above 0, members of an inner
+            // object or inside a string, no object at all
+            for (const std::string& text :
+                 {std::string("{\"id\": \"42\"}"), std::string("{\"id\": 4.2}"), std::string("{\"id\": -42}"),
+                  std::string("{\"id\": 042}"), std::string("{\"id\": 1e3}"), std::string("{\"id\": 42x}"),
+                  std::string("{\"id\": 0}"), std::string("{\"id\": 1234567890123456789012}"),
+                  "{\"error\": {\"id\": 42, \"upload\": \"" + token + "\", \"debug\": \"refused\"}}",
+                  std::string("{\"note\": \"\\\"id\\\": 42, \\\"debug\\\": \\\"refused\\\"\"}"),
+                  std::string("[{\"id\": 42}]"), std::string("id: 42"), std::string("{\"debug\": \"Refused\"}"),
+                  std::string()}) {
+                const F::Answer junkAnswer = F::answer(text);
+                junk = junk && junkAnswer.id == 0 && junkAnswer.upload.empty() && !junkAnswer.debugRefused;
+            }
+            const bool answers = granted.id == 42 && granted.upload == token && !granted.debugRefused &&
+                                 refused.debugRefused && refused.id == 0 && refused.upload.empty() && plain.id == 0 &&
+                                 plain.upload.empty() && !plain.debugRefused && junk;
+            allPassed &= check(answers, "the service's answer to a message gives its number and a token of 32 lowercase hex "
+                                        "for the zip, or refuses the zip; a token of 31, an id that is no number, a member "
+                                        "of an inner object give nothing");
+
+            const std::vector<std::string> uploadHeaders = F::debugHeaders(token);
+            const bool upload =
+                F::debugPath(42) == "/v1/feedback/42/debug" && uploadHeaders.size() == 2 &&
+                uploadHeaders[0] == "X-Bedrock-Upload: " + token && uploadHeaders[1] == "Content-Type: application/zip" &&
+                F::debugOutcome(201) == F::DebugOutcome::Sent && F::debugOutcome(0) == F::DebugOutcome::NoConnection &&
+                F::debugOutcome(413) == F::DebugOutcome::TooLarge &&
+                F::debugOutcome(500) == F::DebugOutcome::NoConnection &&
+                F::debugOutcome(503) == F::DebugOutcome::NoConnection && F::debugOutcome(507) == F::DebugOutcome::Full &&
+                F::debugOutcome(400) == F::DebugOutcome::TurnedDown && F::debugOutcome(403) == F::DebugOutcome::TurnedDown &&
+                F::debugOutcome(404) == F::DebugOutcome::TurnedDown && F::debugOutcome(409) == F::DebugOutcome::Sent;
+            allPassed &= check(upload, "the zip goes to /v1/feedback/<id>/debug with its token; stored at 201 and 409, no "
+                                       "connection without an answer or at 5xx, too large at 413, the service full at 507, "
+                                       "turned down at 400, 403 and 404");
+
+            // the answer to a message sent again that has its zip: no
+            // token, nothing more to send - as strictly read as the rest
+            const F::Answer stored = F::answer("{\"ok\": true, \"stored\": false, \"debug\": \"stored\"}");
+            bool storedOnly = stored.debugStored && !stored.debugRefused && stored.id == 0 && stored.upload.empty() &&
+                              !refused.debugStored && !granted.debugStored && !plain.debugStored;
+            for (const std::string& text :
+                 {std::string("{\"debug\": \"Stored\"}"), std::string("{\"debug\": \"stored \"}"),
+                  std::string("{\"debug\": true}"), std::string("{\"error\": {\"debug\": \"stored\"}}"),
+                  std::string("{\"note\": \"\\\"debug\\\": \\\"stored\\\"\"}"), std::string("[{\"debug\": \"stored\"}]")}) {
+                storedOnly = storedOnly && !F::answer(text).debugStored;
+            }
+            allPassed &= check(storedOnly, "the service's answer says \"stored\" where a message sent again has its zip "
+                                           "already; \"Stored\", an inner object's or a word in a string do not count");
+
+            // Send, all of it, through a poster that answers as told and
+            // notes what it was asked to send: the message, then the zip
+            struct Call {
+                std::string path;
+                std::vector<std::string> headers;
+                std::string payload;
+            };
+            struct Sending {
+                F::Result result;
+                std::vector<Call> calls;
+                std::vector<std::pair<std::int64_t, std::int64_t>> told;
+            };
+            const std::string zip = "PK\x03\x04" + std::string(3000, 'z');
+            const auto sendWith = [&](const std::string& zipBytes, int status, const std::string& said, int uploadStatus) {
+                Sending out;
+                const std::string body = F::body("a", "", "3.0.4", 41003, "LIVE", "windows", (std::int64_t)zipBytes.size());
+                out.result = F::send(
+                    body, zipBytes,
+                    [&](const std::string& path, const std::vector<std::string>& headers, const std::string& payload,
+                        const F::Progress& progress, std::string& answer) {
+                        out.calls.push_back({path, headers, payload});
+                        if (out.calls.size() == 1) {
+                            answer = said;
+                            return status;
+                        }
+                        // the zip, in two pieces
+                        const std::int64_t size = (std::int64_t)payload.size();
+                        if (progress) {
+                            progress(size / 2, size);
+                            progress(size, size);
+                        }
+                        answer = "{\"ok\": true, \"stored\": true}";
+                        return uploadStatus;
+                    },
+                    [&](std::int64_t sentBytes, std::int64_t total) { out.told.push_back({sentBytes, total}); });
+                return out;
+            };
+            const std::string granting = "{\"ok\": true, \"stored\": true, \"id\": 42, \"upload\": \"" + token + "\"}";
+            const std::int64_t zipSize = (std::int64_t)zip.size();
+
+            const Sending alone = sendWith("", 201, "{\"ok\": true, \"stored\": true}", 0);
+            const bool messageAlone = alone.result.status == 201 && alone.result.debug == F::DebugOutcome::None &&
+                                      alone.calls.size() == 1 && alone.calls[0].path == "/v1/feedback" &&
+                                      alone.calls[0].headers == std::vector<std::string>{"Content-Type: application/json"} &&
+                                      alone.calls[0].payload == withoutZip && alone.told.empty() &&
+                                      F::send("", zip, [&](const std::string&, const std::vector<std::string>&,
+                                                           const std::string&, const F::Progress&, std::string&) {
+                                          return 201;
+                                      }).status == 413;
+            allPassed &= check(messageAlone, "Send without a debug folder is one request: the message, saying nothing of a zip");
+
+            const Sending upped = sendWith(zip, 201, granting, 201);
+            const std::vector<std::pair<std::int64_t, std::int64_t>> steps = {{0, zipSize}, {zipSize / 2, zipSize},
+                                                                              {zipSize, zipSize}};
+            const bool goesUp =
+                upped.result.status == 201 && upped.result.debug == F::DebugOutcome::Sent &&
+                upped.result.debugStatus == 201 && upped.calls.size() == 2 &&
+                upped.calls[0].payload.find(",\"debug\":" + std::to_string(zipSize) + "}") != std::string::npos &&
+                upped.calls[1].path == "/v1/feedback/42/debug" && upped.calls[1].headers == F::debugHeaders(token) &&
+                upped.calls[1].payload == zip && upped.told == steps;
+            allPassed &= check(goesUp, "Send with a debug folder: the message says its zip's size, the zip goes up after it "
+                                       "to the message's number with its token, how far it is told from 0 on");
+
+            bool uploads = true;
+            for (const auto& [status, debug] :
+                 std::vector<std::pair<int, F::DebugOutcome>>{{409, F::DebugOutcome::Sent},
+                                                              {413, F::DebugOutcome::TooLarge},
+                                                              {507, F::DebugOutcome::Full},
+                                                              {0, F::DebugOutcome::NoConnection},
+                                                              {502, F::DebugOutcome::NoConnection},
+                                                              {403, F::DebugOutcome::TurnedDown}}) {
+                const Sending one = sendWith(zip, 201, granting, status);
+                uploads = uploads && one.result.status == 201 && one.result.debug == debug &&
+                          one.result.debugStatus == status && one.calls.size() == 2;
+            }
+            allPassed &= check(uploads, "an upload answered 409 - the message has its zip, one sent again after its answer "
+                                        "was lost - counts as sent, as 201 does; 413, 507, none or 5xx, 403 do not");
+
+            // no upload: the answer says the service has the zip, or lets
+            // none in, or gives no token; the message did not go
+            const Sending again = sendWith(zip, 200, "{\"ok\": true, \"stored\": false, \"debug\": \"stored\"}", 201);
+            const Sending turnedAway = sendWith(zip, 201, "{\"ok\": true, \"stored\": true, \"debug\": \"refused\"}", 201);
+            const Sending tokenless = sendWith(zip, 201, "{\"ok\": true, \"stored\": true}", 201);
+            const Sending both = sendWith(zip, 201,
+                                       "{\"ok\": true, \"id\": 42, \"upload\": \"" + token + "\", \"debug\": \"refused\"}", 201);
+            bool held = again.result.debug == F::DebugOutcome::Sent && again.calls.size() == 1 &&
+                        turnedAway.result.debug == F::DebugOutcome::Refused && turnedAway.calls.size() == 1 &&
+                        tokenless.result.debug == F::DebugOutcome::Refused && tokenless.calls.size() == 1 &&
+                        both.result.debug == F::DebugOutcome::Refused && both.calls.size() == 1 &&
+                        again.told.empty() && turnedAway.told.empty() && tokenless.told.empty();
+            for (int status : {0, 429, 400, 413, 503}) {
+                const Sending failed = sendWith(zip, status, granting, 201);
+                held = held && failed.result.status == status && failed.result.debug == F::DebugOutcome::None &&
+                       failed.calls.size() == 1 && failed.told.empty();
+            }
+            allPassed &= check(held, "no upload where the message's answer says its zip is stored, refuses it or gives no "
+                                     "token, nor where the message did not go");
+
+            // what the page shows, for every message outcome and debug
+            // folder's
+            bool page = true;
+            const std::vector<F::DebugOutcome> debugs = {F::DebugOutcome::None,         F::DebugOutcome::Sent,
+                                                         F::DebugOutcome::Refused,      F::DebugOutcome::NoConnection,
+                                                         F::DebugOutcome::TooLarge,     F::DebugOutcome::Full,
+                                                         F::DebugOutcome::TurnedDown};
+            const std::vector<F::Shown> whenSent = {F::Shown::Sent,         F::Shown::Sent,
+                                                    F::Shown::DebugRefused, F::Shown::DebugNoConnection,
+                                                    F::Shown::DebugTooLarge, F::Shown::DebugFull,
+                                                    F::Shown::DebugTurnedDown};
+            for (size_t i = 0; i < debugs.size(); i++) {
+                page = page && F::shown(F::Outcome::Sent, debugs[i]) == whenSent[i] &&
+                       F::shown(F::Outcome::NoConnection, debugs[i]) == F::Shown::NoConnection &&
+                       F::shown(F::Outcome::Limited, debugs[i]) == F::Shown::Limited &&
+                       F::shown(F::Outcome::Refused, debugs[i]) == F::Shown::Refused;
+            }
+            allPassed &= check(page, "the page shows SENT for a message that went with its debug folder or without one "
+                                     "wanted, why the folder did not go where it did not, NOT SENT for a message that did not");
+
+            const bool alongDebug =
+                F::sentWith("3.0.4", 41003, true, true) == "Sent with it: Bedrock 3.0.4" + dot + "Star Citizen 4.10.3" + dot +
+                                                               "Installation number" + dot + "Debug folder" &&
+                F::sentWith("3.0.4", 0, false, true) == "Sent with it: Bedrock 3.0.4" + dot + "Debug folder" &&
+                F::sentWith("3.0.4", 41003, true, false) == F::sentWith("3.0.4", 41003, true);
+            allPassed &= check(alongDebug, "the Feedback page names the debug folder last among what goes with a message "
+                                           "while it is to go, and not otherwise");
+
+            const std::int64_t mb = 1024 * 1024;
+            const bool sizes = F::megabytes(0) == 1 && F::megabytes(1) == 1 && F::megabytes(2 * mb - 1) == 1 &&
+                               F::megabytes(12 * mb + mb / 2) == 12 && F::megabytes(28 * mb) == 28 &&
+                               F::megabytes((std::int64_t)F::DEBUG_MOST) == 32;
+            allPassed &= check(sizes, "an upload's sizes in whole MB, rounded down, 1 at least");
+        }
+
+        // The app's own pictures of the rock panel (PanelKeep.h): one per
+        // rock, one of a panel seen and not read, two rings of twenty
+        {
+            using SCMiner::PanelKeep;
+            const cv::Size screen(5120, 1440);
+            // a look: the labels where the MOLE pilot seat has them on his
+            // screen (17 November 2026), read or not, the mass as read
+            auto lookAt = [](char glyph, bool found, const std::string& mass) {
+                SCMiner::ScanPanel p;
+                p.labels = cv::Point(3056, 680);
+                p.labelScale = 1.0;
+                p.labelGlyph = glyph;
+                p.found = found;
+                p.figures[0].text = mass;
+                p.figures[0].placed = !mass.empty();
+                if (found) {
+                    p.stats.mass = (float)std::atof(mass.c_str());
+                    p.figuresRead = 3;
+                }
+                return p;
+            };
+            const SCMiner::ScanPanel nothing;
+            // A sequence of looks 0.7 s apart, as a player scans rocks in a
+            // cluster: on the PTU (5.0) the masses of the twenty pictures the
+            // PTU build kept in two minutes on 17 November 2026 - panels still
+            // scanning (000, its zeros read as eights), rocks looked at again,
+            // 40024 read as 48824 - then on LIVE (4.10.3) a blank look, a
+            // numeral misread, 12560 read as 18568
+            const std::vector<std::pair<bool, std::string>> five = {
+                {false, "000"},  {false, "088"},  {true, "8728"},  {true, "8728"},  {true, "8720"},
+                {true, "25612"}, {true, "25512"}, {true, "19554"}, {true, "25612"}, {true, "40024"},
+                {true, "48824"}, {false, ""},     {true, "19554"}, {false, "000"},  {true, "40024"}};
+            const std::vector<std::pair<bool, std::string>> live = {
+                {true, "11294"}, {true, "11294"}, {false, ""},     {true, "11284"}, {true, "5891"}, {true, "11294"},
+                {true, "5891"},  {true, "12560"}, {true, "12568"}, {true, "18568"}, {true, "5891"}};
+            PanelKeep keep;
+            double t = 0;
+            std::string rocks;
+            int unreadKept = 0;
+            for (const auto& [found, mass] : five) {
+                const PanelKeep::Kept kept = keep.look(lookAt(SCMiner::FIVE_PANEL, found, mass), screen, t += 0.7);
+                if (kept == PanelKeep::Kept::Rock) rocks += " 5:" + mass;
+                if (kept == PanelKeep::Kept::Unread) unreadKept++;
+            }
+            for (const auto& [found, mass] : live) {
+                const PanelKeep::Kept kept = keep.look(lookAt('Q', found, mass), screen, t += 0.7);
+                if (kept == PanelKeep::Kept::Rock) rocks += " 4:" + mass;
+                if (kept == PanelKeep::Kept::Unread) unreadKept++;
+            }
+            allPassed &= check(rocks == " 5:8728 5:25612 5:19554 5:40024 4:11294 4:5891 4:12560" && unreadKept == 0,
+                               "the panel's pictures: one per rock on a sequence of looks at 5.0 and 4.10 panels - none "
+                               "for a mass a numeral off, a zero read as an eight, a rock looked at again, a panel still "
+                               "scanning (got" + rocks + ", " + std::to_string(unreadKept) + " unread)");
+
+            // A panel whose labels are found and figures not: one picture once
+            // it stays so for five seconds, no more while it stays - an hour
+            // of looks - one a minute at most, none for a rock kept already
+            PanelKeep seen;
+            double s = 0;
+            int early = 0, hour = 0, back = 0, soon = 0, golem = 0, broken = 0;
+            auto unreadLook = [&](const std::string& mass, char glyph) {
+                return seen.look(lookAt(glyph, false, mass), screen, s += 0.7) == PanelKeep::Kept::Unread;
+            };
+            for (int i = 0; i < 6; i++) early += unreadLook("", 'T');                      // 4.2 s
+            for (int i = 0; i < 5143; i++) hour += unreadLook("", 'T');                    // an hour
+            for (int i = 0; i < 18; i++) seen.look(nothing, screen, s += 0.7);             // away 12.6 s
+            for (int i = 0; i < 10; i++) back += unreadLook("", 'T');                      // back: one
+            for (int i = 0; i < 18; i++) seen.look(nothing, screen, s += 0.7);
+            for (int i = 0; i < 10; i++) soon += unreadLook("", 'T');                      // inside the minute
+            for (int i = 0; i < 18; i++) seen.look(nothing, screen, s += 0.7);
+            seen.look(lookAt('G', true, "4097"), screen, s += 70);                          // a Golem rock read...
+            for (int i = 0; i < 20; i++) golem += unreadLook("4097", 'G');                  // ...its figures red
+            for (int i = 0; i < 18; i++) seen.look(nothing, screen, s += 0.7);
+            for (int round = 0; round < 4; round++) {                                      // read now and then
+                for (int i = 0; i < 6; i++) broken += unreadLook("", 'T');
+                seen.look(lookAt('T', true, std::to_string(20000 + round * 3000)), screen, s += 0.7);
+            }
+            allPassed &= check(early == 0 && hour == 1 && back == 1 && soon == 0 && golem == 0 && broken == 0,
+                               "a panel seen and not read: one picture once it stays unread for five seconds, none more "
+                               "in an hour of looks at it, one a minute at most, none for a rock pictured already or "
+                               "between readings (got " + std::to_string(early) + " " + std::to_string(hour) + " " +
+                                   std::to_string(back) + " " + std::to_string(soon) + " " + std::to_string(golem) + " " +
+                                   std::to_string(broken) + ")");
+
+            // The two rings in a folder of their own: twenty-one pictures of
+            // each, the 21st in the first's place; a new start goes on after
+            // the newest file; the .txt says what it is
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            const fs::path folder = fs::temp_directory_path(ec) / "bedrock-panelkeep-selftest";
+            fs::remove_all(folder, ec);
+            cv::Mat frame(screen, CV_8UC3, cv::Scalar(0, 0, 0));
+            cv::putText(frame, "MASS: 11294", cv::Point(3056, 700), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 140, 255), 2);
+            PanelKeep::About about;
+            about.channel = "LIVE";
+            about.ship = "ARGO MOLE";
+            about.seated = true;
+            about.toneMapped = true;
+            PanelKeep rings;
+            std::vector<std::string> names;
+            bool wrote = true;
+            for (int i = 0; i < 21; i++) {
+                for (char glyph : {'Q', SCMiner::FIVE_PANEL}) {
+                    std::string name;
+                    wrote &= rings.write(folder.string(), frame, lookAt(glyph, true, "11294"),
+                                         i == 20 ? PanelKeep::Kept::Unread : PanelKeep::Kept::Rock, about, &name);
+                    names.push_back(name);
+                }
+            }
+            int files = 0;
+            for (fs::directory_iterator it(folder, ec), done; !ec && it != done; it.increment(ec)) files++;
+            auto textOf = [](const fs::path& file) {
+                std::ifstream in(file, std::ios::binary);
+                return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            };
+            const std::string first = textOf(folder / "panel_1.txt"), second = textOf(folder / "panel_2.txt");
+            const bool named = names.size() == 42 && names[0] == "panel_1" && names[1] == "panel5_1" &&
+                               names[38] == "panel_20" && names[39] == "panel5_20" && names[40] == "panel_1" &&
+                               names[41] == "panel5_1";
+            const bool told = first.find("frame 5120x1440") == 0 && first.find("\ntone mapped 1") != std::string::npos &&
+                              first.find("\nkept unread") != std::string::npos &&
+                              first.find("\npanel 4.10, MOLE pilot seat") != std::string::npos &&
+                              first.find("\nship ARGO MOLE, seated") != std::string::npos &&
+                              first.find("\nchannel LIVE") != std::string::npos &&
+                              second.find("\nkept rock 11294") != std::string::npos &&
+                              textOf(folder / "panel5_2.txt").find("\npanel 5.0") != std::string::npos;
+            // a new start: panel_7 the newest file, panel5_20 too
+            const auto now = fs::file_time_type::clock::now();
+            fs::last_write_time(folder / "panel_7.png", now + std::chrono::hours(1), ec);
+            fs::last_write_time(folder / "panel5_20.png", now + std::chrono::hours(1), ec);
+            PanelKeep restarted;
+            const int nextPanel = restarted.nextNumber(folder.string(), "panel");
+            const int nextFive = restarted.nextNumber(folder.string(), "panel5");
+            const cv::Mat back1 = cv::imread((folder / "panel_1.png").string());
+            const cv::Rect cut = PanelKeep::cut(lookAt('Q', true, "11294"), screen);
+            allPassed &= check(wrote && named && files == 80 && told && nextPanel == 8 && nextFive == 1 &&
+                                   back1.cols == cut.width && back1.rows == cut.height,
+                               "the panel's pictures go round two rings of twenty, panel_<n> for 4.10 and panel5_<n> for "
+                               "5.0: the 21st takes the first's place, a new start goes on after the newest file, each "
+                               ".txt says what it is (got " + std::to_string(files) + " files, next " +
+                                   std::to_string(nextPanel) + " and " + std::to_string(nextFive) + ")");
+            if (!named || !told) {
+                std::cout << "    names: " << (names.size() > 41 ? names[40] + " " + names[41] : std::string("-"))
+                          << "\n    panel_1.txt: " << first << std::endl;
+            }
+            fs::remove_all(folder, ec);
+        }
+
+        // ...and the debug folder that goes with a bug report, as a zip
+        // (DebugZip.h): a made-up folder of a made-up user, "Mining"
+        {
+            namespace D = SCMiner::DebugZip;
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            const fs::path folder = fs::temp_directory_path(ec) / "bedrock-debugzip-selftest";
+            fs::remove_all(folder, ec);
+            fs::create_directories(folder / "uex_sent", ec);
+            fs::create_directories(folder / "recording", ec);
+            auto put = [&](const std::string& name, const std::string& bytes) {
+                std::ofstream(folder / name, std::ios::binary | std::ios::trunc) << bytes;
+            };
+            const D::Masks masks{"C:\\Users\\Mining", "Mining"};
+            const std::string session = "Bedrock 3.0.4  2026-11-16 20:15:00\n"
+                                        "program: C:\\Bedrock\n"
+                                        "data:    C:\\Users\\Mining\\AppData\\Local\\Bedrock\n"
+                                        "laser: Mining laser\n";
+            put("session.txt", session);
+            put("region_config.txt", "x=1650\ngamelog=C:/Users/Mining/Games/StarCitizen/LIVE/Game.log\n");
+            put("rock_scans.csv", "observed,ore,mass\n1794000000,Taranite,25005\n");
+            put("rock_readings.csv", "time,ore,mass\n20:15:00.120,Taranite,25005\n");
+            // a scan log of 3 MiB, its lines of different lengths
+            const std::string logHeader = "time,slot,result,value,confidence\n";
+            std::string scanLog = logHeader;
+            for (int i = 0; scanLog.size() < 3 * 1024 * 1024; i++) {
+                scanLog += "20:15:" + std::to_string(10 + i % 50) + ",1,ok," + std::to_string(i) + "," +
+                           std::string((size_t)(i % 41), '9') + "\n";
+            }
+            put("scan_log.csv", scanLog);
+            // what stays out
+            put("scan_log.old.csv", logHeader + "20:14:59,1,ok,1,99\n");
+            put("rock_readings.old.csv", "time,ore,mass\n");
+            put("panel_miss_1.png", "\x89PNG the whole screen");
+            put("region_3.png", "\x89PNG region");
+            put("uex_sent/a.jpg", "jpg");
+            put("recording/x.mp4", "mp4");
+            // five snapshots: four by the time in their names - written in
+            // another order, their files' times the other way round - and
+            // one named otherwise, by its file's time: now, the newest. The
+            // second newest without its .txt.
+            const std::string note = "data:    C:\\Users\\Mining\\AppData\\Local\\Bedrock\n"
+                                     "snapshot: the game picture at 0,0\n";
+            for (const char* base : {"snapshot_20200103_100000", "snapshot_20200101_100000", "snapshot_20200104_100000",
+                                     "snapshot_20200102_100000"}) {
+                put(std::string(base) + ".png", "\x89PNG " + std::string(20000, base[16]));
+                if (std::string(base) != "snapshot_20200104_100000") put(std::string(base) + ".txt", note);
+            }
+            const auto now = fs::file_time_type::clock::now();
+            for (int day = 1; day <= 4; day++) {
+                fs::last_write_time(folder / ("snapshot_2020010" + std::to_string(day) + "_100000.png"),
+                                    now - std::chrono::hours(day), ec);
+            }
+            put("snapshot_manual.png", "\x89PNG " + std::string(30000, 'm'));
+            put("snapshot_manual.txt", note);
+
+            const std::vector<std::string> expected = {
+                "session.txt",         "region_config.txt",   "rock_scans.csv",
+                "rock_readings.csv",   "scan_log.csv",        "snapshot_manual.png",
+                "snapshot_manual.txt", "snapshot_20200104_100000.png", "snapshot_20200103_100000.png",
+                "snapshot_20200103_100000.txt"};
+            auto namesOf = [](const std::vector<D::Entry>& entries) {
+                std::vector<std::string> names;
+                for (const D::Entry& entry : entries) names.push_back(entry.name);
+                return names;
+            };
+            const std::vector<D::Entry> picked = D::pick(folder, masks, SCMiner::Feedback::DEBUG_MOST);
+            const bool order = namesOf(picked) == expected;
+            allPassed &= check(order, "a debug folder's zip takes its texts and the three newest snapshots - by the time in "
+                                      "the name, else the file's - each with its .txt where there is one, and nothing else");
+            if (!order) {
+                std::cout << "    picked:";
+                for (const std::string& name : namesOf(picked)) std::cout << " " << name;
+                std::cout << std::endl;
+            }
+            auto pickedText = [&](const std::string& name) {
+                for (const D::Entry& entry : picked) {
+                    if (entry.name == name) return entry.data;
+                }
+                return std::string();
+            };
+
+            const std::string logTail = pickedText("scan_log.csv");
+            bool tail = false;
+            if (logTail.size() > logHeader.size() && logTail.compare(0, logHeader.size(), logHeader) == 0) {
+                const std::string rest = logTail.substr(logHeader.size());
+                const size_t at = scanLog.size() - rest.size();
+                tail = rest.size() <= D::LOG_TAIL && rest.size() > D::LOG_TAIL - 100 && rest.size() < scanLog.size() &&
+                       scanLog.compare(at, rest.size(), rest) == 0 && scanLog[at - 1] == '\n';
+            }
+            allPassed &= check(tail, "the scan log goes as its header and whole lines of its end, 2 MiB at most beside the "
+                                     "header");
+
+            // the user hidden: by Windows' rules and by Linux', whichever
+            // system this is
+            const std::string paths = "data:    C:\\Users\\Mining\\AppData\\Local\\Bedrock\n"
+                                      "gamelog=C:/Users/Mining/Games/StarCitizen/LIVE/Game.log\n"
+                                      "{\"path\": \"C:\\\\Users\\\\Mining\\\\AppData\\\\Local\"}\n"
+                                      "exe: c:\\users\\MINING\\Downloads\\Bedrock\\Bedrock.exe\n"
+                                      "shortcut: C:\\Users\\Mining\\OneDrive\\Desktop\\Bedrock.lnk\n"
+                                      "game: D:\\Games\\mining\\StarCitizen | D:\\Mining2\\x | D:\\Mining.old\n"
+                                      "Mining laser: Mining, the ship's Mining\n";
+            const std::string pathsHidden = "data:    %USERPROFILE%\\AppData\\Local\\Bedrock\n"
+                                            "gamelog=%USERPROFILE%/Games/StarCitizen/LIVE/Game.log\n"
+                                            "{\"path\": \"%USERPROFILE%\\\\AppData\\\\Local\"}\n"
+                                            "exe: %USERPROFILE%\\Downloads\\Bedrock\\Bedrock.exe\n"
+                                            "shortcut: %USERPROFILE%\\OneDrive\\Desktop\\Bedrock.lnk\n"
+                                            "game: D:\\Games\\<user>\\StarCitizen | D:\\Mining2\\x | D:\\Mining.old\n"
+                                            "Mining laser: Mining, the ship's Mining\n";
+            const std::string onWindows = D::masked(paths, masks, D::Rules::Windows);
+            const std::string onLinux =
+                D::masked("/home/mining/.local/share/bedrock | /home/MINING/x | /data/home/mining/y | /mnt/games/mining | "
+                          "mining laser | /home/mining2/z",
+                          D::Masks{"/home/mining", "mining"}, D::Rules::Linux);
+            bool hidden = onWindows == pathsHidden &&
+                          onLinux == "~/.local/share/bedrock | /home/MINING/x | /data/home/<user>/y | /mnt/games/<user> | "
+                                     "mining laser | /home/mining2/z";
+            // ...and in what pick() takes, every text masked by this system's rules
+            for (const D::Entry& entry : picked) {
+                if (entry.name.size() > 4 && entry.name.compare(entry.name.size() - 4, 4, ".png") == 0) continue;
+                hidden = hidden && entry.data.find("\\Mining\\") == std::string::npos &&
+                         entry.data.find("/Mining/") == std::string::npos;
+            }
+            hidden = hidden && pickedText("session.txt") == D::masked(session, masks) &&
+                     pickedText("session.txt").find("laser: Mining laser") != std::string::npos &&
+                     pickedText("snapshot_manual.txt") == D::masked(note, masks);
+            allPassed &= check(hidden, "the user is hidden in the texts: the home folder written with \\, / or \\\\, in "
+                                       "another case, with OneDrive in it, becomes %USERPROFILE% (~ on Linux), the name as "
+                                       "a part of a path <user>; the same word outside a path stays");
+            if (onWindows != pathsHidden) std::cout << "    masked: " << onWindows << std::endl;
+            if (!onLinux.empty() && onLinux[0] != '~') std::cout << "    masked: " << onLinux << std::endl;
+
+            // a limit too small for three snapshots: the oldest of them is
+            // left out and no older one tried instead; the texts go whatever
+            // the limit
+            const size_t whole = D::zipSize(picked);
+            const std::vector<D::Entry> fewer = D::pick(folder, masks, whole - 1);
+            const bool limited =
+                namesOf(fewer) == std::vector<std::string>(expected.begin(), expected.end() - 2) &&
+                D::zipSize(fewer) <= whole - 1 &&
+                namesOf(D::pick(folder, masks, 0)) == std::vector<std::string>(expected.begin(), expected.begin() + 5);
+            allPassed &= check(limited, "a zip too small for three snapshots leaves the oldest of them out, and no older one "
+                                        "in its place; the texts go whatever the limit");
+
+            // the zip, read back
+            const std::string packed = D::zip(picked);
+            std::vector<D::Entry> back;
+            std::string why;
+            bool same = D::unzip(packed, back, why) && back.size() == picked.size() && packed.size() == whole &&
+                        D::zip(picked) == packed;
+            for (size_t i = 0; same && i < back.size(); i++) {
+                same = back[i].name == "debug/" + picked[i].name && back[i].data == picked[i].data;
+            }
+            // the UTF-8 flag (bit 11) in the first local header and the first central one
+            auto byteAt = [&](size_t at) { return at < packed.size() ? (size_t)(unsigned char)packed[at] : (size_t)0; };
+            const size_t central = packed.size() < 22 ? 0
+                                                      : byteAt(packed.size() - 6) | byteAt(packed.size() - 5) << 8 |
+                                                            byteAt(packed.size() - 4) << 16 | byteAt(packed.size() - 3) << 24;
+            const bool flagged = packed.compare(0, 4, "PK\x03\x04") == 0 && (byteAt(7) & 0x08) != 0 &&
+                                 byteAt(central) == 'P' && byteAt(central + 2) == 1 && (byteAt(central + 9) & 0x08) != 0;
+            // no entries: the end record alone; names beyond ASCII and every
+            // byte value; the time to two seconds
+            std::vector<D::Entry> none{D::Entry{}};
+            const std::string empty = D::zip({});
+            const bool emptyZip = empty.size() == 22 && empty.compare(0, 4, "PK\x05\x06") == 0 && D::zipSize({}) == 22 &&
+                                  D::unzip(empty, none, why) && none.empty();
+            std::string bytes;
+            for (int i = 0; i < 256; i++) bytes += (char)i;
+            const std::vector<D::Entry> own = {{"a.txt", "abc", 1794000000}, {"b \xC3\xA4.png", bytes, 1794000002}};
+            const std::string ownZip = D::zip(own);
+            std::vector<D::Entry> ownBack;
+            const bool ownSame = D::unzip(ownZip, ownBack, why) && ownBack.size() == 2 && ownBack[0].name == "debug/a.txt" &&
+                                 ownBack[0].data == "abc" && ownBack[0].written == 1794000000 &&
+                                 ownBack[1].name == "debug/b \xC3\xA4.png" && ownBack[1].data == bytes &&
+                                 ownBack[1].written == 1794000002 && D::zipSize(own) == ownZip.size();
+            // a changed byte fails its CRC; zip's own CRC-32 against the
+            // known one; ZIP64's count refused
+            std::string broken = ownZip;
+            broken[30 + 11] ^= 0x20;   // "abc" after the 30 bytes of its header and its name, debug/a.txt
+            std::vector<D::Entry> brokenBack;
+            std::string brokenWhy;
+            const bool caught = !D::unzip(broken, brokenBack, brokenWhy) && brokenBack.empty() &&
+                                brokenWhy.find("CRC") != std::string::npos;
+            const bool crc = D::crc32("123456789") == 0xCBF43926u && D::crc32("") == 0;
+            const bool counted = D::zipSize(std::vector<D::Entry>(65534, D::Entry{"x", "", 0})) == 65534u * (30 + 7 + 46 + 7) + 22 &&
+                                 D::zip(std::vector<D::Entry>(65535, D::Entry{"x", "", 0})).empty() &&
+                                 D::zipSize(std::vector<D::Entry>(65535, D::Entry{"x", "", 0})) == 0;
+            allPassed &= check(same && flagged && emptyZip && ownSame && caught && crc && counted,
+                               "the zip reads back entry by entry, byte for byte, under debug/ with the UTF-8 flag, the same "
+                               "bytes for the same files; no entries make an empty zip of 22 bytes; a changed byte fails its "
+                               "CRC; 65,535 entries are refused");
+            if (!same || !ownSame) std::cout << "    unzip: " << why << std::endl;
+
+            // a text over its limit: whole lines of its end, within the limit
+            // also where the mask is longer than the name it hides
+            std::string longText;
+            for (int i = 0; longText.size() < D::WHOLE_MOST + D::WHOLE_MOST / 2; i++) {
+                longText += "line " + std::to_string(i) + ": D:\\Al\\Games\\" + std::string((size_t)(i % 29), 'x') + "\n";
+            }
+            put("session.txt", longText);
+            const D::Masks al{"C:\\Users\\Al", "Al"};
+            const std::vector<D::Entry> texts = D::pick(folder, al, 0);
+            bool cutWhole = !texts.empty() && texts[0].name == "session.txt";
+            if (cutWhole) {
+                const std::string& cut = texts[0].data;
+                const std::string all = D::masked(longText, al);
+                cutWhole = cut.size() <= D::WHOLE_MOST && cut.size() > D::WHOLE_MOST - 100 && all.size() > cut.size() &&
+                           all.compare(all.size() - cut.size(), cut.size(), cut) == 0 &&
+                           all[all.size() - cut.size() - 1] == '\n' && cut.find("\\Al\\") == std::string::npos &&
+                           cut.find("\\<user>\\") != std::string::npos;
+            }
+            allPassed &= check(cutWhole, "a text over its limit goes as whole lines of its end, within the limit also where "
+                                         "<user> is longer than the name it hides");
+            fs::remove_all(folder, ec);
+        }
+
+        // ...with the rock panel's cuts (PanelKeep.h): the ten newest by the
+        // file's time after the snapshots, each with its .txt masked; the
+        // whole screen (panel_miss_<n>.png) stays out
+        {
+            namespace D = SCMiner::DebugZip;
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            const fs::path folder = fs::temp_directory_path(ec) / "bedrock-debugzip-cuts-selftest";
+            fs::remove_all(folder, ec);
+            fs::create_directories(folder, ec);
+            auto put = [&](const std::string& name, const std::string& bytes) {
+                std::ofstream(folder / name, std::ios::binary | std::ios::trunc) << bytes;
+            };
+            // the home folder by this system's rules, as pick() masks it
+            // (Linux: ~)
+            const bool windowsRules = D::RULES_HERE == D::Rules::Windows;
+            const std::string homePath =
+                windowsRules ? "C:\\Users\\Mining\\AppData\\Local\\Bedrock" : "/home/mining/.local/share/bedrock";
+            const std::string homeLeak = windowsRules ? "\\Mining\\" : "/mining/";
+            const std::string homeMark = windowsRules ? "%USERPROFILE%" : "~/";
+            const D::Masks masks = windowsRules ? D::Masks{"C:\\Users\\Mining", "Mining"} : D::Masks{"/home/mining", "mining"};
+            put("session.txt", "data:    " + homePath + "\n");
+            put("snapshot_20200101_100000.png", "\x89PNG " + std::string(20000, 's'));
+            put("snapshot_20200101_100000.txt", "snapshot\n");
+            put("panel_miss_1.png", "\x89PNG " + std::string(50000, 'w'));
+            put("panel_01.png", "\x89PNG not a ring's");
+            // fifteen cuts, their times in another order than their numbers:
+            // the k-th of `order` k minutes old
+            const std::vector<std::string> order = {"panel_3",  "panel5_2", "panel_12", "panel_1",  "panel5_1",
+                                                    "panel_7",  "panel_2",  "panel_11", "panel_4",  "panel_9",
+                                                    "panel5_3", "panel_5",  "panel_6",  "panel_8",  "panel_10"};
+            const auto now = fs::file_time_type::clock::now();
+            for (size_t k = 0; k < order.size(); k++) {
+                put(order[k] + ".png", "\x89PNG " + std::string(30000, (char)('a' + k)));
+                put(order[k] + ".txt", "frame 5120x1440\nkept rock 1129" + std::to_string(k) + "\nread " + homePath + "\n");
+                fs::last_write_time(folder / (order[k] + ".png"), now - std::chrono::minutes(k + 1), ec);
+            }
+            std::vector<std::string> expected = {"session.txt", "snapshot_20200101_100000.png",
+                                                 "snapshot_20200101_100000.txt"};
+            for (size_t k = 0; k < 10; k++) {
+                expected.push_back(order[k] + ".png");
+                expected.push_back(order[k] + ".txt");
+            }
+            auto namesOf = [](const std::vector<D::Entry>& entries) {
+                std::vector<std::string> names;
+                for (const D::Entry& entry : entries) names.push_back(entry.name);
+                return names;
+            };
+            const std::vector<D::Entry> picked = D::pick(folder, masks, SCMiner::Feedback::DEBUG_MOST);
+            bool masked = true;
+            for (const D::Entry& entry : picked) {
+                if (entry.name.size() > 4 && entry.name.compare(entry.name.size() - 4, 4, ".txt") == 0) {
+                    masked = masked && entry.data.find(homeLeak) == std::string::npos;
+                }
+            }
+            const bool tenNewest = namesOf(picked) == expected && masked &&
+                                   picked.size() > 4 && picked[4].data.find(homeMark) != std::string::npos;
+            allPassed &= check(tenNewest, "a debug folder's zip takes the ten newest panel cuts after the snapshots, newest "
+                                          "first by the file's time, each with its .txt masked; not the whole screen");
+            if (namesOf(picked) != expected) {
+                std::cout << "    picked:";
+                for (const std::string& name : namesOf(picked)) std::cout << " " << name;
+                std::cout << std::endl;
+            }
+            // ...within its limit: a cut that would take it over is left out,
+            // and no older one in its place
+            const size_t whole = D::zipSize(picked);
+            const std::vector<D::Entry> fewer = D::pick(folder, masks, whole - 1);
+            // (the texts, the snapshot and three cuts; none where fewer came)
+            const std::vector<D::Entry> firstNine(picked.begin(), picked.begin() + (std::min)(picked.size(), (size_t)9));
+            const std::vector<D::Entry> three =
+                picked.size() >= 9 ? D::pick(folder, masks, D::zipSize(firstNine)) : std::vector<D::Entry>();
+            const bool limited = namesOf(fewer) == std::vector<std::string>(expected.begin(), expected.end() - 2) &&
+                                 D::zipSize(fewer) <= whole - 1 &&
+                                 namesOf(three) == std::vector<std::string>(expected.begin(), expected.begin() + 9);
+            allPassed &= check(limited, "...within the zip's limit: a cut that would take it over is left out, and no "
+                                        "older one in its place");
+            fs::remove_all(folder, ec);
+        }
+
+        // ...typed into fields the window paints itself (TextField.h)
+        {
+            using SCMiner::TextField;
+            namespace T = SCMiner::Chars;
+            TextField field(true, 12);
+            for (char32_t c : std::u32string(U"Hello")) field.type(c);
+            field.type(U'\r');   // Enter
+            field.type(U'x');
+            const bool broke = field.text() == U"Hello\nx" && field.caret() == 7;
+            field.backspace();
+            field.backspace();   // the x, then the line break
+            const bool joined = field.text() == U"Hello" && field.caret() == 5;
+            field.moveTo(1, false);
+            field.moveTo(5, true);   // "ello" marked
+            const bool marks = field.marked() && field.markedText() == U"ello";
+            field.type(U'i');
+            const bool over = field.text() == U"Hi" && !field.marked() && field.caret() == 2;
+            const bool control = !field.type(0x01) && !field.type(0x7F) && field.text() == U"Hi";
+            const bool filled = field.put(U"0123456789ABCDEF") && field.text() == U"Hi0123456789" && !field.type(U'z') &&
+                                !field.put(U"more");
+            TextField one(false, 40);
+            const bool oneLine = one.put(U"a\r\nb\tc") && one.text() == U"a b c" && !one.type(U'\n') && !one.type(U'\r');
+            allPassed &= check(broke && joined && marks && over && control && filled && oneLine,
+                               "a typed field: Enter breaks the line and Backspace joins it again, a letter takes the "
+                               "place of what is marked, and no more goes in than the field holds");
+
+            TextField words(true, 100);
+            words.set(U"rock panel, MOLE");
+            words.left(false, true);
+            const bool w1 = words.caret() == 12;
+            words.left(false, true);
+            const bool w2 = words.caret() == 10;
+            words.left(false, true);
+            const bool w3 = words.caret() == 5;
+            words.right(true, true);
+            const bool w4 = words.caret() == 10 && words.markedText() == U"panel";
+            words.right(false);   // lets go of the mark at its end
+            const bool w5 = words.caret() == 10 && !words.marked();
+            words.markWord(7);
+            const bool w6 = words.markedText() == U"panel";
+            words.markWord(16);
+            const bool w7 = words.markedText() == U"MOLE";
+            words.moveTo(16, false);
+            words.backspace(true);
+            const bool w8 = words.text() == U"rock panel, ";
+            const bool w9 = words.undo() && words.text() == U"rock panel, MOLE" && words.redo() &&
+                            words.text() == U"rock panel, " && !words.redo();
+            for (char32_t c : std::u32string(U"abc")) words.type(c);
+            const bool w10 = words.text() == U"rock panel, abc" && words.undo() && words.text() == U"rock panel, ";
+            words.markAll();
+            const bool w11 = words.markedText() == U"rock panel, " && words.cut() && words.empty() && words.undo() &&
+                             words.text() == U"rock panel, ";
+            allPassed &= check(w1 && w2 && w3 && w4 && w5 && w6 && w7 && w8 && w9 && w10 && w11,
+                               "a typed field's keys: the caret goes word by word, a double click marks a word, letters "
+                               "typed in a row are one step back, and forward again");
+
+            const std::string faceBytes = "a\xF0\x9F\x98\x80" "b";   // U+1F600 between two letters
+            const std::u32string face = T::fromUtf8(faceBytes);
+            const std::wstring wide = T::toWide(face);
+            const bool one32 = face.size() == 3 && face[1] == 0x1F600 && T::toUtf8(face) == faceBytes &&
+                               T::fromWide(wide) == face && wide.size() == (sizeof(wchar_t) == 2 ? 4u : 3u);
+            const bool half = T::fromWide(std::wstring(1, (wchar_t)0xD83D)) == std::u32string(1, (char32_t)0xFFFD) &&
+                              T::toUtf8(std::u32string(1, (char32_t)0xD83D)) == "\xEF\xBF\xBD";
+            TextField two(true, 2);
+            two.put(face);   // room for two of the three
+            const bool counted = two.text() == face.substr(0, 2);
+            two.backspace();
+            allPassed &= check(one32 && half && counted && two.text() == U"a",
+                               "a character beyond the Basic Multilingual Plane is one place in a typed field and on "
+                               "its way to UTF-8 and back; half a surrogate pair is none");
+
+            // the lines of a field ten letters wide, a letter one wide
+            const SCMiner::TextWidth each = [](size_t from, size_t to) { return (float)(to - from); };
+            const std::u32string text = U"alpha beta gamma\n\nabcdefghijkl";
+            const std::vector<SCMiner::TextLine> lines = SCMiner::wrapLines(text, 10.0f, each);
+            const auto is = [&](size_t k, size_t from, size_t to, bool hard) {
+                return k < lines.size() && lines[k].from == from && lines[k].to == to && lines[k].hard == hard;
+            };
+            const bool laid = lines.size() == 5 && is(0, 0, 11, false) && is(1, 11, 16, true) && is(2, 17, 17, true) &&
+                              is(3, 18, 28, false) && is(4, 28, 30, true);
+            const bool carets = laid && SCMiner::lineOfCaret(lines, 11, false) == 1 && SCMiner::lineOfCaret(lines, 16, false) == 1 &&
+                                SCMiner::lineOfCaret(lines, 17, false) == 2 && SCMiner::lineOfCaret(lines, 28, false) == 4 &&
+                                SCMiner::lineOfCaret(lines, 28, true) == 3 && SCMiner::lineOfCaret(lines, 30, false) == 4;
+            const bool ends = laid && SCMiner::lineEnd(text, lines[0]) == 10 && SCMiner::lineEnd(text, lines[1]) == 16 &&
+                              SCMiner::lineEnd(text, lines[3]) == 28;
+            const bool places = laid && SCMiner::placeAt(lines[1], 2.4f, each) == 13 && SCMiner::placeAt(lines[1], 2.6f, each) == 14 &&
+                                SCMiner::placeAt(lines[1], 99.0f, each) == 16 && SCMiner::placeAt(lines[1], -3.0f, each) == 11;
+            const std::vector<SCMiner::TextLine> spaces = SCMiner::wrapLines(U"aaaa      ", 5.0f, each);
+            const std::vector<SCMiner::TextLine> none = SCMiner::wrapLines(U"", 5.0f, each);
+            const std::vector<SCMiner::TextLine> last = SCMiner::wrapLines(U"a\n", 5.0f, each);
+            const bool edges = spaces.size() == 1 && spaces[0].to == 10 && none.size() == 1 && none[0].to == 0 &&
+                               last.size() == 2 && last[1].from == 2 && last[1].to == 2;
+            allPassed &= check(laid && carets && ends && places && edges,
+                               "a typed field's lines break behind the last word that fits and inside a word wider than "
+                               "the field; the caret stands at a broken line's end or at the next one's start");
         }
 
         // The gadget: what the panel prints with it on, taken back
@@ -1625,11 +2838,36 @@ int runSelfTest() {
         piece.parts = {{"", false, 100.0f, 325}};
         const bool pieceNamed = SCMiner::nameContentsByRock("Iron", piece) && SCMiner::contentsHold(piece) &&
                                 partsAre(piece, {{"Iron", 100.0f, 325}});
-        // Hephaestanite and Quartz both begin at 330: that line's name has to be read
+        // Hephaestanite and Quartz both begin at 330. His rock of 12 November
+        // (17,080 kg, 51.39 SCU) has its Quartz at 522, so its 330 is the
+        // Hephaestanite's bulk
         RockContents heph;
-        heph.parts = {{"", false, 3.71f, 510}, {"", false, 6.43f, 572}, {"", false, 57.79f, 330},
-                      {"", false, 2.92f, 522}, {"", true, 29.12f, 0}};
-        const bool twoOres = !SCMiner::nameContentsByRock("Hephaestanite", heph);
+        heph.parts = {{"", false, 4.65f, 510}, {"", false, 3.90f, 572}, {"", false, 51.56f, 330},
+                      {"", false, 2.66f, 522}, {"", true, 37.20f, 0}};
+        const bool byParts = SCMiner::nameContentsByRock("Hephaestanite", heph) && SCMiner::contentsHold(heph) &&
+                             SCMiner::contentsFitRock("Hephaestanite", heph) &&
+                             partsAre(heph, {{"Silicon", 4.65f, 510}, {"Hephaestanite", 3.90f, 572},
+                                             {"Hephaestanite", 51.56f, 330}, {"Quartz", 2.66f, 522}, {"", 37.20f, 0}});
+        // ...both at 330: the rock's weight says which is the bulk (344.6 kg
+        // an SCU named so, 303.7 the other way round)
+        RockContents both;
+        both.parts = {{"", false, 4.0f, 510}, {"", false, 4.5f, 572}, {"", false, 55.0f, 330}, {"", false, 3.0f, 330},
+                      {"", true, 33.5f, 0}};
+        const bool byWeight = SCMiner::nameContentsByRock("Hephaestanite", both, 344.6) && SCMiner::contentsHold(both) &&
+                              partsAre(both, {{"Silicon", 4.0f, 510}, {"Hephaestanite", 4.5f, 572},
+                                              {"Hephaestanite", 55.0f, 330}, {"Quartz", 3.0f, 330}, {"", 33.5f, 0}});
+        // ...a piece all at 330, Hephaestanite's 3.2 to Quartz's 2.65; and not where
+        // the weight cannot tell - 3 % of a piece moves it under 2 % - or is not known
+        RockContents heavy, light, small, unweighed;
+        heavy.parts = {{"", false, 100.0f, 330}};
+        light.parts = heavy.parts;
+        unweighed.parts = heavy.parts;
+        small.parts = {{"", false, 3.0f, 330}, {"", true, 97.0f, 0}};
+        const bool pieceByWeight =
+            SCMiner::nameContentsByRock("Hephaestanite", heavy, 457.0) && heavy.parts[0].ore == "Hephaestanite" &&
+            SCMiner::nameContentsByRock("Hephaestanite", light, 378.6) && light.parts[0].ore == "Quartz";
+        const bool twoOres = !SCMiner::nameContentsByRock("Hephaestanite", small, 152.3) &&
+                             !SCMiner::nameContentsByRock("Hephaestanite", unweighed);
         // ...and a quality no ore of the rock has names nothing
         RockContents wrong;
         wrong.parts = {{"", false, 10.55f, 654}, {"", false, 36.1f, 325}, {"", true, 53.33f, 0}};
@@ -1645,6 +2883,10 @@ int runSelfTest() {
         allPassed &= check(named && pieceNamed && twoOres && noOre,
                            "a line is the ore whose value its quality is, in any order and at any share - and has "
                            "to be read by name where two ores of the rock share the value (got " + partsAs(bexalite) + ")");
+        allPassed &= check(byParts && byWeight && pieceByWeight,
+                           "...unless the rock's other lines or its weight leave one: Hephaestanite's bulk at 330 "
+                           "beside its Quartz at 522, or the heavier way to name two lines at 330 (got " +
+                               partsAs(heph) + " | " + partsAs(both) + ")");
 
         auto holds = [](std::vector<SCMiner::RockPartRead> parts) {
             RockContents c;
@@ -2119,6 +3361,21 @@ int runSelfTest() {
                                notSoldText == "Clearcut Module, Deluge Module, Overrun Module, Pitman Mining Laser",
                            "Bedrock names its 48 heads, modules and gadgets as UEX does - all but the four UEX "
                            "lists no shop for (" + std::to_string(named) + " named; not UEX's: " + notSoldText + ")");
+        // ...and all four have a blueprint: made, not bought - their line
+        // says so (the Golem's Pitman as well, 4.10.3). An item with neither
+        // a shop nor a blueprint still says that no shop is known
+        {
+            std::string craftable;
+            for (const std::string& name : notSold) {
+                if (std::wstring(SCMiner::noShopWords(name)) == L"Craftable only") {
+                    craftable += (craftable.empty() ? "" : ", ") + name;
+                }
+            }
+            allPassed &= check(craftable == "Clearcut Module, Deluge Module, Overrun Module, Pitman Mining Laser" &&
+                                   std::wstring(SCMiner::noShopWords("BoreMax")) == L"No shop known to UEX",
+                               "the Gear page says the four items no shop sells are craftable only (" + craftable +
+                                   "), and of one without a blueprint that no shop is known");
+        }
 
         // The three lists as the app keeps them in uex\, read again while
         // young without asking UEX: a gadget's, a head's, a module's - and
@@ -2142,12 +3399,36 @@ int runSelfTest() {
                 keep(30, answer({{"Rieger-C3 Module", 57000, "Refinery Shop - Levski", "Nyx", nullptr, "Delamar",
                                   nullptr, "Levski", nullptr, 1}}));
             // (only once all three are there: a list missing would be asked for)
-            SCMiner::Application::UexShopsOutcome fromKept, refusedOne;
+            SCMiner::Application::UexShopsOutcome fromKept, refusedOne, oldKept, noneKept;
             if (kept) fromKept = SCMiner::Application::loadUexShops(folder);
+            // ...the same three a day old: read as they are at the start,
+            // without asking UEX - and one of them gone, nothing
+            if (kept) {
+                const auto dayOld = fs::file_time_type::clock::now() - std::chrono::hours(25);
+                for (const int category : {28, 29, 30}) {
+                    fs::last_write_time(folder / ("items_prices_" + std::to_string(category) + ".json"), dayOld, ec);
+                }
+                oldKept = SCMiner::Application::loadUexShops(folder, true);
+                const fs::path heads = folder / "items_prices_29.json";
+                fs::rename(heads, folder / "away.json", ec);
+                noneKept = SCMiner::Application::loadUexShops(folder, true);
+                fs::rename(folder / "away.json", heads, ec);
+                // (young again: the refusal below must not send for the others)
+                for (const int category : {28, 29, 30}) {
+                    fs::last_write_time(folder / ("items_prices_" + std::to_string(category) + ".json"),
+                                        fs::file_time_type::clock::now(), ec);
+                }
+            }
             if (kept && keep(29, "{\"status\":\"error\",\"message\":\"x\"}")) {
                 refusedOne = SCMiner::Application::loadUexShops(folder);
             }
             fs::remove_all(folder, ec);
+            allPassed &= check(oldKept.keptOnly && oldKept.shops && oldKept.shops->itemCount() == 3 &&
+                                   oldKept.note.empty() && noneKept.keptOnly && !noneKept.shops,
+                               "at the start the shop lists kept from before are read whatever their age, without "
+                               "asking UEX, and one of them missing leaves none (" +
+                                   (oldKept.shops ? std::to_string(oldKept.shops->itemCount()) + " items" : "none: " + oldKept.note) +
+                                   ")");
             const auto gadget = fromKept.shops ? SCMiner::nearestFirst(fromKept.shops->offersFor("OptiMax"), "Stanton", "HUR-L1")
                                            : std::vector<ShopInOrder>();
             allPassed &= check(kept && fromKept.shops && fromKept.note.empty() && fromKept.shops->itemCount() == 3 &&
@@ -5014,7 +6295,7 @@ int runSelfTest() {
             rock.mass = 9000.0f;
             rock.resistance = 20.0f;
             auto suggests = [&](const SCMiner::MiningShip* asking) {
-                for (const SCMiner::LaserSuggestion& p : SCMiner::suggestLasers(rock, 1, 0.0f, asking)) {
+                for (const SCMiner::LaserSuggestion& p : SCMiner::suggestLasers(rock, 1, asking)) {
                     if (p.laser == pitman) return true;
                 }
                 return false;
@@ -5050,7 +6331,7 @@ int runSelfTest() {
             int named = 0;
             for (int pass = 0; sized && pass < 3; pass++) {
                 const SCMiner::MiningShip* asking = pass == 0 ? mole : pass == 1 ? prospector : golem;
-                for (const SCMiner::LaserSuggestion& s : SCMiner::suggestLasers(rock, asking->size, 0.0f, asking)) {
+                for (const SCMiner::LaserSuggestion& s : SCMiner::suggestLasers(rock, asking->size, asking)) {
                     sized = sized && s.laser && SCMiner::laserFits(*s.laser, *asking);
                     named++;
                 }
@@ -5077,6 +6358,50 @@ int runSelfTest() {
                            is(hudShipOf(0, "Argo MOLE", true), nullptr) && is(hudShipOf(0, "", true), nullptr);
         allPassed &= check(whose, "the HUD is the Prospector's or the Golem's by the panel's labels, and with no panel "
                                   "up by the ship the log has the player sitting in - never a MOLE's");
+
+        // ...and the ship a panel shows the player in, where the game's log
+        // has no seat to say it (16 November 2026: no crew channel line for
+        // three hours, a MOLE and a Golem boarded without one)
+        using SCMiner::panelShipOf;
+        const bool panelShips = is(panelShipOf('L'), "prospector") && is(panelShipOf('M'), "prospector") &&
+                                is(panelShipOf('K'), "mole") && is(panelShipOf('P'), "mole") &&
+                                is(panelShipOf('Q'), "mole") && is(panelShipOf('T'), "mole") &&
+                                is(panelShipOf('W'), "mole") && is(panelShipOf('G'), "golem") &&
+                                is(panelShipOf('H'), "golem") && is(panelShipOf(0), nullptr) &&
+                                is(panelShipOf('F'), nullptr) && is(panelShipOf('5'), nullptr);
+        allPassed &= check(panelShips, "a panel's label column names its ship: L and M the Prospector, K, P, Q, T "
+                                       "and W the MOLE, G and H the Golem, and nothing else one");
+        using SCMiner::panelsWanted;
+        const bool wanted = panelsWanted("", false) && panelsWanted("", true) &&
+                            !panelsWanted("Anvil Asgard", true) && panelsWanted("Anvil Asgard", false) &&
+                            panelsWanted("Argo MOLE", true) && panelsWanted("Drake Golem", true) &&
+                            panelsWanted("Greycat ROC", true);
+        allPassed &= check(wanted, "a panel is looked for everywhere but in the seat of a ship that cannot mine - "
+                                   "also once out of that seat, where the log may not name the next ship");
+        {
+            SCMiner::PanelShipWitness w;
+            // two sure MOLE panels: its fit, once
+            const bool firstOnly = is(w.look('Q', false), nullptr) && is(w.look('Q', false), "mole") &&
+                                   is(w.look('T', false), nullptr) && is(w.look('Q', false), nullptr);
+            // looks without a panel leave the count; a Golem panel starts it
+            // over, and two of them name the Golem
+            const bool gaps = is(w.look('G', false), nullptr) && is(w.look(0, false), nullptr) &&
+                              is(w.look('H', false), "golem");
+            // a single panel of another ship between two is not two in a row
+            const bool row = is(w.look('Q', false), nullptr) && is(w.look('G', false), nullptr) &&
+                             is(w.look('Q', false), nullptr) && is(w.look('Q', false), "mole");
+            // a seat the log names: nothing, and the next stretch out of
+            // the seat names its ship afresh
+            const bool seat = is(w.look('Q', true), nullptr) && is(w.look('Q', true), nullptr) &&
+                              is(w.look('Q', false), nullptr) && is(w.look('Q', false), "mole");
+            // a panel no ship is known by leaves the count
+            SCMiner::PanelShipWitness v;
+            const bool unknown = is(v.look('L', false), nullptr) && is(v.look('5', false), nullptr) &&
+                                 is(v.look('M', false), "prospector");
+            allPassed &= check(firstOnly && gaps && row && seat && unknown,
+                               "with no seat in the log, two sure panels of one ship in a row switch to its fit, "
+                               "once - a fit picked by hand afterwards stays - and a seat the log names starts over");
+        }
     }
 
     // Where exactly: the names the log uses, the tables' places behind
@@ -5154,6 +6479,23 @@ int runSelfTest() {
         allPassed &= check(placeByDestination("LOC_RR_S1_L2", "").oreLocation == "Lagrange F",
                            "the rest stop at HUR-L2 is Lagrange F");
         allPassed &= check(placeByDestination("levski_all-001", "").system == "Nyx", "levski_all-001 is Levski");
+        {
+            // Nyx I (5.0 PTU) by the name the physics statistics give its
+            // terrain, after a pick from Levski to a point without a name
+            const auto nyx1 = placeByDestination("nyx1", "");
+            SCMiner::GameState planet;
+            auto feedPlanet = [&](const std::string& line) {
+                SCMiner::GameState::Event event;
+                if (SCMiner::GameState::parse(line, &event)) planet.apply(event);
+            };
+            feedPlanet("<2026-11-15T10:34:00.130Z> [Notice] <RequestLocationInventory> Player[<player>] requested "
+                       "inventory for Location[Nyx_Levski] [Team_CoreGameplayFeatures][Inventory]");
+            feedPlanet("<2026-11-15T10:39:50.343Z>   planet cells:   70 [16384] meshes:   38 [ 2048] name: nyx1");
+            allPassed &= check(nyx1.name == "Nyx I" && nyx1.system == "Nyx" && nyx1.oreLocation == "Nyx I" &&
+                                   nyx1.surface == 1 && planet.place() == "Nyx I" && planet.system() == "Nyx",
+                               "nyx1 is Nyx I, a body, and the statistics' line puts the ship there (got " +
+                                   planet.place() + ")");
+        }
         // A planet's low-orbit station is no Lagrange point, and a Lagrange
         // point itself is one
         allPassed &= check(placeByDestination("rs_ext_pyro3_leo", "").name == "Orbituary" &&
@@ -5429,6 +6771,248 @@ int runSelfTest() {
                                !SCMiner::contradictsHandPlace("Wala", "", "") &&
                                !SCMiner::contradictsHandPlace("Nowhere Special", "Lyria", "Stanton"),
                            "...and not by itself, by its own system, by nothing, or when the tables do not know it");
+
+        // The place a rock scan is sent with (rockPlace): a place of the ore
+        // tables where ships mine, or nothing - never the station, gateway or
+        // cluster the header may name. By name first...
+        {
+            using SCMiner::RockPlaceState;
+            auto rockAt = [](const std::string& place,
+                             RockPlaceState::Terrain terrain = RockPlaceState::Terrain::Unknown) {
+                RockPlaceState state;
+                state.place = place;
+                state.terrain = terrain;
+                return SCMiner::rockPlace(state);
+            };
+            auto said = [](const std::string& place) { return place.empty() ? std::string("nothing") : place; };
+            // ...each station by what lies around it
+            const std::pair<const char*, const char*> AROUND[] = {
+                {"Levski", "Nyx - Glaciem Ring"},
+                {"Grim HEX", "Stanton - Yela Asteroid Belt"},
+                {"People's Service Station Alpha", "Nyx - Keeger Belt"},
+                {"People's Service Station Delta", "Nyx - Keeger Belt"},
+                {"People's Service Station Lambda", "Nyx - Keeger Belt"},
+                {"People's Service Station Theta", "Nyx - Keeger Belt"},
+                {"Lorville", "Stanton - Hurston"},
+                {"New Babbage", "Stanton - microTech"}};
+            for (const auto& [station, around] : AROUND) {
+                allPassed &= check(rockAt(station) == around, std::string("a rock by ") + station + " is in " + around +
+                                                                  " (got " + said(rockAt(station)) + ")");
+            }
+            allPassed &= check(rockAt("Checkmate").empty() && rockAt("Gaslight").empty() && rockAt("Ruin Station").empty(),
+                               "a rock by a Pyro rest stop has its Lagrange point's place, which the tables do not list - "
+                               "and one by a station in low orbit none (got " + said(rockAt("Checkmate")) + ")");
+            // ...a body, belt or ring as the header spells it
+            allPassed &= check(rockAt("Monox") == "Pyro - Monox" && rockAt("Pyro I") == "Pyro - Pyro I" &&
+                                   rockAt("Daymar") == "Stanton - Daymar" && rockAt("Terminus Ring") == "Pyro - Terminus Ring" &&
+                                   rockAt("Glaciem Ring") == "Nyx - Glaciem Ring" && rockAt("Keeger Belt") == "Nyx - Keeger Belt",
+                               "a rock on a body, in a belt or a ring has the header's place: Pyro - Monox, not Pyro II "
+                               "(Monox) (got " + said(rockAt("Monox")) + ")");
+            allPassed &= check(rockAt("Magda\xC2\xA0") == "Stanton - Magda" && rockAt("Ariel") == "Stanton - Arial",
+                               "...Magda with the no-break space some routes give it, and Arial by the engine's \"Ariel\" "
+                               "(got " + said(rockAt("Magda\xC2\xA0")) + ", " + said(rockAt("Ariel")) + ")");
+            allPassed &= check(rockAt("Crusader").empty() && rockAt("ArcCorp").empty() && rockAt("Pyro V").empty(),
+                               "...and none on a body the tables have no ship rocks for");
+            // ...a Lagrange point by the tables' group whose note lists it
+            allPassed &= check(rockAt("HUR-L1") == "Stanton - Lagrange A" && rockAt("HUR L2") == "Stanton - Lagrange F" &&
+                                   rockAt("CRU-L1 Ambitious Dream Station") == "Stanton - Lagrange E" &&
+                                   rockAt("MIC L4") == "Stanton - Lagrange D",
+                               "a rock at a Lagrange point is in its group of the tables: HUR-L1 Lagrange A (got " +
+                                   said(rockAt("HUR-L1")) + ")");
+            allPassed &= check(rockAt("PYR2 L4").empty() && rockAt("PYR5 L2").empty(),
+                               "...and nowhere at a point of Pyro's, which no group of the tables lists (got " +
+                                   said(rockAt("PYR2 L4")) + ")");
+            // ...and nothing else
+            const char* const NOWHERE[] = {"Area18", "Orison", "Everus Harbor", "Seraphim Station", "Port Tressler",
+                                           "Baijini Point", "QV Breaker Station", "Stanton Gateway", "Nyx Gateway",
+                                           "Stanton-Pyro Jump Point", "Asteroid Cluster", "Keeger Belt Cluster",
+                                           "RAB-CHARLIE", "OM-3", "<= UNINITIALIZED =>", "Stanton", ""};
+            std::string somewhere;
+            for (const char* place : NOWHERE) {
+                if (!rockAt(place).empty()) somewhere += std::string(somewhere.empty() ? "" : ", ") + place;
+            }
+            allPassed &= check(somewhere.empty(), "a rock by another station or city, a gateway, a jump point, an "
+                                                  "Asteroid Cluster, a name the tables do not know, a system alone or "
+                                                  "open space has no place (got one at: " + said(somewhere) + ")");
+            // ...under way, or after arriving where the log has no name
+            RockPlaceState away;
+            away.place = "Monox";
+            away.travelling = true;
+            RockPlaceState lost;
+            lost.place = "Levski";
+            lost.unnamed = true;
+            allPassed &= check(SCMiner::rockPlace(away).empty() && SCMiner::rockPlace(lost).empty(),
+                               "...nor under way from Monox, or after an arrival without a name beside Levski");
+            // ...Yela by its terrain: the belt lies in the moon's own container
+            allPassed &= check(rockAt("Yela").empty() && rockAt("Yela", RockPlaceState::Terrain::Loaded) == "Stanton - Yela" &&
+                                   rockAt("Yela", RockPlaceState::Terrain::None) == "Stanton - Yela Asteroid Belt",
+                               "a rock at Yela is on the moon with its terrain loaded, in the belt after a round of "
+                               "statistics with none, and nowhere before either");
+            // ...and a place set by hand when it is one of the tables'
+            allPassed &= check(SCMiner::rockPlaceByHand("Wala") == "Stanton - Wala" &&
+                                   SCMiner::rockPlaceByHand("Yela") == "Stanton - Yela" &&
+                                   SCMiner::rockPlaceByHand("HUR-L3") == "Stanton - Lagrange E" &&
+                                   SCMiner::rockPlaceByHand("Grim HEX") == "Stanton - Yela Asteroid Belt" &&
+                                   SCMiner::rockPlaceByHand("Asteroid clusters") == "Pyro - Asteroid clusters" &&
+                                   SCMiner::rockPlaceByHand("Nowhere Special").empty() &&
+                                   SCMiner::rockPlaceByHand("Area18").empty(),
+                               "a place set by hand goes with a rock when the tables have it (got " +
+                                   said(SCMiner::rockPlaceByHand("HUR-L3")) + " for HUR-L3)");
+        }
+        // ...then off the log, line by line, on lines as the game writes them
+        {
+            SCMiner::GameState rock;
+            auto feedRock = [&](const std::string& line) {
+                SCMiner::GameState::Event event;
+                if (SCMiner::GameState::parse(line, &event)) rock.apply(event);
+            };
+            auto said = [](const std::string& place) { return place.empty() ? std::string("nothing") : place; };
+            const std::string PICK = "[Notice] <Player Selected Quantum Target - Local> [ItemNavigation][CL][41716] | NOT AUTH "
+                                     "| MISC_Prospector_830000000101[830000000101]|CSCItemNavigation::"
+                                     "OnPlayerSelectedQuantumTarget|Player has selected point ";
+            const std::string PICKED = " as their destination, routing locally [Team_CGP4][QuantumTravel]";
+            const std::string ROUTE = "[Notice] <Calculate Route> [ItemNavigation][CL][41716] | NOT AUTH | "
+                                      "MISC_Prospector_830000000101[830000000101]|CSCItemNavigation::CalculateRoute|"
+                                      "Projected Start Location is ";
+            const std::string ARRIVED = "[Notice] <Quantum Drive Arrived - Arrived at Final Destination> [ItemNavigation]"
+                                        "[CL][41716] | NOT AUTH | MISC_Prospector_830000000101[830000000101]|"
+                                        "CSCItemNavigation::OnQuantumDriveArrived|Quantum Drive has arrived at final "
+                                        "destination [Team_CGP4][QuantumTravel]";
+            const std::string TERMINAL = "[Notice] <RequestLocationInventory> Player[<player>] requested inventory for "
+                                         "Location[";
+            const std::string TEAM = "] [Team_CoreGameplayFeatures][Inventory]";
+            auto cells = [&](const char* stamp, const char* body, int count) {
+                char text[200];
+                std::snprintf(text, sizeof(text), "<%s>   planet cells: %4d [%5d] meshes:    0 [    0] name: %s", stamp,
+                              count, count > 0 ? 16384 : 0, body);
+                feedRock(text);
+            };
+            // A login at Levski, out of the station into the ring: no line
+            // in between, and the ring it is
+            feedRock("<2026-10-29T14:50:29.000Z> Loading screen for Nyx : SC_Frontend closed after 21.00 seconds");
+            const std::string spawned = rock.rockPlace();
+            feedRock("<2026-10-29T14:50:30.000Z> " + TERMINAL + "Nyx_Levski" + TEAM);
+            feedRock("<2026-10-29T14:52:47.570Z> [Notice] <SHUDEvent_OnNotification> Added notification \"Leaving "
+                     "Armistice Zone - Caution Advised: \" [6] to queue. New queue size: 2, MissionId: "
+                     "[00000000-0000-0000-0000-000000000000], ObjectiveId: [] [Team_CoreGameplayFeatures][Missions][Comms]");
+            allPassed &= check(spawned.empty() && rock.rockPlace() == "Nyx - Glaciem Ring" && rock.place() == "Levski",
+                               "spawned at Levski and out into the ring: no place before the terminal, then the Glaciem "
+                               "Ring - the header still at Levski (got " + said(rock.rockPlace()) + ")");
+            // A contract's coordinates from there: a pick, a nav point without
+            // a name - the geodes of a QV Breaker Station, not the ring
+            feedRock("<2026-10-29T15:00:00.000Z> " + PICK + "NavPoint_Dynamic_830000000202" + PICKED);
+            feedRock("<2026-10-29T15:00:00.001Z> " + ROUTE + "Levski for route to destination NavPoint_Dynamic_830000000202 "
+                     "[Team_CGP4][QuantumTravel]");
+            const std::string picked = rock.rockPlace();
+            feedRock("<2026-10-29T15:03:10.000Z> " + ARRIVED);
+            allPassed &= check(picked.empty() && rock.rockPlace().empty() && rock.place() == "Levski",
+                               "...a pick from Levski and the arrival at a nav point: no place on the way or after, with "
+                               "the header still at Levski (got " + said(picked) + ", " + said(rock.rockPlace()) + ")");
+            // ...a round of statistics says nothing there, and a terminal of a
+            // code without a name neither
+            feedRock("<2026-10-29T15:08:00.000Z> PHYSICS INSTANCE STATS BEGIN 3");
+            cells("2026-10-29T15:08:00.000Z", "OOC_Stanton_2c_Yela", 0);
+            feedRock("<2026-10-29T15:08:00.001Z> PHYSICS INSTANCE STATS END");
+            const std::string round = rock.rockPlace();
+            feedRock("<2026-10-29T15:10:00.000Z> " + TERMINAL + "Nyx_Kaboos" + TEAM);
+            allPassed &= check(round.empty() && rock.rockPlace().empty(),
+                               "...and none after a round of statistics or at a terminal the app has no name for (got " +
+                                   said(round) + ", " + said(rock.rockPlace()) + ")");
+            // ...until the next place line: back at Levski's terminals
+            feedRock("<2026-10-29T15:30:00.000Z> " + TERMINAL + "Nyx_Levski" + TEAM);
+            allPassed &= check(rock.rockPlace() == "Nyx - Glaciem Ring",
+                               "...until a place line: back at Levski, the ring again (got " + said(rock.rockPlace()) + ")");
+            // A pick that ends without an arrival line, at Levski's terminal
+            // (6 November: picked Levski from the ring, docked, mined again)
+            feedRock("<2026-11-06T17:53:34.000Z> " + PICK + "levski_all-001" + PICKED);
+            feedRock("<2026-11-06T17:53:34.001Z> " + ROUTE + "Nyx System for route to destination levski_all-001 "
+                     "[Team_CGP4][QuantumTravel]");
+            const std::string toLevski = rock.rockPlace();
+            feedRock("<2026-11-06T17:54:32.000Z> " + TERMINAL + "Nyx_Levski" + TEAM);
+            allPassed &= check(toLevski.empty() && rock.rockPlace() == "Nyx - Glaciem Ring",
+                               "...a pick from open space has none, and Levski's terminal without an arrival line ends it "
+                               "(got " + said(toLevski) + ", " + said(rock.rockPlace()) + ")");
+            // An Asteroid Cluster in Nyx says nothing: the Glaciem or the Keeger
+            feedRock("<2026-11-06T18:20:00.000Z> " + ROUTE + "Asteroid Cluster for route to destination levski_all-001 "
+                     "[Team_CGP4][QuantumTravel]");
+            allPassed &= check(rock.place() == "Asteroid Cluster" && rock.rockPlace().empty(),
+                               "a route from an Asteroid Cluster in Nyx: no place for a rock (got " +
+                                   said(rock.rockPlace()) + ")");
+            // Grim HEX: Yela's belt
+            feedRock("<2026-09-21T18:23:35.000Z> " + TERMINAL + "GrimHEX" + TEAM);
+            allPassed &= check(rock.rockPlace() == "Stanton - Yela Asteroid Belt",
+                               "a terminal at Grim HEX: Yela's belt (got " + said(rock.rockPlace()) + ")");
+            // Yela itself, as a route out of Grim HEX starts: neither moon nor
+            // belt until the statistics say which. A round begun before that
+            // place line is not a whole one since, and a round without bodies
+            // (before the universe loads) says nothing.
+            feedRock("<2026-09-21T18:28:07.000Z> PHYSICS INSTANCE STATS BEGIN 4");
+            feedRock("<2026-09-21T18:28:07.000Z> " + ROUTE + "Yela for route to destination MISSION_QT_Quantum_Beacon_1 "
+                     "[Team_CGP4][QuantumTravel]");
+            const std::string fromYela = rock.rockPlace();
+            cells("2026-09-21T18:28:07.000Z", "OOC_Stanton_2c_Yela", 0);
+            cells("2026-09-21T18:28:07.000Z", "OOC_Stanton_2b_Daymar", 0);
+            feedRock("<2026-09-21T18:28:07.001Z> PHYSICS INSTANCE STATS END");
+            const std::string halfRound = rock.rockPlace();
+            feedRock("<2026-09-21T18:30:00.000Z> PHYSICS INSTANCE STATS BEGIN 5");
+            feedRock("<2026-09-21T18:30:00.001Z> PHYSICS INSTANCE STATS END");
+            const std::string noBodies = rock.rockPlace();
+            feedRock("<2026-09-21T18:38:07.000Z> PHYSICS INSTANCE STATS BEGIN 6");
+            cells("2026-09-21T18:38:07.000Z", "OOC_Stanton_2c_Yela", 0);
+            cells("2026-09-21T18:38:07.000Z", "OOC_Stanton_2b_Daymar", 0);
+            feedRock("<2026-09-21T18:38:07.001Z> PHYSICS INSTANCE STATS END");
+            allPassed &= check(rock.place() == "Yela" && fromYela.empty() && halfRound.empty() && noBodies.empty() &&
+                                   rock.rockPlace() == "Stanton - Yela Asteroid Belt",
+                               "at Yela no place for a rock until a whole round of statistics since passed without "
+                               "terrain - then Yela's belt (got " + said(fromYela) + ", " + said(halfRound) + ", " +
+                                   said(noBodies) + ", " + said(rock.rockPlace()) + ")");
+            // ...an arrival at the moon starts over, and its terrain loaded
+            // says the moon
+            feedRock("<2026-09-21T18:45:00.000Z> " + PICK + "OOC_Stanton_2c_Yela" + PICKED);
+            feedRock("<2026-09-21T18:47:38.000Z> " + ARRIVED);
+            const std::string atYela = rock.rockPlace();
+            feedRock("<2026-09-21T18:48:07.000Z> PHYSICS INSTANCE STATS BEGIN 7");
+            cells("2026-09-21T18:48:07.000Z", "OOC_Stanton_2c_Yela", 317);
+            const std::string moon = rock.rockPlace();
+            cells("2026-09-21T18:48:07.000Z", "OOC_Stanton_2b_Daymar", 0);
+            feedRock("<2026-09-21T18:48:07.001Z> PHYSICS INSTANCE STATS END");
+            allPassed &= check(atYela.empty() && moon == "Stanton - Yela" && rock.rockPlace() == "Stanton - Yela",
+                               "...an arrival at the moon has none, its terrain loaded the moon (got " + said(atYela) +
+                                   ", " + said(rock.rockPlace()) + ")");
+            // Another body's terrain: that body, as the header has it
+            cells("2026-09-21T19:08:07.000Z", "OOC_Stanton_2b_Daymar", 125);
+            allPassed &= check(rock.place() == "Daymar" && rock.rockPlace() == "Stanton - Daymar",
+                               "terrain loaded on Daymar: a rock there is on Daymar (got " + said(rock.rockPlace()) + ")");
+            // A rest stop at a Lagrange point: the point's group of the tables
+            feedRock("<2026-09-21T19:30:00.000Z> " + TERMINAL + "RR_HUR_L1" + TEAM);
+            allPassed &= check(rock.place() == "HUR-L1" && rock.rockPlace() == "Stanton - Lagrange A",
+                               "a terminal at HUR-L1: Lagrange A for a rock, HUR-L1 in the header (got " +
+                                   said(rock.rockPlace()) + ")");
+            // Out of quantum travel half way - the Aaron Halo - with no
+            // arrival line: the place set off from is behind the ship
+            feedRock("<2026-09-21T19:40:00.000Z> " + PICK + "OOC_Stanton_2b_Daymar" + PICKED);
+            feedRock("<2026-09-21T19:40:00.001Z> " + ROUTE + "HUR-L1 Green Glade Station for route to destination "
+                     "OOC_Stanton_2b_Daymar [Team_CGP4][QuantumTravel]");
+            allPassed &= check(rock.place() == "HUR-L1" && rock.rockPlace().empty(),
+                               "...and none from the pick on, the route's own start included (got " +
+                                   said(rock.rockPlace()) + ")");
+            // Monox, as on 12 November: Checkmate, a pick, the arrival
+            feedRock("<2026-11-12T10:50:00.000Z> " + TERMINAL + "RR_P2_L4" + TEAM);
+            const std::string checkmate = rock.rockPlace();
+            feedRock("<2026-11-12T10:55:08.000Z> " + PICK + "pyro2" + PICKED);
+            feedRock("<2026-11-12T10:55:08.001Z> " + ROUTE + "Checkmate for route to destination pyro2 "
+                     "[Team_CGP4][QuantumTravel]");
+            const std::string toMonox = rock.rockPlace();
+            feedRock("<2026-11-12T10:56:15.000Z> " + ARRIVED);
+            allPassed &= check(checkmate.empty() && toMonox.empty() && rock.rockPlace() == "Pyro - Monox",
+                               "Checkmate has no place for a rock, nor the way to Monox; Monox has Pyro - Monox (got " +
+                                   said(checkmate) + ", " + said(toMonox) + ", " + said(rock.rockPlace()) + ")");
+            // A spawn: nothing until a place line says where
+            feedRock("<2026-11-12T12:29:41.000Z> Loading screen for Pyro : SC_Frontend closed after 21.00 seconds");
+            allPassed &= check(rock.rockPlace().empty() && rock.place() == "Monox",
+                               "a loading screen leaves the header's place, but a rock none until a place line (got " +
+                                   said(rock.rockPlace()) + ")");
+        }
 
         // The SCAN RESULTS panel, found by structure rather than by place.
         // It is anchored to the rock in 3D and slides with the view, so there
@@ -5795,6 +7379,63 @@ int runSelfTest() {
                 allPassed &= check(seen.complete() && seen.laser && std::string(seen.laser->name) == "Helix I Mining Laser" &&
                                        names == std::vector<std::string>{"Focus III Module", "Rieger-C3 Module"},
                                    "...and a Prospector's HUD reads as Helix I with Focus III and Rieger-C3 (got " + got + ")");
+                allPassed &= check(seen.tableShape == 'F', "...on the table as the HUD drew it up to Star Citizen 4.10.2 "
+                                                           "(got '" + std::string(1, seen.tableShape ? seen.tableShape : '-') +
+                                                               "')");
+            }
+            // ...and the table as Star Citizen 4.10.3 draws it: seven rows, a
+            // fifth larger, in a thin face fringed with colour - its own shape
+            // ('S') and its own places for the laser's line, the module list,
+            // the Head column and the icons (LoadoutReader's TableLayout). Cut
+            // from the app's own pictures at 5,120 x 1,440 and put back where
+            // they were on a black screen: a Prospector's Helix I with a
+            // Rieger-C3 and a Focus III (the list's left edge and what stood
+            // left of it, the global chat, blacked out), and a Golem's Pitman
+            // with nothing fitted under MINING MODULES. The Head column's
+            // coloured figures are read at the new rows; a grey 100 may come
+            // back unread.
+            {
+                const struct {
+                    const char* file;
+                    const wchar_t* resource;
+                    int x, y;
+                    const char* laser;
+                    std::vector<std::string> modules;
+                    int head[6];   // -1: not read; 100: 100 or not read
+                } huds[] = {
+                    {"scanpanel/loadout_prospector_4103.png", L"SELFTEST_LOADOUT_4103", 1788, 587, "Helix I Mining Laser",
+                     {"Focus III Module", "Rieger-C3 Module"}, {119, 70, 100, 100, -1, 83}},
+                    {"scanpanel/loadout_golem_4103.png", L"SELFTEST_LOADOUT_GOLEM_4103", 1644, 397, "Pitman Mining Laser",
+                     {}, {100, 125, 135, 60, -1, 140}},
+                };
+                for (const auto& h : huds) {
+                    const cv::Mat cut = testPicture(h.file, h.resource);
+                    allPassed &= check(!cut.empty(), std::string("the 4.10.3 HUD's picture ") + h.file +
+                                                         " is beside the build or inside the exe");
+                    if (cut.empty() || !reader) continue;
+                    cv::Mat screen(1440, 5120, CV_8UC3, cv::Scalar(0, 0, 0));
+                    cut.copyTo(screen(cv::Rect(h.x, h.y, cut.cols, cut.rows)));
+                    SCMiner::SeenLoadout seen;
+                    SCMiner::readSeenLoadout(screen, *reader, seen);
+                    std::vector<std::string> names;
+                    for (const SCMiner::MiningModule* m : seen.modules) names.push_back(m->name);
+                    std::sort(names.begin(), names.end());
+                    std::string got = std::string(1, seen.tableShape ? seen.tableShape : '-') + " " +
+                                      (seen.laser ? seen.laser->name : "-");
+                    for (const std::string& n : names) got += ", " + n;
+                    bool head = true;
+                    got += "; head";
+                    for (int r = 0; r < 6; r++) {
+                        got += (r ? "/" : " ") + std::to_string(seen.head[r]);
+                        if (h.head[r] == 100) head &= seen.head[r] == 100 || seen.head[r] < 0;
+                        else if (h.head[r] >= 0) head &= seen.head[r] == h.head[r];
+                    }
+                    allPassed &= check(seen.tableShape == 'S' && seen.complete() && seen.laser &&
+                                           std::string(seen.laser->name) == h.laser && names == h.modules && head,
+                                       std::string("...and 4.10.3's table reads as ") + h.laser +
+                                           (h.modules.empty() ? " with nothing fitted" : " with its modules") +
+                                           ", the Head column at its new rows (got " + got + ")");
+                }
             }
             // ...and a MOLE turret's: the line over its table names the head
             // the player flies, a laser of size 2. Three turrets' HUDs at 5120 x
@@ -5838,6 +7479,20 @@ int runSelfTest() {
                     const SCMiner::MiningLaser* laser = SCMiner::readTurretLaser(screen, *reader, &line);
                     allPassed &= check(laser && std::string(laser->name) == t.laser,
                                        std::string("...and a turret's HUD reads as ") + t.laser + " (got '" + line + "')");
+                }
+                // ...and the Hofstede's line where a 16:9 screen has it since
+                // 4.10.3, above the band it was looked for in: 885 to 898 down
+                // at 2560 x 1440 (andydsm, 16 November 2026)
+                {
+                    const cv::Mat cut = testPicture("scanpanel/turret_laser_hofstede.png", L"SELFTEST_TURRET_HOFSTEDE");
+                    if (!cut.empty() && reader) {
+                        cv::Mat screen(1440, 2560, CV_8UC3, cv::Scalar(0, 0, 0));
+                        cut.copyTo(screen(cv::Rect(387, 849, cut.cols, cut.rows)));
+                        std::string line;
+                        const SCMiner::MiningLaser* laser = SCMiner::readTurretLaser(screen, *reader, &line);
+                        allPassed &= check(laser && std::string(laser->name) == "Hofstede-S2 Mining Laser",
+                                           "...and on a 16:9 screen since 4.10.3, the line higher up (got '" + line + "')");
+                    }
                 }
                 if (reader) {
                     const cv::Mat blank(1440, 5120, CV_8UC3, cv::Scalar(0, 0, 0));
@@ -6158,6 +7813,181 @@ int runSelfTest() {
                                            "...and a volume in thousandths: 745 kg and 582.28m SCU, 0.58228 SCU (got " +
                                                std::to_string((int)c.mass) + " kg, " + std::to_string(c.scu) + ")");
                     }
+                    // ...and since 4.10.3, drawn smaller: at 5120 x 1440 the
+                    // labels stand at 1.27 where they stood at 1.53 to 1.59, at
+                    // 2560 x 1440 at 1.08 where they stood at 1.35. Looked for
+                    // from 1.35 up, the panel went unread, its volume and list
+                    // with it (andydsm, 16 November 2026).
+                    const cv::Mat turret4103 = testPicture("scanpanel/panel_turret_4103.png", L"SELFTEST_TURRET_4103");
+                    allPassed &= check(!turret4103.empty(),
+                                       "the MOLE turret's panel of 4.10.3 is beside the build or inside the exe");
+                    if (!turret4103.empty()) {
+                        cv::Mat towerScreen(1440, 5120, CV_8UC3, cv::Scalar(0, 0, 0));
+                        turret4103.copyTo(towerScreen(cv::Rect(3240, 500, turret4103.cols, turret4103.rows)));
+                        SCMiner::ScanPanel tower;
+                        for (int look = 0; look < 4 && !tower.found; look++) {
+                            tower = SCMiner::ScanPanel();
+                            SCMiner::readPanelByShape(towerScreen, tower);
+                        }
+                        const SCMiner::RockStats& c = tower.stats;
+                        allPassed &= check(tower.found && c.mass == 13923.0f && c.resistance == 15.0f &&
+                                               std::abs(c.instability - 491.9f) < 0.005f &&
+                                               std::abs(c.scu - 44.98f) < 0.005f,
+                                           "...and at its 4.10.3 size: 13923, 15 %, 491.90 and 44.98 SCU (got " +
+                                               std::to_string((int)c.mass) + ", " + std::to_string((int)c.resistance) +
+                                               " %, " + std::to_string(c.instability) + ", " + std::to_string(c.scu) + ")");
+                        std::string cutAt;
+                        const bool held = tower.found && panelCutHolds(tower, towerScreen.size(), cutAt);
+                        allPassed &= check(held, "...and the app's own picture of it: the panel with its heading and its "
+                                                 "composition list, no more (got " + cutAt + ")");
+                    }
+                    // The Prospector's white panel after a turret's orange one,
+                    // the search held back as the app holds it: the size the
+                    // turret's panel was read at is not the white panel's.
+                    // Before, the white panel was then looked for at the
+                    // turret's size alone and at the others every fortieth look,
+                    // and a Prospector's rocks after a MOLE went unread (16
+                    // November 2026). Its volume stands a little further left
+                    // since 4.10.3 at 5120 x 1440: 54.65 SCU.
+                    const cv::Mat prospector4103 =
+                        testPicture("scanpanel/panel_prospector_4103.png", L"SELFTEST_PROSPECTOR_4103");
+                    allPassed &= check(!prospector4103.empty(),
+                                       "the Prospector's panel of 4.10.3 is beside the build or inside the exe");
+                    if (!prospector4103.empty() && !copper.empty()) {
+                        cv::Mat prospectorScreen(1440, 5120, CV_8UC3, cv::Scalar(0, 0, 0));
+                        prospector4103.copyTo(
+                            prospectorScreen(cv::Rect(3060, 600, prospector4103.cols, prospector4103.rows)));
+                        cv::Mat towerScreen(1440, 5120, CV_8UC3, cv::Scalar(0, 0, 0));
+                        copper.copyTo(towerScreen(cv::Rect(3395, 515, copper.cols, copper.rows)));
+                        auto lookAt = [](const cv::Mat& screen, int looks) {
+                            SCMiner::ScanPanel panel;
+                            for (int look = 0; look < looks && !panel.found; look++) {
+                                panel = SCMiner::ScanPanel();
+                                SCMiner::readPanelByShape(screen, panel);
+                            }
+                            return panel;
+                        };
+                        const SCMiner::ScanPanel first = lookAt(prospectorScreen, 4);
+                        const SCMiner::ScanPanel second = lookAt(prospectorScreen, 4);
+                        SCMiner::throttlePanelSearch(true);
+                        int towerLooks = 0;
+                        for (int i = 0; i < 3; i++) towerLooks += lookAt(towerScreen, 4).found ? 1 : 0;
+                        const SCMiner::ScanPanel after = lookAt(prospectorScreen, 2);
+                        SCMiner::throttlePanelSearch(false);
+                        allPassed &= check(first.found && second.found && towerLooks == 3 && after.found &&
+                                               after.stats.mass == 74277.0f,
+                                           "...and found again at once after a MOLE turret's panel, the search held "
+                                           "back as in the app (got " +
+                                               std::to_string(towerLooks) + " turret looks, then " +
+                                               std::to_string((int)after.stats.mass) + " kg)");
+                        allPassed &= check(first.found && std::abs(first.stats.scu - 54.65f) < 0.005f,
+                                           "...and its volume a little further left since 4.10.3: 54.65 SCU (got " +
+                                               std::to_string(first.stats.scu) + ")");
+                    }
+                    // The MOLE's pilot seat since 4.10.3: its labels written
+                    // larger, the figures where they were. Found by the column
+                    // before, every figure lost its first numeral - 199 kg,
+                    // 1 %, 79.69 - and the volume went unread (andydsm, 16
+                    // November 2026).
+                    const cv::Mat pilot4103 = testPicture("scanpanel/panel_pilot_4103.png", L"SELFTEST_PILOT_4103");
+                    allPassed &= check(!pilot4103.empty(),
+                                       "the MOLE pilot seat's panel of 4.10.3 is beside the build or inside the exe");
+                    if (!pilot4103.empty()) {
+                        cv::Mat seatScreen(1440, 2560, CV_8UC3, cv::Scalar(0, 0, 0));
+                        pilot4103.copyTo(seatScreen(cv::Rect(1740, 640, pilot4103.cols, pilot4103.rows)));
+                        SCMiner::ScanPanel seat;
+                        for (int look = 0; look < 4 && !seat.found; look++) {
+                            seat = SCMiner::ScanPanel();
+                            SCMiner::readPanelByShape(seatScreen, seat);
+                        }
+                        const SCMiner::RockStats& c = seat.stats;
+                        allPassed &= check(seat.found && seat.labelGlyph == 'Q' && c.mass == 20199.0f &&
+                                               c.resistance == 51.0f && std::abs(c.instability - 279.69f) < 0.005f &&
+                                               std::abs(c.scu - 28.99f) < 0.005f,
+                                           "...and the pilot seat's of 4.10.3, its labels larger: 20199, 51 %, 279.69 "
+                                           "and 28.99 SCU (got " +
+                                               std::string(1, seat.labelGlyph ? seat.labelGlyph : '-') + ", " +
+                                               std::to_string((int)c.mass) + ", " + std::to_string((int)c.resistance) +
+                                               " %, " + std::to_string(c.instability) + ", " + std::to_string(c.scu) +
+                                               ")");
+                        std::string cutAt;
+                        const bool held = seat.found && panelCutHolds(seat, seatScreen.size(), cutAt);
+                        allPassed &= check(held, "...and the app's own picture of the pilot seat's: the panel with its "
+                                                 "heading and its composition list, no more (got " + cutAt + ")");
+                    }
+                    // The Golem on an HDR desktop: the picture comes tone
+                    // mapped, its lettering orange where an SDR capture has it
+                    // amber, and in amber the column is not found at all
+                    // (the app's own snapshot, 16 November 2026)
+                    const cv::Mat golemHdr = testPicture("scanpanel/panel_golem_hdr.png", L"SELFTEST_GOLEM_HDR");
+                    allPassed &= check(!golemHdr.empty(),
+                                       "the Golem's panel off an HDR desktop is beside the build or inside the exe");
+                    if (!golemHdr.empty()) {
+                        cv::Mat golemScreen(1440, 5120, CV_8UC3, cv::Scalar(0, 0, 0));
+                        golemHdr.copyTo(golemScreen(cv::Rect(3160, 520, golemHdr.cols, golemHdr.rows)));
+                        const auto look = [&](bool toneMapped) {
+                            SCMiner::setPanelToneMapped(toneMapped);
+                            SCMiner::ScanPanel golem;
+                            for (int n = 0; n < 4 && !golem.found; n++) {
+                                golem = SCMiner::ScanPanel();
+                                SCMiner::readPanelByShape(golemScreen, golem);
+                            }
+                            SCMiner::setPanelToneMapped(false);
+                            return golem;
+                        };
+                        // (as an SDR picture first: once the column is known,
+                        // the little that amber sees of it is tried at its spot)
+                        const SCMiner::ScanPanel asSdr = look(false);
+                        allPassed &= check(!asSdr.found,
+                                           "...the Golem's off an HDR desktop, its lettering orange: nothing taken "
+                                           "for an SDR picture, where it is amber (got " +
+                                               std::to_string((int)asSdr.stats.mass) + ")");
+                        const SCMiner::ScanPanel golem = look(true);
+                        const SCMiner::RockStats& g = golem.stats;
+                        allPassed &= check(golem.found && (golem.labelGlyph == 'G' || golem.labelGlyph == 'H') &&
+                                               g.mass == 4097.0f && golem.figures[1].placed && g.resistance == 0.0f &&
+                                               golem.figures[2].placed && g.instability == 0.0f,
+                                           "...and told the picture is tone mapped: 4097, 0 % and 0.00 (got " +
+                                               std::string(1, golem.labelGlyph ? golem.labelGlyph : '-') + ", " +
+                                               std::to_string((int)g.mass) + ", '" + golem.figures[1].text + "', '" +
+                                               golem.figures[2].text + "')");
+                    }
+                    // The MOLE's pilot seat on his 5,120 x 1,440 HDR screen,
+                    // as the app saw it (17 November 2026, 13:49:20): the
+                    // shapes find the labels and read none of the mass, and
+                    // the second reader read the whole row as 111,294, a
+                    // fringe of the 1s read as a numeral of its own, and no
+                    // volume. Counted off its ink the mass has five numerals,
+                    // and the row cut where they end reads 11,294; the volume
+                    // is read by line as well.
+                    const cv::Mat pilotHdr =
+                        testPicture("scanpanel/panel_pilot_4103_hdr.png", L"SELFTEST_PILOT_4103_HDR");
+                    allPassed &= check(!pilotHdr.empty(),
+                                       "the MOLE pilot seat's panel off his HDR screen is beside the build or inside "
+                                       "the exe");
+                    if (SCMiner::TextLineReader* const second = panelLines(); second && !pilotHdr.empty()) {
+                        cv::Mat seatScreen(1440, 5120, CV_8UC3, cv::Scalar(0, 0, 0));
+                        pilotHdr.copyTo(seatScreen(cv::Rect(3020, 620, pilotHdr.cols, pilotHdr.rows)));
+                        // the app's way: the shapes, then the second reader on
+                        // the rows their labels place
+                        SCMiner::ScanPanel seat;
+                        for (int look = 0; look < 4 && !seat.found; look++) {
+                            seat = SCMiner::ScanPanel();
+                            SCMiner::readPanelByShape(seatScreen, seat);
+                            if (!seat.found && (seat.labels.x >= 0 || seat.tryLabels.x >= 0)) {
+                                SCMiner::readPanelByLines(seatScreen, *second, seat);
+                            }
+                        }
+                        const SCMiner::RockStats& c = seat.stats;
+                        allPassed &= check(seat.found && c.mass == 11294.0f && c.resistance == 50.0f &&
+                                               std::abs(c.instability - 513.44f) < 0.005f,
+                                           "...its mass by line with the numerals its ink shows: 11294, 50 %, 513.44 "
+                                           "(got " + std::to_string((int)c.mass) + ", " +
+                                               std::to_string((int)c.resistance) + " %, " +
+                                               std::to_string(c.instability) + "; " + seat.note + ")");
+                        allPassed &= check(seat.found && std::abs(c.scu - 33.38f) < 0.005f,
+                                           "...and its volume by line: 33.38 SCU (got " + std::to_string(c.scu) + ")");
+                    }
                     // The MOLE's TURRET, over a sunlit red rock: its figures
                     // are the largest on the screen and no shapes are cut for
                     // that face, so nothing reads them glyph by glyph. The
@@ -6276,6 +8106,20 @@ int runSelfTest() {
                                        "the app's own look reads the rock with no Tesseract beside the exe (got " +
                                            std::to_string((int)w.mass) + " kg, " + std::to_string((int)w.resistance) +
                                            " %, " + std::to_string(w.instability) + ")");
+                    // A 5.0 game: only the 5.0 reader looks, and it takes this
+                    // 4.10 panel for none of its own; back at 4.10 it reads again
+                    SCMiner::setPanelGeneration(5);
+                    const SCMiner::ScanPanel five = SCMiner::readScanPanel(screen, never, &templates, panelLines());
+                    SCMiner::setPanelGeneration(0);
+                    SCMiner::ScanPanel again;
+                    for (int look = 0; look < 4 && !again.found; look++) {
+                        again = SCMiner::readScanPanel(screen, never, &templates, panelLines());
+                    }
+                    allPassed &= check(five.note.rfind("five:", 0) == 0 && !five.found && five.stats.mass == 0 &&
+                                           again.found && again.stats.mass == 2895.0f,
+                                       "...a 5.0 game's look leaves the 4.10 panel unread, a 4.10 game's reads it (got " +
+                                           std::to_string((int)five.stats.mass) + " kg, then " +
+                                           std::to_string((int)again.stats.mass) + " kg; " + five.note + ")");
                 }
             }
         }
@@ -6490,6 +8334,164 @@ int runSelfTest() {
                                        " % (model says " + std::to_string((int)std::lround(held.toHold)) + " %)");
             }
 
+            // 5.0 prints the laser's modifier in front of the figure, and the
+            // figure already carries it: 88 % at +25 % is a rock of 70.4 %
+            // (Nyx I, 13:19:46 on 15 November 2026). The panel's own writing
+            // is taken as it stands, the volume with its SI prefix included,
+            // and nothing else.
+            {
+                float res = 0, delta = 0, inst = 0, scu = 0, little = 0, minus = 0, junk = 0;
+                const bool parsed = SCMiner::fivePercent("88%", res) && SCMiner::fiveDelta("+25%", delta) &&
+                                    SCMiner::fiveTwoPlaces("107.82", inst) && SCMiner::fiveVolume("15.46", scu) &&
+                                    std::abs(inst - 107.82f) < 1e-4f && std::abs(scu - 15.46f) < 1e-4f;
+                const bool milli = SCMiner::fiveVolume("754.38m", little) && std::abs(little - 0.75438f) < 1e-6f;
+                const bool negative = SCMiner::fiveDelta("-35%", minus) && minus == -35.0f;
+                const bool refused = !SCMiner::fiveVolume("754.3m", junk) && !SCMiner::fiveDelta("25%", junk) &&
+                                     !SCMiner::fivePercent("101%", junk) && !SCMiner::fiveWhole("0232", junk) &&
+                                     !SCMiner::fiveShare("15.3%", junk);
+                const float own = SCMiner::rockOwnResistance(res, delta != 0, 1.0f + delta / 100.0f);
+                allPassed &= check(parsed && milli && negative && refused && std::abs(own - 70.4f) < 0.01f,
+                                   "5.0 panel: 88 % at +25 % is a rock of 70.4 %, 754.38m SCU is 0.75438 SCU");
+                // ...and its list goes into 4.10's lines: Savrilium twice, each
+                // with its own quality, Gold, and the inert rest at 0
+                SCMiner::RockContents list;
+                for (const auto& [share, quality] : {std::pair<float, int>{15.30f, 580}, {38.80f, 322}, {6.54f, 553}, {39.34f, 0}}) {
+                    SCMiner::RockPartRead part;
+                    part.percent = share;
+                    part.quality = quality;
+                    part.inert = quality == 0;
+                    list.parts.push_back(part);
+                }
+                const bool named = SCMiner::nameContentsByRock("Savrilium", list) && SCMiner::contentsHold(list);
+                allPassed &= check(named && list.parts.size() == 4 && list.parts[0].ore == "Savrilium" &&
+                                       list.parts[1].ore == "Savrilium" && list.parts[2].ore == "Gold" && list.parts[3].inert,
+                                   "5.0 list: Savrilium 580 and 322 stay two lines, Gold 553, the inert rest");
+                // (how many numerals two masses differ in, set right-aligned)
+                const bool counted = SCMiner::numeralsOff("2322", "2382") == 1 && SCMiner::numeralsOff("2322", "1139") == 4;
+                // The slashed zero against the eight: an eight shows both its
+                // counters dark, the zero's slash fills one of them; a glyph
+                // halfway between the two is neither
+                {
+                    // the built-in shapes, a numeral's advance (9) from their right edge
+                    auto shapeOf = [](char glyph) {
+                        for (int i = 0; i < SCMiner::FIVE_SHAPE_COUNT; i++) {
+                            const SCMiner::FiveShape& s = SCMiner::FIVE_SHAPES[i];
+                            if (s.glyph == glyph && s.height == 16 && s.width >= 9) {
+                                const cv::Mat all(s.height, s.width, CV_32F, const_cast<float*>(s.grey));
+                                return cv::Mat(all(cv::Rect(s.width - 9, 0, 9, 16)).clone());
+                            }
+                        }
+                        return cv::Mat(16, 9, CV_32F, cv::Scalar(0));
+                    };
+                    const cv::Mat zero = shapeOf('0'), eight = shapeOf('8');
+                    const cv::Mat between = (zero + eight) / 2;
+                    allPassed &= check(SCMiner::zeroOrEight(zero) == '0' && SCMiner::zeroOrEight(eight) == '8' &&
+                                           SCMiner::zeroOrEight(between) == 0,
+                                       "5.0 panel: the slashed zero and the eight told apart by their counters, "
+                                       "a glyph between them left unread");
+                }
+                allPassed &= check(counted && SCMiner::numeralsOff("954", "1954") == 1 &&
+                                       SCMiner::numeralsOff("88", "1139") == 4,
+                                   "5.0 panel: how many numerals two masses differ in, set right-aligned");
+                // Where the 5.0 reader lands on the Golem's panel, the MOLE
+                // pilot seat's (PTU recording of 17 November 2026) and the
+                // MOLE turret's row under the reticle (the app's own snapshot
+                // of 08:55:14): the label column, the figures' words, the
+                // list's lines. Which glyphs it reads there is not checked: a
+                // recording does not tell the thin numerals apart well enough
+                // (PanelFive.cpp).
+                {
+                    auto onScreen = [](const cv::Mat& cut, int x, int y) {
+                        cv::Mat screen(1440, 5120, CV_8UC3, cv::Scalar(0, 0, 0));
+                        if (!cut.empty()) cut.copyTo(screen(cv::Rect(x, y, cut.cols, cut.rows)));
+                        return screen;
+                    };
+                    const cv::Mat golemCut = testPicture("scanpanel/panel5_golem.png", L"SELFTEST_FIVE_GOLEM");
+                    const cv::Mat moleCut = testPicture("scanpanel/panel5_mole_pilot.png", L"SELFTEST_FIVE_MOLE");
+                    const cv::Mat turretCut = testPicture("scanpanel/panel5_turret.png", L"SELFTEST_FIVE_TURRET");
+                    allPassed &= check(!golemCut.empty() && !moleCut.empty() && !turretCut.empty(),
+                                       "the 5.0 panels of the Golem, the MOLE pilot seat and the MOLE turret are beside "
+                                       "the build or inside the exe");
+                    const cv::Mat golemScreen = onScreen(golemCut, 3086, 413), moleScreen = onScreen(moleCut, 3018, 582);
+                    SCMiner::ScanPanel golem, mole;
+                    const bool golemSeen = !golemCut.empty() && SCMiner::readPanelFive(golemScreen, golem, nullptr);
+                    const bool moleSeen = !moleCut.empty() && SCMiner::readPanelFive(moleScreen, mole, nullptr);
+                    // the Golem: 5646 with the triangle close after it, 39.52 SCU
+                    allPassed &= check(golemSeen && golem.labelGlyph == SCMiner::FIVE_PANEL &&
+                                           std::abs(golem.labels.x - 3165) <= 6 && std::abs(golem.labels.y - 526) <= 6 &&
+                                           golem.figures[0].text.size() == 4 &&
+                                           golem.note.find(" -; delta") == std::string::npos,
+                                       "5.0 panel on the Golem: its column, the mass's four numerals before the triangle, "
+                                       "the volume (got " + golem.note.substr(0, 140) + ")");
+                    // the MOLE pilot seat: 27519, and three lines - 14.57% 521,
+                    // 51.80% 325, 33.62% and INERT MATERIALS scrolled to its end
+                    const std::vector<SCMiner::FiveListLine> rows =
+                        moleSeen ? SCMiner::readFiveList(moleScreen, mole) : std::vector<SCMiner::FiveListLine>();
+                    std::string taken;
+                    bool shares = rows.size() == 3;
+                    for (const SCMiner::FiveListLine& row : rows) {
+                        shares &= row.shareText.size() == 6 && row.shareText.back() == '%';
+                        taken += " " + row.shareText + "|" + row.qualityText;
+                    }
+                    allPassed &= check(moleSeen && std::abs(mole.labels.x - 3086) <= 6 && std::abs(mole.labels.y - 678) <= 6 &&
+                                           mole.figures[0].text.size() == 5 && shares && rows[0].qualityText.size() == 3 &&
+                                           rows[1].qualityText.size() == 3,
+                                       "5.0 panel on the MOLE pilot seat: its column, the mass's five numerals, three list "
+                                       "lines, each share whole and nothing more (got " + mole.figures[0].text + taken + ")");
+                    // the MOLE turret: its row under the reticle - 27519, 0%,
+                    // -35% 20.83, 34.63 SCU right of the figures, and the same
+                    // three lines with INERT MATERIAL cut by its scroll
+                    const cv::Mat turretScreen = onScreen(turretCut, 2311, 1056);
+                    SCMiner::ScanPanel turret;
+                    const bool turretSeen = !turretCut.empty() && SCMiner::readPanelFive(turretScreen, turret, nullptr);
+                    const std::vector<SCMiner::FiveListLine> turretRows =
+                        turretSeen ? SCMiner::readFiveList(turretScreen, turret) : std::vector<SCMiner::FiveListLine>();
+                    std::string turretTaken;
+                    bool turretShares = turretRows.size() == 3;
+                    for (const SCMiner::FiveListLine& row : turretRows) {
+                        turretShares &= row.shareText.size() == 6 && row.shareText.back() == '%';
+                        turretTaken += " " + row.shareText + "|" + row.qualityText;
+                    }
+                    allPassed &= check(turretSeen && std::abs(turret.labels.x - 2388) <= 6 &&
+                                           std::abs(turret.labels.y - 1162) <= 6 && turret.figures[0].text.size() == 5 &&
+                                           turret.note.find(" -; delta") == std::string::npos && turretShares &&
+                                           turretRows[0].qualityText.size() == 3 && turretRows[1].qualityText.size() == 3,
+                                       "5.0 panel on the MOLE turret: its column under the reticle, the mass's five "
+                                       "numerals, the volume right of them, three list lines (got " +
+                                           turret.note.substr(0, 120) + turretTaken + ")");
+                    // The app's own picture of a Torite rock on the PTU (17
+                    // November 2026 12:15:04, MOLE pilot seat, HDR desktop, tone
+                    // mapped): 4975, 24%, 168.58, 15.04 SCU. The resistance reads
+                    // sure: 0.31 from halfway to the likeliest other glyph with
+                    // the glyphs' likeness taken over the matching's own shifts,
+                    // 0.27 at one alignment.
+                    const cv::Mat toriteCut = testPicture("scanpanel/panel5_torite.png", L"SELFTEST_FIVE_TORITE");
+                    const bool wasToneMapped = SCMiner::panelToneMapped();
+                    SCMiner::setPanelToneMapped(true);
+                    SCMiner::ScanPanel torite;
+                    const bool toriteSeen =
+                        !toriteCut.empty() && SCMiner::readPanelFive(onScreen(toriteCut, 3001, 596), torite, nullptr);
+                    SCMiner::setPanelToneMapped(wasToneMapped);
+                    allPassed &= check(toriteSeen && torite.note.find(" -/24%(") != std::string::npos,
+                                       "5.0 panel on the app's picture of a Torite rock: the resistance 24% sure (got " +
+                                           torite.note.substr(0, 160) + ")");
+                    // The app's own picture of the Golem's panel (17 November
+                    // 2026 08:33:50, HDR desktop, tone mapped): 18782, 0%, +35%
+                    // 28.80, 26.28 SCU. The resistance's zero reads sure: its
+                    // counters measure 0.78, a zero on a tone-mapped frame from
+                    // 0.77 up, elsewhere from 0.80.
+                    const cv::Mat golemAppCut = testPicture("scanpanel/panel5_golem_app.png", L"SELFTEST_FIVE_GOLEM_APP");
+                    SCMiner::setPanelToneMapped(true);
+                    SCMiner::ScanPanel golemApp;
+                    const bool golemAppSeen = !golemAppCut.empty() &&
+                                              SCMiner::readPanelFive(onScreen(golemAppCut, 3133, 462), golemApp, nullptr);
+                    SCMiner::setPanelToneMapped(wasToneMapped);
+                    allPassed &= check(golemAppSeen && golemApp.note.find(" -/0%(") != std::string::npos,
+                                       "5.0 panel on the app's picture of the Golem: the resistance 0% sure (got " +
+                                           golemApp.note.substr(0, 160) + ")");
+                }
+            }
+
             // What to reach for when the head on the ship will not do. The
             // suggestions take the rock's resistance through each head's own
             // factor, so the 48,929 kg savrilium is not handed to a stock
@@ -6538,22 +8540,51 @@ int runSelfTest() {
                                        std::to_string((int)std::lround(alone)) + ")");
 
                 // No suggestion runs two of the actives that cut each other off,
-                // on any head, for the hard rocks on record and a spread of made-up ones
+                // on any head, for the hard rocks on record and a spread of made-up
+                // ones; none takes an active module where its passive ones hold
+                // the rock, and of the heads that hold it, none that needs a
+                // charge comes before one that does not
                 auto twoCutting = [](const SCMiner::LaserSuggestion& p) {
                     int n = 0;
                     for (const SCMiner::MiningModule* m : p.modules) n += SCMiner::cutsOthersOff(*m) ? 1 : 0;
                     return n > 1;
                 };
-                int asked = 0, doubled = 0;
-                for (float mass : {3000.0f, 13147.0f, 25000.0f, 48929.0f, 90000.0f}) {
-                    for (float res : {0.0f, 30.0f, 67.0f, 75.0f, 90.0f}) {
-                        for (int8_t size : {(int8_t)1, (int8_t)2}) {
-                            SCMiner::RockStats r;
-                            r.mass = mass;
-                            r.resistance = res;
-                            for (const SCMiner::LaserSuggestion& p : SCMiner::suggestLasers(r, size)) {
-                                asked++;
-                                if (twoCutting(p)) doubled++;
+                int asked = 0, doubled = 0, chargedNeedless = 0, chargedFirst = 0, passiveHolds = 0;
+                int ownHolds = 0, ownLate = 0;
+                // ...and with a crafted head on board, one of each size: of
+                // the heads that hold the rock the same way, with a charge or
+                // without, it comes before every head off the shelf
+                SCMiner::MiningLoadout ownOne;
+                ownOne.laser = helixOne.laser;
+                ownOne.craftedPower = 28.84f;
+                SCMiner::MiningLoadout ownTwo = onHelixTwo({});
+                ownTwo.craftedPower = 28.84f;
+                for (bool withOwn : {false, true}) {
+                    for (float mass : {3000.0f, 13147.0f, 25000.0f, 48929.0f, 90000.0f}) {
+                        for (float res : {0.0f, 30.0f, 67.0f, 75.0f, 90.0f}) {
+                            for (int8_t size : {(int8_t)1, (int8_t)2}) {
+                                SCMiner::RockStats r;
+                                r.mass = mass;
+                                r.resistance = res;
+                                const float needs = mass * SCMiner::BREAK_DECAY_PER_MASS;
+                                std::vector<SCMiner::MiningLoadout> aboard;
+                                if (withOwn) aboard.push_back(size == 1 ? ownOne : ownTwo);
+                                bool charged = false;
+                                bool shelfHeld[2] = {false, false};   // without a charge, with one
+                                for (const SCMiner::LaserSuggestion& p : SCMiner::suggestLasers(r, size, nullptr, aboard)) {
+                                    asked++;
+                                    if (twoCutting(p)) doubled++;
+                                    const bool runsOut = SCMiner::runsOut(p.modules);
+                                    if (runsOut && p.passivePower > 0 && needs / p.passivePower <= 1.0f) chargedNeedless++;
+                                    if (p.breaks && !runsOut && !p.stock) passiveHolds++;
+                                    if (p.breaks && !runsOut && charged) chargedFirst++;
+                                    if (p.breaks && runsOut) charged = true;
+                                    if (p.breaks && p.crafted != 0.0f) {
+                                        ownHolds++;
+                                        if (shelfHeld[runsOut ? 1 : 0]) ownLate++;
+                                    }
+                                    if (p.breaks && p.crafted == 0.0f) shelfHeld[runsOut ? 1 : 0] = true;
+                                }
                             }
                         }
                     }
@@ -6561,32 +8592,89 @@ int runSelfTest() {
                 allPassed &= check(asked > 0 && doubled == 0,
                                    "no suggested head runs two actives that cut each other off (" +
                                        std::to_string(doubled) + " of " + std::to_string(asked) + ")");
+                allPassed &= check(passiveHolds > 0 && chargedNeedless == 0 && chargedFirst == 0,
+                                   "a suggestion takes active modules only where its passive ones do not hold the rock (" +
+                                       std::to_string(chargedNeedless) + "), and a head holding it on a charge comes "
+                                       "after every one holding it without (" + std::to_string(chargedFirst) + "; " +
+                                       std::to_string(passiveHolds) + " held on passive modules)");
+                allPassed &= check(ownHolds > 0 && ownLate == 0,
+                                   "a crafted head on board that holds the rock comes before the heads off the shelf "
+                                   "holding it the same way (" + std::to_string(ownLate) + " late of " +
+                                       std::to_string(ownHolds) + ")");
 
                 SCMiner::RockStats sav;
                 sav.mass = 48929.0f;
                 sav.resistance = 75.0f;      // its own, as the MOLE's cockpit printed it
                 const std::vector<SCMiner::LaserSuggestion> picks = SCMiner::suggestLasers(sav, 2);
                 // The 48,929 kg savrilium is a Helix II with three Surge, near
-                // 78 %, and the quantainium a Helix I with two, near 41 %.
+                // 78 %: no passive mix holds it, its best (Rieger-C3 and two
+                // Deluge) wanting more than the head has. The quantainium is a
+                // Helix I with two Deluge, near 69 %, rather than two Surge at
+                // 41 % that last 15 s, and the gold rock a Helix II with three
+                // Rieger-C3.
                 auto has = [](const SCMiner::LaserSuggestion& p, const SCMiner::MiningModule* m) {
                     return std::count(p.modules.begin(), p.modules.end(), m);
                 };
                 const SCMiner::LaserSuggestion* top = picks.empty() ? nullptr : &picks[0];
                 const bool threeSurgeHead = top && top->breaks && top->laser == SCMiner::laserById("thcn_helix_s2") &&
-                                            has(*top, surge) == 3 && top->throttle > 65.0f && top->throttle < 90.0f;
+                                            has(*top, surge) == 3 && top->throttle > 65.0f && top->throttle < 90.0f &&
+                                            !top->passive.empty() &&
+                                            top->passivePower < sav.mass * SCMiner::BREAK_DECAY_PER_MASS;
                 allPassed &= check(threeSurgeHead,
                                    "48,929 kg at 75 % is a Helix II with three Surge, near " +
-                                       std::to_string((int)std::lround(top ? top->throttle : 0.0f)) + " %");
+                                       std::to_string((int)std::lround(top ? top->throttle : 0.0f)) +
+                                       " %, no passive mix holding it");
                 SCMiner::RockStats quant;
                 quant.mass = 13147.0f;
                 quant.resistance = 67.0f;    // 47 % in green through a Helix I
                 const std::vector<SCMiner::LaserSuggestion> one = SCMiner::suggestLasers(quant, 1);
-                const bool twoSurgeHelix = !one.empty() && one[0].breaks && one[0].laser == helixOne.laser &&
-                                           has(one[0], surge) == 2 && one[0].throttle > 30.0f && one[0].throttle < 55.0f;
-                allPassed &= check(twoSurgeHelix,
-                                   "the quantainium wants a Helix I with two Surge, near " +
+                const bool twoDelugeHelix = !one.empty() && one[0].breaks && one[0].laser == helixOne.laser &&
+                                            has(one[0], deluge) == 2 && one[0].modules.size() == 2 &&
+                                            one[0].throttle > 55.0f && one[0].throttle < 85.0f;
+                allPassed &= check(twoDelugeHelix,
+                                   "the quantainium wants a Helix I with two Deluge, near " +
                                        std::to_string((int)std::lround(one.empty() ? 0.0f : one[0].throttle)) + " %");
-                (void)deluge;
+                SCMiner::RockStats gold;
+                gold.mass = 22000.0f;
+                gold.resistance = 50.0f;
+                const std::vector<SCMiner::LaserSuggestion> mole = SCMiner::suggestLasers(gold, 2);
+                const bool threeRieger = !mole.empty() && mole[0].breaks && mole[0].laser == SCMiner::laserById("thcn_helix_s2") &&
+                                         has(mole[0], rieger) == 3;
+                allPassed &= check(threeRieger,
+                                   "the 22,000 kg gold rock at 50 % is a Helix II with three Rieger-C3, near " +
+                                       std::to_string((int)std::lround(mole.empty() ? 0.0f : mole[0].throttle)) + " %");
+
+                // The 30,280 kg savrilium at 79 % is three Surge on a Helix II
+                // off the shelf; with a crafted Helix II (+28.84 %) on board,
+                // two of its mounts, the answer is that head with three Deluge
+                // - named once
+                SCMiner::RockStats sav30;
+                sav30.mass = 30280.0f;
+                sav30.resistance = 79.0f;
+                SCMiner::MiningLoadout craftedTwo = onHelixTwo({SCMiner::moduleById("passive_focus_mk3"), rieger});
+                craftedTwo.craftedPower = 28.84f;
+                const std::vector<SCMiner::LaserSuggestion> shelf = SCMiner::suggestLasers(sav30, 2);
+                const std::vector<SCMiner::LaserSuggestion> aboard =
+                    SCMiner::suggestLasers(sav30, 2, nullptr, {craftedTwo, craftedTwo});
+                const bool shelfSurge = !shelf.empty() && shelf[0].crafted == 0.0f && has(shelf[0], surge) == 3;
+                const bool ownDeluge = !aboard.empty() && aboard[0].crafted == 28.84f && aboard[0].breaks &&
+                                       aboard[0].laser == craftedTwo.laser && has(aboard[0], deluge) == 3 &&
+                                       aboard[0].throttle > 75.0f && aboard[0].throttle < 95.0f;
+                const auto ownNamed = std::count_if(aboard.begin(), aboard.end(),
+                                                    [](const SCMiner::LaserSuggestion& p) { return p.crafted != 0.0f; });
+                allPassed &= check(shelfSurge && ownDeluge && ownNamed == 1 && aboard.size() == shelf.size() + 1,
+                                   "30,280 kg at 79 % is three Surge off the shelf, and three Deluge on the crafted "
+                                   "Helix II on board, near " +
+                                       std::to_string((int)std::lround(aboard.empty() ? 0.0f : aboard[0].throttle)) + " %");
+
+                // ...and a hold that needs a charge says for how long
+                const SCMiner::MiningModule* rime = SCMiner::moduleById("active_rime");
+                allPassed &= check(SCMiner::whileRuns({surge, surge, surge}) == " while Surge runs, 15 s" &&
+                                       SCMiner::whileRuns({rieger, deluge, deluge}).empty() &&
+                                       SCMiner::whileRuns({}).empty() && rime &&
+                                       SCMiner::whileRuns({surge, rieger, rime}) == " while Surge and Rime run, 15 s",
+                                   "a hold on a charge lasts \"" + SCMiner::whileRuns({surge, surge, surge}) +
+                                       "\", one on passive modules says nothing of the kind");
             }
 
             // ...and whether a gadget is NEEDED or would help, off the balance
@@ -6890,6 +8978,83 @@ int runSelfTest() {
         allPassed &= check(listedIn && !absentIn, "at Monox only Monox's ores stay in scope");
         narrowed.setPlaceFilter("Nowhere");
         allPassed &= check(narrowed.placeFilter().empty(), "a place the tables do not know is no filter");
+        // Nyx I (5.0) has rocks of its own at about half the usual signature:
+        // there 2,105 is one Quartz and 4,210 two, anywhere else 2,105 is
+        // nothing and 4,210 one
+        {
+            using Ground = SCMiner::SignatureAnalyzer::Ground;
+            auto shown = [](SCMiner::SignatureAnalyzer& a, int value) {
+                std::string out;
+                for (const auto& r : a.analyzeSignature(value)) {
+                    if (!out.empty()) out += ", ";
+                    out += r.name + " x" + std::to_string(r.clusterSize) + (r.inSelectedSystem ? "" : " (out)");
+                }
+                return out.empty() ? std::string("nothing") : out;
+            };
+            std::string name;
+            int count = 0;
+            SCMiner::SignatureAnalyzer nyx1;
+            nyx1.setSystemFilter("NYX");
+            nyx1.setPlaceFilter("Nyx I");
+            nyx1.setGround(Ground::Surface);
+            allPassed &= check(nyx1.placeFilter() == "Nyx I" && shown(nyx1, 2105) == "Quartz x1" &&
+                                   shown(nyx1, 4210) == "Quartz x2" && nyx1.isExactMatch(1782, name, count) &&
+                                   name == "Gold" && count == 1 && !nyx1.isExactMatch(3585, name, count),
+                               "at Nyx I 2,105 is one Quartz, 4,210 two, 1,782 a Gold, and 3,585 (a Gold anywhere "
+                               "else) nothing (got " + shown(nyx1, 2105) + " / " + shown(nyx1, 4210) + ")");
+            // its own values are no multiples of 5, nor are their sums
+            allPassed &= check(nyx1.explainsExactly(3887) && nyx1.isKnownSignature(3887),
+                               "...and 3,887 there is a Gold beside a Quartz (got " + shown(nyx1, 3887) + ")");
+            const std::vector<int> known = nyx1.knownSignatures();
+            allPassed &= check(std::find(known.begin(), known.end(), 2105) != known.end() &&
+                                   std::find(known.begin(), known.end(), 3585) == known.end(),
+                               "...and the reader's list there has Nyx I's values, not the usual ones");
+            SCMiner::SignatureAnalyzer daymar;
+            daymar.setSystemFilter("STANTON");
+            daymar.setPlaceFilter("Daymar");
+            daymar.setGround(Ground::Surface);
+            allPassed &= check(!daymar.isExactMatch(2105, name, count) && shown(daymar, 4210) == "Quartz x1",
+                               "at Daymar 2,105 is no signature and 4,210 is one Quartz (got " + shown(daymar, 4210) +
+                                   ")");
+            // Levski behind, Nyx I not yet named by the log: both kinds
+            SCMiner::SignatureAnalyzer underway;
+            underway.setSystemFilter("NYX");
+            underway.setGround(Ground::Surface);
+            const std::string before = shown(underway, 2105);
+            underway.setGround(Ground::Space);
+            allPassed &= check(before == "Quartz x1" && !underway.isExactMatch(2105, name, count),
+                               "in Nyx with no place named 2,105 is a Quartz of Nyx I, out in open space nothing "
+                               "(got " + before + ")");
+            // ...but only in 5.0: 4.10 has no rocks of Nyx I, and with them
+            // every match in Nyx off open space doubled - 7,200 two Bexalite
+            // or four, 50 % each, on 17 Nov 2026
+            auto exact = [](SCMiner::SignatureAnalyzer& a, int value) {
+                std::string out;
+                for (const auto& r : a.analyzeSignature(value)) {
+                    if (r.difference >= 1.0) continue;
+                    if (!out.empty()) out += ", ";
+                    out += r.name + " x" + std::to_string(r.clusterSize);
+                }
+                return out.empty() ? std::string("nothing") : out;
+            };
+            using Rocks = SCMiner::SignatureAnalyzer::Rocks;
+            SCMiner::SignatureAnalyzer live;
+            live.setSystemFilter("NYX");
+            live.setGround(Ground::Surface);
+            live.setGameGeneration(4);
+            const std::string onLive = exact(live, 7200);
+            const bool liveUsual = live.rocksHere() == Rocks::Usual && !live.isExactMatch(2105, name, count);
+            live.setPlaceFilter("Nyx I");
+            const bool liveAtNyx1 = live.rocksHere() == Rocks::Usual && exact(live, 4210) == "Quartz x1";
+            live.setPlaceFilter("");
+            live.setGameGeneration(5);
+            const std::string onFive = exact(live, 7200);
+            const bool fiveEither = live.rocksHere() == Rocks::Either;
+            allPassed &= check(onLive == "Bexalite x2" && liveUsual && liveAtNyx1 &&
+                                   onFive == "Bexalite x2, Bexalite x4" && fiveEither,
+                               "in 4.10 no place has rocks of its own: in Nyx 7,200 is two Bexalite, in 5.0 two or "
+                               "four (got " + onLive + " / " + onFive + ")");
+        }
         // The 2,000 family by where the ship is
         SCMiner::SignatureAnalyzer grounded;
         auto nameOf = [&](SCMiner::SignatureAnalyzer& a) {
@@ -6948,6 +9113,36 @@ int runSelfTest() {
                            "a window of Bedrock's under the game's is left in the picture where the game's lies "
                            "over it, and only there");
     }
+
+#ifdef _WIN32
+    // A minimised game is none on screen, and the scan rests: a window of a
+    // class of its own stands in for the game's, minimised and brought back
+    // where no screen shows it, never taking the focus and without the
+    // animation
+    {
+        using SCMiner::ScreenCapture;
+        const wchar_t* const standClass = L"BedrockSelfTestGame";
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = standClass;
+        RegisterClassW(&wc);
+        HWND stand = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, standClass, L"", WS_POPUP, -32000, -32000,
+                                     640, 480, nullptr, nullptr, wc.hInstance, nullptr);
+        BOOL still = TRUE;
+        if (stand) DwmSetWindowAttribute(stand, DWMWA_TRANSITIONS_FORCEDISABLED, &still, sizeof(still));
+        const bool hidden = !ScreenCapture::gameMinimised("BedrockSelfTestGame");
+        if (stand) ShowWindow(stand, SW_SHOWMINNOACTIVE);
+        const bool minimised = ScreenCapture::gameMinimised("BedrockSelfTestGame");
+        if (stand) ShowWindow(stand, SW_SHOWNOACTIVATE);
+        const bool shown = !ScreenCapture::gameMinimised("BedrockSelfTestGame") && stand && !IsIconic(stand);
+        if (stand) DestroyWindow(stand);
+        UnregisterClassW(standClass, wc.hInstance);
+        const bool closed = !ScreenCapture::gameMinimised("BedrockSelfTestGame");
+        allPassed &= check(stand && hidden && minimised && shown && closed,
+                           "a game minimised is a game not on screen, and one hidden, shown or closed is not minimised");
+    }
+#endif
 
     // The automatic aim box reproduces the measured setup and scales with
     // the viewport height (352x180 centred at 2560,475, the span 53 read
@@ -7451,6 +9646,61 @@ int runSelfTest() {
         allPassed &= check(suited == std::vector<std::string>{"Aberdeen", "Arial", "Pyro I", "Pyro VI (Terminus)"},
                            "Of the places the tables list, those four alone name a suit (" +
                                std::to_string(suited.size()) + ")");
+        // The Ore Finder's list of places (By place): one system's places
+        // by kind under their headings, each place once, A to Z within a
+        // kind; over all systems every place there is, each system's kinds
+        // in turn and the system in their headings
+        auto flat = [](const std::vector<SCMiner::PlaceGroup>& groups) {
+            std::vector<std::string> out;
+            for (const auto& group : groups) out.insert(out.end(), group.places.begin(), group.places.end());
+            return out;
+        };
+        auto headings = [](const std::vector<SCMiner::PlaceGroup>& groups) {
+            std::string out;
+            for (const auto& group : groups) {
+                out += (out.empty() ? "" : " / ") + (group.system.empty() ? "" : group.system + " ") + group.kind;
+            }
+            return out;
+        };
+        const auto stantonPlaces = SCMiner::placeGroups("STANTON");
+        const auto stantonFlat = flat(stantonPlaces);
+        allPassed &= check(headings(stantonPlaces) == "PLANETS / MOONS / ASTEROID FIELDS / CAVES" &&
+                               stantonFlat.size() == 23 && stantonPlaces[0].places == std::vector<std::string>{
+                                                                                    "Hurston", "microTech"} &&
+                               stantonPlaces[2].places.front() == "Aaron Halo" &&
+                               stantonPlaces[2].places.back() == "Yela Asteroid Belt" &&
+                               stantonPlaces[3].places == std::vector<std::string>{"Hathor Caves"},
+                           "Stanton's places: planets, moons, asteroid fields, caves, 23 in all (" +
+                               headings(stantonPlaces) + ", " + std::to_string(stantonFlat.size()) + ")");
+        const auto nyxPlaces = SCMiner::placeGroups("nyx");
+        allPassed &= check(headings(nyxPlaces) == "ASTEROID FIELDS / EVENTS" && flat(nyxPlaces).size() == 4,
+                           "Nyx's places, the system in any case: two fields and the Breaker Stations (" +
+                               headings(nyxPlaces) + ")");
+        const auto allPlaces = SCMiner::placeGroups("ALL");
+        std::vector<std::string> everyPlace;
+        for (const auto& row : SCMiner::ORE_LOCATIONS) {
+            if (std::find(everyPlace.begin(), everyPlace.end(), row.location) == everyPlace.end()) {
+                everyPlace.push_back(row.location);
+            }
+        }
+        auto allFlat = flat(allPlaces);
+        const std::string allHeads = headings(allPlaces);
+        std::sort(allFlat.begin(), allFlat.end());
+        std::sort(everyPlace.begin(), everyPlace.end());
+        allPassed &= check(allFlat == everyPlace &&
+                               allHeads == "Stanton PLANETS / Stanton MOONS / Stanton ASTEROID FIELDS / Stanton CAVES / "
+                                           "Pyro PLANETS / Pyro MOONS / Pyro ASTEROID FIELDS / "
+                                           "Nyx ASTEROID FIELDS / Nyx EVENTS",
+                           "All systems: every place once (" + std::to_string(allFlat.size()) + " of " +
+                               std::to_string(everyPlace.size()) + "), Stanton's kinds, Pyro's, Nyx's (" + allHeads +
+                               ")");
+        allPassed &= check(SCMiner::placeSystem("daymar") == "Stanton" && SCMiner::placeSystem("Keeger Belt") == "Nyx" &&
+                               SCMiner::placeSystem("Levski").empty() &&
+                               SCMiner::oresAtCount("Daymar") == (int)SCMiner::MinerGUI::minedAt("Daymar").size() &&
+                               SCMiner::oresAtCount("Pyro VI (Terminus)") == 11 && SCMiner::oresAtCount("Levski") == 0,
+                           "A place's system and how many ores its card lists (Daymar " +
+                               std::to_string(SCMiner::oresAtCount("Daymar")) + ", Terminus " +
+                               std::to_string(SCMiner::oresAtCount("Pyro VI (Terminus)")) + ")");
     }
 
     // --- refinery table ---

@@ -6,7 +6,7 @@ made of, whether your laser can break it, where an ore is found and where it
 sells best, your refinery work orders, and your blueprints.
 
 It is free, needs no account and no installer, and runs on Windows and on
-Linux (AppImage, also SteamOS). Current version: 3.0.3, for Star Citizen 4.10.3.
+Linux (AppImage, also SteamOS). Current version: 3.0.4, for Star Citizen 4.10.3.
 
 **Download:** the [Releases](https://github.com/SC-Ravaxx/Bedrock/releases) page - on Windows,
 unzip it anywhere and start `Bedrock.exe`; on Linux, make the AppImage
@@ -29,8 +29,9 @@ executable and start it. The app tells you when a newer version is out.
 - **Ore Finder:** where an ore is found, what a rock of it usually holds, and
   where refined ore sells best right now (prices players report on
   [UEX](https://uexcorp.space)), next to your own trades from the game log.
-  Clicking the Aaron Halo in it opens a calculator: at which distance left to
-  leave quantum travel for each band.
+  By place it goes the other way round: what is mined on a planet, a moon or
+  in an asteroid field. Clicking the Aaron Halo in it opens a calculator: at
+  which distance left to leave quantum travel for each band.
 - **Gear:** the laser heads, modules and gadgets your ship takes, with the
   nearest shops that sell them and their prices from UEX.
 - **Refinery:** reads your work orders off the refinery terminal and shows
@@ -78,8 +79,8 @@ process or inject anything. The `[BP]` option and the component names write a
 language file into the game folder, the way language packs do.
 
 Network: an update check, the plugin list and the plugins you install
-(official builds only), UEX's public price lists while the Ore Finder or the
-Gear page is open,
+(official builds only), UEX's public price lists (ore prices while the Ore
+Finder is open, gear prices from the start, at most every 12 hours),
 refinery workloads to and from Bedrock's server and the rocks you scan to it
 (official builds only; untick "Share refinery workloads" in the Refinery
 window or "Share rock scans" in Settings to stop sending - what is sent is
@@ -183,7 +184,7 @@ without it.
 
 ### Windows
 
-Use the versions `BUILDINFO.txt` names - for 3.0.3: Visual Studio 2022
+Use the versions `BUILDINFO.txt` names - for 3.0.4: Visual Studio 2022
 Build Tools with MSVC 19.44.35222 (toolset v143), Windows SDK 10.0.26100.0,
 CMake 3.31, and vcpkg; `vcpkg.json` pins every library to one vcpkg
 baseline, which vcpkg installs on its own when cmake runs.

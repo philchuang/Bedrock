@@ -2,16 +2,21 @@
 folder: python -m unittest test_app (from this folder)"""
 
 import contextlib
+import csv
+import hashlib
+import http.client
 import io
 import json
 import os
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 
 import app
 
@@ -25,8 +30,11 @@ class ServiceTest(unittest.TestCase):
         self.limiter = app.Limiter(per_address=1000, overall=100000)
         self.rock_limiter = app.Limiter(per_address=1000, overall=100000)
         self.rock_count_limiter = app.Limiter(per_address=100000, overall=1000000)
+        self.feedback_limiter = app.FeedbackLimiter(per_hour=1000, per_day=100000, overall=1000000)
+        self.debug_limiter = app.FeedbackLimiter(per_hour=1000, per_day=100000, overall=1000000)
         self.server = app.serve(self.store, self.limiter, host="127.0.0.1", port=0, rock_limiter=self.rock_limiter,
-                                rock_count_limiter=self.rock_count_limiter)
+                                rock_count_limiter=self.rock_count_limiter, feedback_limiter=self.feedback_limiter,
+                                debug_limiter=self.debug_limiter)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = "http://127.0.0.1:%d%s" % (self.server.server_address[1], app.PREFIX)
@@ -798,6 +806,763 @@ class ServiceTest(unittest.TestCase):
         app.Store(self.store.path)
         self.assertEqual(self.send_rocks([self.rock()])[0], 201)
         self.assertEqual((self.store.count(), self.store.rock_count()), (1, 1))
+
+    # ---------------------------------------------------------------- feedback
+
+    def message(self, **changes):
+        # each with a text of its own, so no two are the same message
+        self.tick += 1
+        m = {"text": "The rock panel shows no list.\nMOLE, pilot seat (%d)." % self.tick, "name": "Rockhound",
+             "version": "3.0.4", "game": 41003, "channel": "LIVE", "os": "windows"}
+        m.update(changes)
+        return m
+
+    def send_feedback(self, address="203.0.113.1", install=None, **changes):
+        return self.call("/v1/feedback", self.message(**changes), address=address, install=install)
+
+    def feedback_rows(self):
+        db = sqlite3.connect(self.store.path)
+        db.row_factory = sqlite3.Row
+        try:
+            return db.execute("SELECT * FROM feedback ORDER BY id").fetchall()
+        finally:
+            db.close()
+
+    def test_a_message_is_kept_as_it_was_written(self):
+        # line breaks, an empty line, an umlaut and an emoji - as UTF-8, the way Bedrock sends it
+        text = "Since 4.10.3 the list stays empty.\n\nL\u00e4uft nicht \U0001f44d\n  MOLE, pilot seat"
+        body = self.message(text=text, name="J\u00e4ger \U0001f680")
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.assertIn("L\u00e4uft nicht \U0001f44d".encode("utf-8"), raw)
+        self.assertEqual(self.call("/v1/feedback", raw=raw, install=self.ONE), (201, {"ok": True, "stored": True}))
+        # ...and escaped, as json.dumps has it
+        self.assertEqual(self.send_feedback(text=text + "!", install=self.ONE), (201, {"ok": True, "stored": True}))
+        first, second = self.feedback_rows()
+        self.assertEqual((first["install"], first["name"], first["text"], first["version"], first["game"],
+                          first["channel"], first["os"]),
+                         (self.ONE, "J\u00e4ger \U0001f680", text, "3.0.4", 41003, "LIVE", "windows"))
+        self.assertEqual(second["text"], text + "!")
+        self.assertTrue(self.now <= first["received"] <= time.time() + 1)
+        self.assertEqual(len(first["source"]), 16)
+        today = self.today()
+        self.assertEqual((today["req:feedback"], today["feedback:accepted"], today["feedback-senders"]), (2, 2, 1))
+        self.assertNotIn("accepted", today)     # the readings' own counts stay apart
+
+    def test_a_message_needs_its_text_and_bedrocks_version_only(self):
+        self.assertEqual(self.call("/v1/feedback", {"text": "  No list on the MOLE. \n", "version": "3.0.4"})[0], 201)
+        # nothing given, in the ways there are to say so - and what a newer Bedrock may add is left aside
+        self.assertEqual(self.send_feedback(name="  ", game=0, channel="", os="", shots=[1, 2], v=2)[0], 201)
+        self.assertEqual(self.send_feedback(name=None, game=None, channel=None, os=None)[0], 201)
+        for row in self.feedback_rows():
+            self.assertEqual((row["install"], row["name"], row["game"], row["channel"], row["os"]),
+                             (None, None, None, None, None))
+        self.assertEqual(self.feedback_rows()[0]["text"], "No list on the MOLE.")
+        # trimmed, the text and the name; what is inside stays, a tab as a space
+        self.assertEqual(self.send_feedback(text="\n  Two lines \n here.  \n\n", name="  Rock\thound ", channel=" PTU ",
+                                            os="linux", game=41003.0)[0], 201)
+        row = self.feedback_rows()[-1]
+        self.assertEqual((row["text"], row["name"], row["channel"], row["os"], row["game"]),
+                         ("Two lines \n here.", "Rock hound", "PTU", "linux", 41003))
+
+    def test_a_line_break_is_kept_however_it_was_written(self):
+        # a Windows edit field's CR LF, a rich edit's CR and its Shift+Enter (VT), and the rest; a tab is a space
+        self.assertEqual(self.send_feedback(text="a\r\nb\rc\x0bd\x0ce\x85f\u2028g\u2029h\n\ni\tj")[0], 201)
+        self.assertEqual(self.feedback_rows()[0]["text"], "a\nb\nc\nd\ne\nf\ng\nh\n\ni j")
+
+    def test_the_same_message_from_the_same_sender_is_kept_once(self):
+        body = self.message()
+
+        def post(address="203.0.113.1", install=None, **changes):
+            return self.call("/v1/feedback", dict(body, **changes), address=address, install=install)
+        self.assertEqual(post(install=self.ONE), (201, {"ok": True, "stored": True}))
+        self.assertEqual(post(install=self.ONE), (200, {"ok": True, "stored": False}))
+        # the install is the sender, wherever it writes from and whatever else it says
+        self.assertEqual(post("198.51.100.9", self.ONE, name="Someone else", os="linux")[0], 200)
+        # ...and written another way it is the same text
+        self.assertEqual(post(install=self.ONE, text="  " + body["text"].replace("\n", "\r\n") + "\n")[0], 200)
+        self.assertEqual(post(install=self.OTHER)[0], 201)
+        # without a number the address is
+        self.assertEqual(post("198.51.100.7")[0], 201)
+        self.assertEqual(post("198.51.100.7")[0], 200)
+        self.assertEqual(post("198.51.100.8")[0], 201)
+        self.assertEqual(post(install=self.ONE, text=body["text"] + " Again.")[0], 201)
+        self.assertEqual(self.store.feedback_count(), 5)
+        today = self.today()
+        self.assertEqual((today["feedback:accepted"], today["feedback:duplicate"], today["feedback-senders"]),
+                         (5, 4, 4))
+        # a day on it is a new message
+        db = sqlite3.connect(self.store.path)
+        try:
+            with db:
+                db.execute("UPDATE feedback SET received = received - ?", (app.FEEDBACK_SAME_HOURS * 3600 + 5,))
+        finally:
+            db.close()
+        self.assertEqual(post(install=self.ONE)[0], 201)
+        self.assertEqual(post("198.51.100.7")[0], 201)
+
+    def test_the_same_message_is_known_across_midnight_by_yesterdays_token(self):
+        # an address has another token each UTC day: a quarter of an hour before midnight, and one after
+        late = (self.now // 86400) * 86400 - 900
+        message = app.validate_feedback(self.message())
+        self.assertIs(self.store.add_feedback(message, late, self.store.tokens("198.51.100.7", late), None,
+                                              lambda: True), True)
+        after = self.store.tokens("198.51.100.7", late + 1800)
+        self.assertEqual(len(set(after)), 2)
+        self.assertIs(self.store.add_feedback(message, late + 1800, after, None, lambda: True), False)
+        self.assertIs(self.store.add_feedback(message, late + 1800, self.store.tokens("198.51.100.8", late + 1800),
+                                              None, lambda: True), True)
+        # ...and where there is no room, a new message is not kept
+        self.assertIsNone(self.store.add_feedback(app.validate_feedback(self.message()), late + 1800, after, None,
+                                                  lambda: False))
+        self.assertEqual(self.store.feedback_count(), 2)
+
+    def test_a_message_that_does_not_fit_the_format_is_turned_down(self):
+        self.feedback_limiter.per_hour = 1
+        bad = [
+            self.message(text=""),
+            self.message(text="   "),                                  # only spaces
+            self.message(text=" \n\t \r\n"),
+            self.message(text="x" * (app.FEEDBACK_TEXT_MAX + 1)),
+            self.message(text="The bell \x07 rings"),                  # a control character
+            self.message(text="nothing\x00after"),
+            self.message(text="\x1b[2Jgone"),
+            self.message(text="a\x7fb"),
+            self.message(text=None),
+            self.message(text=["No list."]),
+            self.message(name="x" * (app.FEEDBACK_NAME_MAX + 1)),
+            self.message(name="Rock\nhound"),                          # a name is one line
+            self.message(name="Rock\x07hound"),
+            self.message(name=7),
+            self.message(version=None),
+            self.message(version="latest"),
+            self.message(version="3.0.4\n"),
+            self.message(version="3.0.4.1.2"),
+            self.message(game=-1),
+            self.message(game=1000000),
+            self.message(game=41003.5),
+            self.message(game="41003"),
+            self.message(game=True),
+            self.message(channel="x" * (app.FEEDBACK_CHANNEL_MAX + 1)),
+            self.message(channel="LIVE\nPTU"),
+            self.message(os="macos"),
+            self.message(os="Windows"),
+            ["No list."],
+            "No list.",
+        ]
+        for body in bad:
+            code, answer = self.call("/v1/feedback", body, install=self.ONE)
+            self.assertEqual(code, 400, json.dumps(body)[:200])
+            self.assertFalse(answer["ok"])
+        raw = [b"{not json", b"", b"[" * 16000,
+               b'{"text": "No list.", "version": "3.0.4", "game": ' + b"1" * 5000 + b"}",    # too long to read
+               b'{"text": "No list. \xff", "version": "3.0.4"}',                            # not UTF-8
+               b'{"text": "No list. \\ud83d", "version": "3.0.4"}']                         # half an emoji
+        for body in raw:
+            self.assertEqual(self.call("/v1/feedback", raw=body, install=self.ONE)[0], 400, body[:60])
+        self.assertEqual(self.store.feedback_count(), 0)
+        today = self.today()
+        self.assertEqual(today["feedback:rejected"], len(bad) + len(raw))
+        self.assertEqual([today["feedback:rejected:" + field] for field in
+                          ("text", "name", "version", "game", "channel", "os", "message", "json")],
+                         [11, 4, 4, 5, 2, 2, 2, 5])
+        self.assertNotIn("rejected", today)
+        # the edges fit: 4000 characters, a name of 40
+        self.assertEqual(self.send_feedback(text="x" * app.FEEDBACK_TEXT_MAX, name="y" * app.FEEDBACK_NAME_MAX,
+                                            channel="z" * app.FEEDBACK_CHANNEL_MAX, game=999999,
+                                            install=self.ONE)[0], 201)
+        # ...as the first this hour: what was turned down did not count against the limit
+        self.assertEqual(self.send_feedback(install=self.ONE)[0], 429)
+
+    def test_feedback_of_the_wrong_kind_too_large_or_without_a_length(self):
+        self.assertEqual(self.call("/v1/feedback", self.message(), kind="text/plain")[0], 415)
+        self.assertEqual(self.call("/v1/feedback", raw=b"x" * (app.MAX_FEEDBACK_BODY + 1))[0], 413)
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        try:
+            connection.putrequest("POST", app.PREFIX + "/v1/feedback")
+            connection.putheader("Content-Type", "application/json")
+            connection.endheaders()
+            self.assertEqual(connection.getresponse().status, 411)
+        finally:
+            connection.close()
+        self.assertEqual(self.store.feedback_count(), 0)
+        # the largest message there is fits: 4000 characters of four bytes each, the name's 40 and the channel's 20
+        body = self.message(text="\U0001f44d" * app.FEEDBACK_TEXT_MAX, name="\U0001f680" * app.FEEDBACK_NAME_MAX,
+                            channel="\U0001f680" * app.FEEDBACK_CHANNEL_MAX, game=999999)
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.assertTrue(16000 < len(raw) <= app.MAX_FEEDBACK_BODY, len(raw))
+        self.assertEqual(self.call("/v1/feedback", raw=raw)[0], 201)
+        self.assertEqual(self.feedback_rows()[0]["text"], body["text"])
+
+    def test_feedback_has_limits_of_its_own(self):
+        self.assertEqual((app.FEEDBACK_PER_HOUR, app.FEEDBACK_PER_DAY, app.FEEDBACK_PER_DAY_ALL), (5, 20, 500))
+        self.feedback_limiter.per_hour = app.FEEDBACK_PER_HOUR
+        kept = self.message()
+        self.assertEqual(self.call("/v1/feedback", kept, address="192.0.2.1")[0], 201)
+        for _ in range(app.FEEDBACK_PER_HOUR - 1):
+            self.assertEqual(self.send_feedback(address="192.0.2.1")[0], 201)
+        self.assertEqual(self.send_feedback(address="192.0.2.1"),
+                         (429, {"ok": False, "error": "too many messages, try again later"}))
+        self.assertEqual(self.store.feedback_count(), app.FEEDBACK_PER_HOUR)       # nothing of it kept
+        self.assertEqual(self.send_feedback(address="192.0.2.2")[0], 201)
+        # one kept already, or one that does not fit the format, is answered as ever
+        self.assertEqual(self.call("/v1/feedback", kept, address="192.0.2.1")[0], 200)
+        self.assertEqual(self.send_feedback(address="192.0.2.1", text="")[0], 400)
+        # the readings' and the rocks' limits are others
+        self.assertEqual(self.send(address="192.0.2.1")[0], 201)
+        self.assertEqual(self.send_rocks([self.rock()], address="192.0.2.1")[0], 201)
+        today = self.today()
+        self.assertEqual(today["feedback:limited"], 1)
+        self.assertNotIn("limited", today)
+        self.assertNotIn("rocks:limited", today)
+        self.assertTrue(all(len(k) == 32 for k in self.feedback_limiter.seen))
+
+    def test_feedback_is_limited_by_the_day_and_for_everyone_together(self):
+        self.feedback_limiter.per_day = 3
+        for _ in range(3):
+            self.assertEqual(self.send_feedback(address="192.0.2.1")[0], 201)
+        self.assertEqual(self.send_feedback(address="192.0.2.1")[0], 429)
+        self.feedback_limiter.overall = 5
+        self.assertEqual(self.send_feedback(address="192.0.2.2")[0], 201)
+        self.assertEqual(self.send_feedback(address="192.0.2.3")[0], 201)
+        self.assertEqual(self.send_feedback(address="192.0.2.4")[0], 429)       # five from everyone
+        self.assertEqual(self.store.feedback_count(), 5)
+        self.assertEqual(self.today()["feedback:limited"], 2)
+        # ...and as time goes: two an hour, three a day, four from everyone
+        limiter = app.FeedbackLimiter(per_hour=2, per_day=3, overall=4)
+        self.assertTrue(limiter.allow("192.0.2.1", 1000))
+        self.assertTrue(limiter.allow("192.0.2.1", 1001))
+        self.assertFalse(limiter.allow("192.0.2.1", 1002))
+        self.assertTrue(limiter.allow("192.0.2.1", 4601))        # an hour on, the hour's two are let go
+        self.assertFalse(limiter.allow("192.0.2.1", 8300))       # ...the day's three not yet
+        self.assertTrue(limiter.allow("192.0.2.2", 8300))
+        self.assertFalse(limiter.allow("192.0.2.3", 8301))       # everyone's four
+        self.assertEqual(len(limiter.seen), 2)                   # one turned away leaves nothing behind
+        self.assertTrue(limiter.allow("192.0.2.1", 87401))       # a day after its first two
+        self.assertTrue(limiter.allow("192.0.2.3", 87402))
+
+    def test_health_counts_the_feedback(self):
+        self.send_feedback()
+        self.send_feedback(address="198.51.100.9")
+        self.send_feedback(text="")
+        code, answer = self.call("/v1/health")
+        self.assertEqual((code, answer["observations"], answer["rocks"], answer["feedback"]), (200, 0, 0, 2))
+
+    def test_the_feedback_is_for_the_operator_alone(self):
+        first = self.message(text="No list on the MOLE.\n\"Pilot seat\", 4.10.3; l\u00e4uft nicht \U0001f44d",
+                             name="Rockhound, Jr.")
+        second = {"text": "=1+1", "version": "3.0.3"}
+        self.assertEqual(self.call("/v1/feedback", first, install=self.ONE)[0], 201)
+        self.assertEqual(self.call("/v1/feedback", second, address="198.51.100.7")[0], 201)
+        self.assertEqual(self.get("/v1/feedback/export.csv", "198.51.100.7"),
+                         (404, {"ok": False, "error": "not found"}))
+        self.assertEqual(self.call("/v1/feedback")[0], 404)       # sent, not asked for
+        code, text = self.call("/v1/feedback/export.csv")
+        self.assertEqual(code, 200)
+        kept = self.feedback_rows()
+        # the newest first, each as it was sent
+        self.assertEqual(list(csv.reader(io.StringIO(text))), [
+            ["id", "received", "install", "name", "text", "version", "game", "channel", "os", "debug_size"],
+            ["2", app.utc_iso(kept[1]["received"]), "", "", "=1+1", "3.0.3", "", "", "", ""],
+            ["1", app.utc_iso(kept[0]["received"]), self.ONE, "Rockhound, Jr.", first["text"], "3.0.4", "41003",
+             "LIVE", "windows", ""]])
+        self.assertNotIn(kept[0]["source"], text)                   # never the token
+        self.assertEqual(self.today()["req:feedback-export"], 1)    # the one through nginx
+        # ...and the same from the command line
+        target = os.path.join(self.folder.name, "feedback.csv")
+        out = io.StringIO()
+        app.DB_PATH, was = self.store.path, app.DB_PATH
+        try:
+            with contextlib.redirect_stdout(out):
+                app.main(["--feedback-export", target])
+        finally:
+            app.DB_PATH = was
+        self.assertIn("2 messages written to", out.getvalue())
+        with open(target, encoding="utf-8", newline="") as f:
+            self.assertEqual(f.read(), text)
+
+    def test_the_admin_view_gets_the_newest_messages_and_how_many_came_in_by_day(self):
+        self.assertEqual(self.get("/v1/stats")[1]["feedback"],
+                         {"messages": [], "came_in": {}, "totals": {"messages": 0}})
+        first = self.message(text="No list on the MOLE.\nL\u00e4uft nicht \U0001f44d")
+        self.assertEqual(self.call("/v1/feedback", first, install=self.ONE)[0], 201)
+        self.assertEqual(self.call("/v1/feedback", {"text": "Thanks.", "version": "3.0.3"}, address="198.51.100.7")[0],
+                         201)
+        self.assertEqual(self.get("/v1/stats", "198.51.100.7")[0], 404)     # through nginx it is not there
+        code, stats = self.get("/v1/stats?days=7")
+        kept = self.feedback_rows()
+        day = app.utc_day(time.time())
+        self.assertEqual((code, stats["feedback"]), (200, {
+            "messages": [
+                {"id": 2, "received": kept[1]["received"], "install": None, "name": None, "text": "Thanks.",
+                 "version": "3.0.3", "game": None, "channel": None, "os": None, "debug_size": None},
+                {"id": 1, "received": kept[0]["received"], "install": self.ONE, "name": "Rockhound",
+                 "text": first["text"], "version": "3.0.4", "game": 41003, "channel": "LIVE", "os": "windows",
+                 "debug_size": None}],
+            "came_in": {day: {"messages": 2}}, "totals": {"messages": 2}}))
+        self.assertNotIn(kept[0]["source"], json.dumps(stats))      # never the token
+        self.assertEqual(stats["counters"][day]["feedback:accepted"], 2)
+        # a message from before the days asked for is listed, and counted with all of them only
+        db = sqlite3.connect(self.store.path)
+        try:
+            with db:
+                db.execute("UPDATE feedback SET received = received - 8 * 86400 WHERE id = 1")
+        finally:
+            db.close()
+        feedback = self.get("/v1/stats?days=7")[1]["feedback"]
+        self.assertEqual((len(feedback["messages"]), feedback["came_in"], feedback["totals"]),
+                         (2, {day: {"messages": 1}}, {"messages": 2}))
+        # ...and no more than the newest so many are listed
+        was = app.FEEDBACK_STATS_NEWEST
+        app.FEEDBACK_STATS_NEWEST = 1
+        try:
+            feedback = self.get("/v1/stats")[1]["feedback"]
+        finally:
+            app.FEEDBACK_STATS_NEWEST = was
+        self.assertEqual(([m["text"] for m in feedback["messages"]], feedback["totals"]),
+                         (["Thanks."], {"messages": 2}))
+
+    def test_a_message_keeps_no_address_and_loses_the_senders_token_after_two_days(self):
+        self.send_feedback(address="198.51.100.7", install=self.ONE)
+        self.send(address="198.51.100.7")
+        self.assertEqual(self.feedback_rows()[0]["source"], self.rows()[0]["source"])    # a reading's token
+        self.store.prune(self.now + 3600)
+        self.assertIsNotNone(self.feedback_rows()[0]["source"])
+        self.store.prune(self.now + 49 * 3600)
+        row = self.feedback_rows()[0]
+        self.assertIsNone(row["source"])
+        # the message stays, with the number and the name it came with
+        self.assertEqual((self.store.feedback_count(), row["install"], row["name"]), (1, self.ONE, "Rockhound"))
+        kept = b""
+        for path in (self.store.path, self.store.path + "-wal"):
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    kept += f.read()
+        self.assertNotIn(b"198.51.100", kept)
+
+    def test_feedback_and_readings_do_not_hold_each_other_back(self):
+        # an install held back for what it sent as rocks can still write
+        for _ in range(app.MISFITS_PER_HOUR):
+            self.assertEqual(self.send_rocks([self.rock()], install=self.ONE, v=2)[0], 400)
+        self.assertEqual(self.send_rocks([self.rock()], install=self.ONE)[0], 429)
+        self.assertEqual(self.send_feedback(install=self.ONE)[0], 201)
+        # ...and messages turned down hold back neither its rocks nor its readings
+        for _ in range(app.MISFITS_PER_HOUR + 1):
+            self.assertEqual(self.send_feedback(address="198.51.100.9", install=self.OTHER, text="")[0], 400)
+        self.assertEqual(self.send_rocks([self.rock()], address="198.51.100.9", install=self.OTHER)[0], 201)
+        self.assertEqual(self.send(address="198.51.100.9", install=self.OTHER)[0], 201)
+        today = self.today()
+        self.assertEqual((today["rocks:held"], today["feedback:rejected"], today["feedback:accepted"]),
+                         (1, app.MISFITS_PER_HOUR + 1, 1))
+        self.assertNotIn("held", today)
+
+    def test_a_database_from_before_the_feedback_gets_its_table(self):
+        self.send()
+        self.send_rocks([self.rock()])
+        db = sqlite3.connect(self.store.path)
+        try:
+            with db:
+                db.execute("DROP TABLE feedback")
+        finally:
+            db.close()
+        app.Store(self.store.path)
+        self.assertEqual(self.send_feedback()[0], 201)
+        self.assertEqual((self.store.count(), self.store.rock_count(), self.store.feedback_count()), (1, 1, 1))
+
+    # ---------------------------------------------------------------- a bug report's debug folder
+
+    def zipped(self, files=None):
+        # a debug folder as Bedrock zips it: logs, and a picture, which does not pack
+        files = files or {"debug/session.txt": b"Bedrock 3.0.4\r\n", "debug/scan_log.csv": b"12:00:01,MOLE\r\n" * 200,
+                          "debug/snapshot_1.png": os.urandom(3000)}
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+            for name, data in files.items():
+                z.writestr(name, data)
+        return out.getvalue()
+
+    def ticket(self, data, address="203.0.113.1", install=None):
+        # a bug report that says its zip follows: the message's number and the token the answer gave
+        code, answer = self.call("/v1/feedback", self.message(debug=len(data)), address=address, install=install)
+        self.assertEqual((code, sorted(answer)), (201, ["id", "ok", "stored", "upload"]))
+        return answer["id"], answer["upload"]
+
+    def upload(self, number, token, data=None, kind="application/zip", address="203.0.113.1", length=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        try:
+            connection.putrequest("POST", "%s/v1/feedback/%s/debug" % (app.PREFIX, number))
+            connection.putheader("Content-Type", kind)
+            connection.putheader("X-Real-IP", address)
+            if token:
+                connection.putheader("X-Bedrock-Upload", token)
+            if data is not None or length is not None:
+                connection.putheader("Content-Length", str(len(data) if length is None else length))
+            connection.endheaders(data)
+            answer = connection.getresponse()
+            return answer.status, json.loads(answer.read().decode("utf-8"))
+        finally:
+            connection.close()
+
+    def zips(self):
+        folder = os.path.join(self.folder.name, "feedback")
+        return sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+
+    def test_a_bug_reports_debug_folder_comes_in_as_a_zip(self):
+        data = self.zipped()
+        code, answer = self.call("/v1/feedback", self.message(debug=len(data)), install=self.ONE)
+        self.assertEqual((code, sorted(answer), answer["ok"], answer["stored"], answer["id"]),
+                         (201, ["id", "ok", "stored", "upload"], True, True, 1))
+        self.assertRegex(answer["upload"], r"^[0-9a-f]{32}\Z")
+        # only the token's sha256 is kept, and for an hour
+        row = self.feedback_rows()[0]
+        self.assertEqual(row["upload_hash"], hashlib.sha256(answer["upload"].encode()).hexdigest())
+        self.assertTrue(self.now + 3600 <= row["upload_until"] <= time.time() + 3601)
+        self.assertEqual((row["debug_size"], row["debug_sha256"], row["debug_received"]), (None, None, None))
+        files = b""
+        for path in (self.store.path, self.store.path + "-wal"):
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    files += f.read()
+        self.assertNotIn(answer["upload"].encode(), files)
+        self.assertEqual(self.zips(), [])
+        self.assertEqual(self.upload(1, answer["upload"], data), (201, {"ok": True, "stored": True}))
+        # byte for byte, beside the database
+        self.assertEqual(self.zips(), ["1.zip"])
+        kept = os.path.join(self.folder.name, "feedback", "1.zip")
+        with open(kept, "rb") as f:
+            self.assertEqual(f.read(), data)
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(os.stat(kept).st_mode), 0o600)
+        row = self.feedback_rows()[0]
+        self.assertEqual((row["debug_size"], row["debug_sha256"], row["upload_hash"], row["upload_until"]),
+                         (len(data), hashlib.sha256(data).hexdigest(), None, None))
+        self.assertTrue(self.now <= row["debug_received"] <= time.time() + 1)
+        today = self.today()
+        self.assertEqual((today["req:feedback"], today["req:feedback-debug"], today["debug:offered"],
+                          today["debug:accepted"]), (1, 1, 1, 1))
+        # a message that says nothing of a zip is answered as ever
+        self.assertEqual(self.send_feedback(), (201, {"ok": True, "stored": True}))
+        self.assertEqual(self.send_feedback(debug=0), (201, {"ok": True, "stored": True}))
+        self.assertEqual(self.send_feedback(debug=None), (201, {"ok": True, "stored": True}))
+        # ...and whoever runs the service copies the zip out
+        target = os.path.join(self.folder.name, "out.zip")
+        out = io.StringIO()
+        app.DB_PATH, was = self.store.path, app.DB_PATH
+        try:
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(app.main(["--feedback-debug", "1", target]), 0)
+                self.assertEqual(app.main(["--feedback-debug", "2", target + ".none"]), 1)
+        finally:
+            app.DB_PATH = was
+        self.assertIn("%d bytes written to" % len(data), out.getvalue())
+        self.assertIn("message 2 has no debug folder", out.getvalue())
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), data)
+        self.assertFalse(os.path.exists(target + ".none"))
+
+    def fetch(self, path, address=None, method="GET"):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        try:
+            connection.putrequest(method, app.PREFIX + path)
+            if address:
+                connection.putheader("X-Real-IP", address)
+            connection.endheaders()
+            answer = connection.getresponse()
+            return answer.status, dict(answer.getheaders()), answer.read()
+        finally:
+            connection.close()
+
+    def test_the_operator_gets_a_zip_back_from_inside_only(self):
+        data = self.zipped()
+        number, token = self.ticket(data)
+        self.assertEqual(self.upload(number, token, data), (201, {"ok": True, "stored": True}))
+        path = "/v1/feedback/%d/debug.zip" % number
+        code, headers, body = self.fetch(path)
+        self.assertEqual((code, headers["Content-Type"], int(headers["Content-Length"]), body),
+                         (200, "application/zip", len(data), data))
+        self.assertEqual(headers["Content-Disposition"], 'attachment; filename="bedrock-feedback-%d.zip"' % number)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        code, headers, body = self.fetch(path, method="HEAD")
+        self.assertEqual((code, int(headers["Content-Length"]), body), (200, len(data), b""))
+        # through nginx it is not there, and that is all it says
+        code, _, body = self.fetch(path, address="203.0.113.9")
+        self.assertEqual((code, json.loads(body)), (404, {"ok": False, "error": "not found"}))
+        self.assertEqual(self.today()["req:feedback-debug-zip"], 1)
+        # a message without one, and no message
+        code, answer = self.send_feedback(address="203.0.113.5")
+        self.assertEqual(code, 201)
+        none = (404, {"ok": False, "error": "no debug folder"})
+        for other in (number + 1, 99):
+            code, _, body = self.fetch("/v1/feedback/%d/debug.zip" % other)
+            self.assertEqual((code, json.loads(body)), none)
+        for wrong in ("/v1/feedback/0/debug.zip", "/v1/feedback/x/debug.zip", "/v1/feedback/1/debug.zip/"):
+            code, _, body = self.fetch(wrong)
+            self.assertEqual((code, json.loads(body)), (404, {"ok": False, "error": "not found"}))
+        # gone with its 90 days, it is not handed out either
+        self.store.prune(int(time.time()) + app.FEEDBACK_DEBUG_DAYS * 86400 + 1)
+        code, _, body = self.fetch(path)
+        self.assertEqual((code, json.loads(body)), none)
+
+    def test_a_zip_comes_in_with_the_token_its_message_was_answered_with(self):
+        data = self.zipped()
+        number, token = self.ticket(data)
+        other, others = self.ticket(data)
+        wrong = (403, {"ok": False, "error": "the token does not fit, was used or holds no longer"})
+        self.assertEqual(self.upload(number, "0" * 32, data), wrong)
+        self.assertEqual(self.upload(number, None, data), wrong)
+        self.assertEqual(self.upload(number, "not a token", data), wrong)
+        self.assertEqual(self.upload(number, others, data), wrong)                  # another message's
+        self.assertEqual(self.upload(99, token, data), (404, {"ok": False, "error": "no such message"}))
+        # it holds for an hour
+        db = sqlite3.connect(self.store.path)
+        try:
+            with db:
+                db.execute("UPDATE feedback SET upload_until = ? WHERE id = ?", (int(time.time()) - 1, other))
+        finally:
+            db.close()
+        self.assertEqual(self.upload(other, others, data), wrong)
+        # ...and for one try: a zip turned down has used it up
+        self.assertEqual(self.upload(number, token, b"PK\x03\x04 and no zip after it")[0], 400)
+        self.assertEqual(self.upload(number, token, data), wrong)
+        self.assertEqual((self.zips(), self.call("/v1/health")[1]["feedback_debug"]), ([], 0))
+        self.assertEqual(self.today()["debug:denied"], 7)
+        # none of it counts against the address, as readings that do not fit would
+        for _ in range(app.MISFITS_PER_HOUR + 1):
+            self.assertEqual(self.upload(number, "f" * 32, data, address="198.51.100.9")[0], 403)
+        self.assertEqual(self.send(address="198.51.100.9")[0], 201)
+        self.assertEqual(self.send_rocks([self.rock()], address="198.51.100.9")[0], 201)
+
+    def test_a_zip_too_large_is_turned_down_before_it_is_read(self):
+        data = self.zipped()
+        number, token = self.ticket(data)
+        # by the length it says: nothing of it was sent, and the answer came
+        self.assertEqual(self.upload(number, token, length=app.FEEDBACK_DEBUG_MAX + 1),
+                         (413, {"ok": False, "error": "too large"}))
+        self.assertEqual(self.upload(number, token)[0], 411)
+        self.assertEqual(self.upload(number, token, data, kind="application/json"),
+                         (415, {"ok": False, "error": "send application/zip"}))
+        was = app.FEEDBACK_DEBUG_MAX
+        try:
+            app.FEEDBACK_DEBUG_MAX = len(data) - 1
+            self.assertEqual(self.upload(number, token, length=len(data))[0], 413)
+            # ...and none of them used the token up: at the most a zip may be, it is kept
+            app.FEEDBACK_DEBUG_MAX = len(data)
+            self.assertEqual(self.upload(number, token, data)[0], 201)
+        finally:
+            app.FEEDBACK_DEBUG_MAX = was
+        self.assertEqual(self.zips(), ["1.zip"])
+
+    def test_what_is_no_debug_folder_is_turned_down(self):
+        good = self.zipped()
+        body = self.message(debug=len(good))
+
+        def sent(data):
+            # the same report again: each try needs a token of its own
+            answer = self.call("/v1/feedback", body)[1]
+            return self.upload(answer["id"], answer["upload"], data)
+
+        def named(name):
+            # a zip with a file of that name, written as it is - a Windows zip may use backslashes
+            mark = "debug/" + "x" * (len(name) - 6)
+            return self.zipped({"debug/session.txt": b"ok", mark: b"x"}).replace(mark.encode(), name.encode())
+
+        directory = good.index(b"PK\x01\x02")
+        bad = {
+            "zip": [b"", b"not a zip at all", b"\x89PNG\r\n\x1a\n" + os.urandom(500),
+                    b"PK\x05\x06" + b"\x00" * 18,                                    # an empty zip
+                    b"MZ" + good,                                                   # something before it
+                    good[:len(good) // 2],                                          # half of one
+                    good[:directory] + b"\x00" * (len(good) - directory)],          # no directory at its end
+            "name": [named("../outside.txt"), named("debug/../../outside.txt"), named("debug\\..\\outside.txt"),
+                     named("/etc/cron.d/outside"), named("\\\\server\\share\\outside"),
+                     named("C:/Windows/outside.dll"), named("c:\\Windows\\outside.dll"), named("C:outside.dll")],
+            # its directory says two gigabytes, which nobody unpacks to see
+            "size": [good[:directory + 24] + (0x7FFFFFFF).to_bytes(4, "little") + good[directory + 28:]],
+        }
+        for why, zips in bad.items():
+            for data in zips:
+                code, answer = sent(data)
+                self.assertEqual((code, answer["ok"]), (400, False), (why, data[:40]))
+        # ...nor one with more files than a debug folder has
+        was = app.FEEDBACK_DEBUG_ENTRIES
+        try:
+            app.FEEDBACK_DEBUG_ENTRIES = 3
+            self.assertEqual(sent(self.zipped({"debug/%d.txt" % i: b"x" for i in range(4)}))[0], 400)
+            self.assertEqual(sent(b"PK\x03\x04" + b"PK\x01\x02" * 31)[0], 400)      # not even read as a zip
+            self.assertEqual(sent(self.zipped({"debug/%d.txt" % i: b"x" for i in range(3)}))[0], 201)
+        finally:
+            app.FEEDBACK_DEBUG_ENTRIES = was
+        today = self.today()
+        self.assertEqual([today["debug:rejected:" + why] for why in ("zip", "name", "size", "entries")],
+                         [len(bad["zip"]), len(bad["name"]), 1, 2])
+        self.assertEqual(today["debug:rejected"], len(bad["zip"]) + len(bad["name"]) + 3)
+        # only the last was kept, and nothing of the others is left
+        self.assertEqual((self.zips(), self.store.feedback_count()), (["1.zip"], 1))
+
+    def test_an_address_sends_three_zips_a_day(self):
+        self.assertEqual((app.FEEDBACK_DEBUG_MAX, app.FEEDBACK_DEBUG_PER_DAY, app.FEEDBACK_DEBUG_TOTAL,
+                          app.FEEDBACK_DEBUG_DAYS, app.FEEDBACK_UPLOAD_MINUTES),
+                         (32 * 1024 * 1024, 3, 2 * 1024 ** 3, 90, 60))
+        limit = app.debug_limit()
+        self.assertEqual((limit.per_hour, limit.per_day), (3, 3))
+        self.debug_limiter.per_hour = self.debug_limiter.per_day = app.FEEDBACK_DEBUG_PER_DAY
+        data = self.zipped()
+        for _ in range(app.FEEDBACK_DEBUG_PER_DAY):
+            number, token = self.ticket(data, address="192.0.2.1")
+            self.assertEqual(self.upload(number, token, data, address="192.0.2.1")[0], 201)
+        # the fourth report is kept, its zip is not taken - nor when it asks again
+        body = self.message(debug=len(data))
+        self.assertEqual(self.call("/v1/feedback", body, address="192.0.2.1"),
+                         (201, {"ok": True, "stored": True, "debug": "refused"}))
+        self.assertEqual(self.call("/v1/feedback", body, address="192.0.2.1"),
+                         (200, {"ok": True, "stored": False, "debug": "refused"}))
+        self.assertEqual(self.ticket(data, address="192.0.2.2")[0], 5)
+        self.assertEqual((self.store.feedback_count(), self.store.debug_count()), (5, 3))
+        today = self.today()
+        self.assertEqual((today["debug:offered"], today["debug:refused"]), (4, 2))
+        self.assertTrue(all(len(k) == 32 for k in self.debug_limiter.seen))         # no address in it
+
+    def test_the_zips_kept_have_a_limit_together(self):
+        data = self.zipped()
+        was = app.FEEDBACK_DEBUG_TOTAL
+        try:
+            app.FEEDBACK_DEBUG_TOTAL = 2 * len(data) + 10
+            first, second, third = self.ticket(data), self.ticket(data), self.ticket(data)
+            self.assertEqual(self.upload(*first, data)[0], 201)
+            self.assertEqual(self.upload(*second, data)[0], 201)
+            # no room for a third: it is not kept, and no other is asked for
+            self.assertEqual(self.upload(*third, data), (507, {"ok": False, "error": "no room for it"}))
+            self.assertEqual(self.call("/v1/feedback", self.message(debug=len(data))),
+                             (201, {"ok": True, "stored": True, "debug": "refused"}))
+            self.assertEqual(self.zips(), ["1.zip", "2.zip"])
+            # ...with room again, the token still holds
+            app.FEEDBACK_DEBUG_TOTAL = 3 * len(data)
+            self.assertEqual(self.upload(*third, data)[0], 201)
+        finally:
+            app.FEEDBACK_DEBUG_TOTAL = was
+        self.assertEqual((self.store.debug_count(), self.today()["debug:full"]), (3, 1))
+
+    def test_a_zip_that_may_not_come_is_refused_and_its_message_kept(self):
+        self.assertEqual(self.call("/v1/feedback", self.message(debug=app.FEEDBACK_DEBUG_MAX + 1)),
+                         (201, {"ok": True, "stored": True, "debug": "refused"}))
+        self.assertIsNone(self.feedback_rows()[0]["upload_hash"])
+        self.assertIn("upload", self.call("/v1/feedback", self.message(debug=app.FEEDBACK_DEBUG_MAX))[1])
+        # what is no size is a message that does not fit the format
+        for size in (-1, 1.5, "4096", True, [4096], 2 ** 60):
+            self.assertEqual(self.send_feedback(debug=size)[0], 400, size)
+        self.assertEqual((self.store.feedback_count(), self.today()["feedback:rejected:debug"]), (2, 6))
+
+    def test_the_same_report_again_gets_another_token_until_its_zip_is_kept(self):
+        data = self.zipped()
+        body = self.message(debug=len(data))
+        first = self.call("/v1/feedback", body, install=self.ONE)[1]
+        code, again = self.call("/v1/feedback", body, install=self.ONE)
+        self.assertEqual((code, sorted(again), again["stored"], again["id"]),
+                         (200, ["id", "ok", "stored", "upload"], False, first["id"]))
+        self.assertNotEqual(again["upload"], first["upload"])
+        # the token given before holds no longer
+        self.assertEqual(self.upload(first["id"], first["upload"], data)[0], 403)
+        self.assertEqual(self.upload(first["id"], again["upload"], data)[0], 201)
+        # with its zip kept, the message takes no other
+        self.assertEqual(self.call("/v1/feedback", body, install=self.ONE),
+                         (200, {"ok": True, "stored": False, "debug": "stored"}))
+        self.assertEqual(self.upload(first["id"], again["upload"], data),
+                         (409, {"ok": False, "error": "it has its debug folder already"}))
+        # ...and one sent without, then again as a bug report, gets its zip after all
+        plain = self.message()
+        self.assertEqual(self.call("/v1/feedback", plain), (201, {"ok": True, "stored": True}))
+        code, answer = self.call("/v1/feedback", dict(plain, debug=len(data)))
+        self.assertEqual((code, answer["stored"], answer["id"]), (200, False, 2))
+        self.assertEqual(self.upload(2, answer["upload"], data)[0], 201)
+        self.assertEqual((self.store.feedback_count(), self.zips()), (2, ["1.zip", "2.zip"]))
+        today = self.today()
+        self.assertEqual((today["debug:offered"], today["debug:stored"], today["debug:accepted"]), (3, 1, 2))
+
+    def test_a_zip_goes_after_ninety_days_and_its_message_stays(self):
+        data = self.zipped()
+        number, token = self.ticket(data, install=self.ONE)
+        self.assertEqual(self.upload(number, token, data)[0], 201)
+        self.ticket(data)                                    # a token that is never used
+        left = os.path.join(self.folder.name, "feedback", "upload-left.part")
+        with open(left, "wb") as f:                          # what a zip left on its way in, the service stopped
+            f.write(data[:100])
+        self.store.prune(self.now + 1800)
+        self.assertEqual(self.zips(), ["1.zip", "upload-left.part"])
+        self.assertIsNotNone(self.feedback_rows()[1]["upload_hash"])
+        # an hour on, the token holds no more and what was left is cleared away
+        self.store.prune(self.now + 2 * 3600)
+        self.assertEqual(self.zips(), ["1.zip"])
+        row = self.feedback_rows()[1]
+        self.assertEqual((row["upload_hash"], row["upload_until"]), (None, None))
+        self.store.prune(self.now + (app.FEEDBACK_DEBUG_DAYS - 1) * 86400)
+        self.assertEqual((self.zips(), self.store.debug_count()), (["1.zip"], 1))
+        self.store.prune(self.now + (app.FEEDBACK_DEBUG_DAYS + 1) * 86400)
+        self.assertEqual((self.zips(), self.store.debug_count()), ([], 0))
+        row = self.feedback_rows()[0]
+        self.assertEqual((row["debug_size"], row["debug_sha256"], row["debug_received"]), (None, None, None))
+        self.assertEqual((self.store.feedback_count(), row["install"], row["name"]), (2, self.ONE, "Rockhound"))
+        self.assertEqual(self.call("/v1/health")[1]["feedback_debug"], 0)
+
+    def test_a_feedback_table_from_before_the_debug_folders_gets_their_columns(self):
+        path = os.path.join(self.folder.name, "before.db")
+        db = sqlite3.connect(path)
+        try:
+            with db:
+                db.execute("CREATE TABLE feedback (id INTEGER PRIMARY KEY, received INTEGER NOT NULL, source TEXT,"
+                           " install TEXT, name TEXT, text TEXT NOT NULL, version TEXT NOT NULL, game INTEGER,"
+                           " channel TEXT, os TEXT)")
+                db.execute("INSERT INTO feedback (received, text, version) VALUES (?, 'From before.', '3.0.3')",
+                           (self.now,))
+        finally:
+            db.close()
+        app.Store(path)
+        store = app.Store(path)                              # ...and the start after finds them there
+        db = sqlite3.connect(path)
+        try:
+            columns = [row[1] for row in db.execute("PRAGMA table_info(feedback)")]
+            indexes = {row[1] for row in db.execute("PRAGMA index_list(feedback)")}
+        finally:
+            db.close()
+        self.assertEqual(columns[-5:], ["debug_size", "debug_sha256", "debug_received", "upload_hash", "upload_until"])
+        self.assertEqual(len(columns), 15)
+        self.assertTrue({"feedback_debug", "feedback_upload"} <= indexes)
+        self.assertEqual((store.feedback_count(), store.debug_count()), (1, 0))
+        # the message from before can get its zip
+        token, why = store.debug_ticket(1, 1000, self.now, lambda: True)
+        self.assertEqual((len(token), why), (32, None))
+        self.assertIsNone(store.debug_claim(1, token, 1000, self.now))
+        self.assertEqual(store.debug_claim(1, token, 1000, self.now), "token")
+
+    def test_health_counts_the_zips(self):
+        data = self.zipped()
+        self.assertEqual(self.call("/v1/health")[1]["feedback_debug"], 0)
+        number, token = self.ticket(data)
+        self.ticket(data)
+        self.assertEqual(self.upload(number, token, data)[0], 201)
+        answer = self.call("/v1/health")[1]
+        self.assertEqual((answer["feedback"], answer["feedback_debug"]), (2, 1))
+
+    def test_the_operator_sees_which_message_brought_a_zip(self):
+        data = self.zipped()
+        number, token = self.ticket(data, install=self.ONE)
+        self.assertEqual(self.upload(number, token, data)[0], 201)
+        pending = self.ticket(data, address="198.51.100.7")[1]
+        code, text = self.call("/v1/feedback/export.csv")
+        rows = list(csv.reader(io.StringIO(text)))
+        self.assertEqual((code, rows[0][0], rows[0][-1]), (200, "id", "debug_size"))
+        self.assertEqual([(row[0], row[-1]) for row in rows[1:]], [("2", ""), ("1", str(len(data)))])
+        code, stats = self.get("/v1/stats")
+        self.assertEqual([(m["id"], m["debug_size"]) for m in stats["feedback"]["messages"]],
+                         [(2, None), (1, len(data))])
+        # neither says a token or its sha256
+        for told in (text, json.dumps(stats)):
+            self.assertNotIn(pending, told)
+            self.assertNotIn(self.feedback_rows()[1]["upload_hash"], told)
+        # ...through nginx neither is there, and no route hands out a zip
+        self.assertEqual(self.get("/v1/feedback/export.csv", "198.51.100.7")[0], 404)
+        self.assertEqual(self.get("/v1/stats", "198.51.100.7")[0], 404)
+        self.assertEqual(self.get("/v1/feedback/1/debug")[0], 404)
+        self.assertEqual(self.get("/v1/feedback/1/debug", "198.51.100.7")[0], 404)
+        self.assertEqual(self.get("/v1/feedback/1.zip")[0], 404)
 
 
 if __name__ == "__main__":

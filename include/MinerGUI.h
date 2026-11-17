@@ -31,6 +31,8 @@
 #include "NoteBook.h"
 #include "Plugins.h"
 #include "Reputation.h"
+#include "Feedback.h"
+#include "TextField.h"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "dwmapi.lib")
@@ -130,12 +132,10 @@ public:
     // The ore the Ore Finder's UEX tab shows the marketplace for; "" while it shows none
     std::string uexMarketWanted() const;
     // The shops that sell the mining gear - laser heads, modules, gadgets -
-    // as UEX lists them (WhereToBuy.h). Whether the lists are wanted: UEX is
-    // only asked for them while the Gear page is up.
-    bool gearListsWanted() const { return gearListsWanted_; }
-    // ...the lists that came - null while none has - and what went wrong the
-    // last time they were asked for ("" when nothing did); the Gear page
-    // drawn anew with them
+    // as UEX lists them (WhereToBuy.h), asked for from the start: the lists
+    // that came - null while none has - and what went wrong the last time
+    // they were asked for ("" when nothing did); the Gear page drawn anew
+    // with them
     void setGearShops(std::shared_ptr<const UexShops> shops, const std::string& note) {
         gearShops_ = std::move(shops);
         gearShopsNote_ = note;
@@ -290,12 +290,44 @@ public:
     void showPluginPage(const std::string& id);
 
     // ---- the rail: the full window's pages and tools, down its left ----
-    // Scan, Gear, Datarunner, Plugins and each plugin are pages of the main
-    // window; the others open their windows. Not in the overlay, nor in a
-    // phone's picture of the window.
-    enum class RailItem { Scan, Datarunner, Refinery, Finder, Blueprints, Notes, Plugin, Plugins, Settings, Gear };
+    // Scan, Gear, Datarunner, Feedback, Plugins and each plugin are pages of
+    // the main window; the others open their windows. Not in the overlay,
+    // nor in a phone's picture of the window.
+    enum class RailItem {
+        Scan, Datarunner, Refinery, Finder, Blueprints, Notes, Plugin, Plugins, Settings, Gear, Feedback
+    };
     // ...a click on one, for a picture (`id`: the plugin's)
     void railPickForShot(RailItem item, const std::string& id = "") { railPick(item, id); }
+
+    // ---- the Feedback page: a message for the developer (Feedback.h) ----
+    // Whether the build carries the service's address - the rail has the
+    // page's entry only then -, the game's version as a message carries it
+    // (41003; 0 not known) and whether the installation number goes along
+    void setFeedback(bool available, int gameVersion, bool installSent);
+    // Send clicked: the message and the name as typed, UTF-8, and whether
+    // the debug folder goes along (the page's tick). What came of it comes
+    // back through feedbackAnswered.
+    using FeedbackCallback = std::function<void(const std::string& text, const std::string& name, bool debugFolder)>;
+    void setFeedbackCallback(FeedbackCallback callback) { onFeedback_ = std::move(callback); }
+    // How far the debug folder's upload is: its bytes out and its size, 0
+    // before it starts. The page is drawn again where the MB it shows change.
+    void feedbackProgress(std::int64_t sent, std::int64_t total);
+    // What came of it: the message's status (0 where no answer came) and its
+    // debug folder's
+    void feedbackAnswered(const Feedback::Result& result);
+    // --screenshot only: the page's fields and state for a picture, nothing
+    // sent - what is typed, which field has the caret (0 none, 1 the
+    // message, 2 the name), and the state: 0 nothing sent, 1 sending, 2
+    // answered with `status`. The tick on, no debug folder's state.
+    void feedbackForShot(const std::wstring& text, const std::wstring& name, int typing, int state, int status);
+    // ...then the tick, and the debug folder's state: what came of it
+    // (answered) or how far its upload is (sending; `total` 0: not begun) -
+    // nothing picked, nothing sent
+    void feedbackDebugForShot(bool attach, Feedback::DebugOutcome debug, int debugStatus, std::int64_t sent,
+                              std::int64_t total);
+    // ...and what the fields hold, where the caret stands and what is
+    // marked, as one line of text
+    std::string feedbackStateForShot() const;
     void paintPluginsTo(HDC hdc);
     // ...a plugin's window for a picture: cards open, a tab and chip
     // picked, a search typed - nothing saved
@@ -419,10 +451,8 @@ public:
     std::wstring nameEntryForShot() const { return nameEntry_; }
     void stopRenameForShot() { endNameEditing(false); }   // ...and let go, the name as it was
     void showLoadoutForShot(bool open) { showLoadout(open); }
-    // The gear's shop lists wanted, as a page showing them wants them
-    // (gearListsWanted) - and what the GUI holds of them and of the player's
-    // place, as such a page would read it
-    void wantGearListsForShot(bool wanted) { gearListsWanted_ = wanted; }
+    // What the GUI holds of the gear's shop lists and of the player's place,
+    // as the Gear page would read it
     std::shared_ptr<const UexShops> gearShopsForShot() const { return gearShops_; }
     std::string whereAtForShot() const { return whereSystem_ + " - " + wherePlace_; }
     // The Gear page for a picture: its list (0 laser heads, 1 modules, 2
@@ -475,6 +505,10 @@ public:
     // The ship Game.log names, shown in the header; "" clears it. hull: which
     // one of its kind, when the log has said (GameState::hull), "" when not
     void setShip(const std::string& label, bool inSeat, const std::string& hull = "");
+    // The ship the scan panels show the player in, where the log has no seat
+    // to say it (PanelShipWitness): that ship's fit, as it was left - unless
+    // the chosen fit is of that kind already
+    void shipSeenOnHud(const MiningShip& kind);
     // A hull the log says was destroyed with the player in it (GameState::lostHulls)
     void shipLost(const std::string& hull);
     // What the mining HUD of a one-seat ship shows fitted (LoadoutReader):
@@ -635,6 +669,11 @@ public:
     using RankSetCallback = std::function<void(int, int, int)>;
     void setRankSetCallback(RankSetCallback callback) { rankSetCallback_ = callback; }
     void grindOpenOnlyForShot(bool on);   // --screenshot only: "Open to me" pressed
+    // ...FROM held to these outfits, their chips showing or not
+    void grindFromForShot(const std::vector<std::string>& outfits, bool open);
+    // ...and FROM held to one outfit: what is wrong with the list it leaves
+    // (a set it does not feed, a mission of another outfit), "" when nothing
+    std::string grindFromCheckForShot(const std::string& outfit);
     // The contracts of the moment, off the game's log: the ones taken and not
     // over - the player's own, or shared with them - and the ones of their
     // own finished lately. A gathering order among the running ones (Shubin's
@@ -848,6 +887,12 @@ public:
     // planHits_), or that hit clicked, where the window paints it now:
     // false when it paints no such hit, and the pointer off it then
     bool pointInPlannerForShot(int kind, const std::string& value, bool click);
+    // ...and the wheel turned over the list of places (or over the card),
+    // the way a real wheel's message comes: false where none is drawn
+    bool wheelPlannerForShot(bool places, int notches);
+    int plannerPlaceScrollForShot() const { return plannerPlaceScroll_; }
+    const std::string& plannerPlaceForShot() const { return plannerPlace_; }
+    const std::string& plannerSystemForShot() const { return plannerSystem_; }
     void suggestForShot();       // ...and the suggestion list, which only
     HWND suggestHandle() const { return notesSuggest_; }   // lives while typing
     // --screenshot only: `typed` added at the end of the open note, and the
@@ -1232,6 +1277,7 @@ private:
     std::vector<RailHit> railHits_;
     bool pluginPage_ = false;      // the plugins' page, or one plugin's, is up (pluginShown_)
     bool gearPage_ = false;        // the Gear page is up (showGearPage)
+    bool feedbackPage_ = false;    // the Feedback page is up (showFeedbackPage)
     bool phonePainting_ = false;   // the window drawn for a phone: as it was, without the rail
     // The window on screen, not the overlay nor a phone's picture: the rail
     // is up with Bedrock's mark at its head, the header holds the page's
@@ -1246,9 +1292,11 @@ private:
     // ...and the Gear page: beside the rail only - a phone's picture is the
     // scan page's
     bool gearPageUp() const { return gearPage_ && railShown(); }
+    // ...and the Feedback page
+    bool feedbackPageUp() const { return feedbackPage_ && railShown(); }
     void drawRail(Gdiplus::Graphics& g, int rw, int ch);
     void railPick(RailItem item, const std::string& id);
-    void toScanPage();   // a plugin's page or the Gear page left for the scan, typing let go
+    void toScanPage();   // a plugin's page, the Gear page or the Feedback page left for the scan, typing let go
     void railRepaint();  // a tool's window opened or shut: the rail shows it
     // A card drawn by the parent cannot cover a child window: the buttons
     // go under it (`on`) and come back as layoutControls has them
@@ -1409,7 +1457,9 @@ private:
     };
     GadgetWords gadgetWords() const;
     // The head off the shelf that would break a rock nothing on board holds
-    struct Suggestion { std::wstring line, note; bool good = false; };
+    // good: one head holds the rock; together: only several of them do, and
+    // the line names them
+    struct Suggestion { std::wstring line, note; bool good = false, together = false; };
     Suggestion headSuggestion() const;
     void drawCompactUpdateChip(Gdiplus::Graphics& g, int clientW, float leftOf);
     int  drawLocationCard(Gdiplus::Graphics& g, int clientW, int yPos, int clientH);
@@ -1529,13 +1579,40 @@ private:
     std::string plannerScrollList_;
     void showPlaceFinderFor(const std::string& place);
     void showSystemFinderFor(const std::string& system);
+    // The left column's two lists, as the Blueprints window has its two: the
+    // ores (By ore) or the places (By place, OrePlaces.h). A click on the
+    // card does not switch it - the card answers for whatever was clicked,
+    // and the list marks it where it has it.
+    bool plannerByPlace_ = false;
+    // The place picked in the list of places, kept while the card shows an
+    // ore, so the list's tab brings it back
+    std::string plannerPlacePick_;
+    // The list of places over all systems is longer than the column: its
+    // first row in view (a heading counts as a row), where it was drawn for
+    // the wheel, and whether the pick is to be brought into view on the
+    // next painting (after a tab or a link)
+    int plannerPlaceScroll_ = 0;
+    Gdiplus::RectF plannerPlaceList_;
+    bool plannerRevealPlace_ = false;
+    // The list opens on the player's own system with the place they are
+    // at picked, once for each place they come to: a tab clicked after
+    // that stays. The system and place it was last done for:
+    std::string plannerPresetFor_;
+    std::string plannerPresetKey() const;
+    bool presetPlannerPlaces();   // false where it had been done for this place
+    // The card on a place of the list on the tabs: the one shown if the
+    // list has it, else the one picked before, else where the player is,
+    // else the list's first
+    void settlePlannerPlace();
     // kind 0 ore, 1 system, 2 family, 3 tick box, 4 a link, 5 Report to UEX,
     // 6 the UEX tab, 7 a listing (its page), 8 a gem in the UEX tab, 9 the
     // listings' order ("price", "newest"), 10 a place in the list (what else
     // is mined there), 11 a ROC gem of a place and 12 a hand-mined one (the
     // places of that gem), 13 a family's arrow (its gems' list), 14 a gem in
     // that list ("" for all of them), 15 a field of the Aaron Halo's way in
-    // ("from", "to": its list of places), 16 a place in that list
+    // ("from", "to": its list of places), 16 a place in that list, 17 a place
+    // in the list of places on the left, 18 the left column's tabs ("ore",
+    // "place")
     struct PlanHit { Gdiplus::RectF rect; int kind; std::string value; };
     std::vector<PlanHit> planHits_;
     static LRESULT CALLBACK PlannerProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
@@ -1601,9 +1678,8 @@ private:
     };
     std::map<std::string, MarketEntry> uexMarket_;   // by ore
     std::shared_ptr<const UexThreads> uexThreads_;
-    // The gear's shops (gearListsWanted, setGearShops) and where the player
-    // is, to list them nearest first (setWhereAt)
-    bool gearListsWanted_ = false;
+    // The gear's shops (setGearShops) and where the player is, to list them
+    // nearest first (setWhereAt)
     std::shared_ptr<const UexShops> gearShops_;
     std::string gearShopsNote_;
     std::string wherePlace_, whereSystem_;
@@ -1628,6 +1704,70 @@ private:
     void showGearPage();
     void drawGearPage(Gdiplus::Graphics& g, int cw, int ch);
     void pressGear(HWND hwnd, float px, float py);
+
+    // The Feedback page (feedbackPage_): a message and a name typed into two
+    // fields the window paints itself (TextField.h), the debug folder's
+    // tick, Send, and what came of it. What is typed and the tick stay for
+    // the session, in memory only.
+    bool fbAvailable_ = false;     // the build carries the service's address: the rail has the entry
+    int fbGame_ = 0;               // the game's version as a message carries it; 0 not known
+    bool fbInstallSent_ = false;   // the installation number goes along
+    FeedbackCallback onFeedback_;
+    TextField fbText_{true, Feedback::TEXT_MOST};
+    TextField fbName_{false, Feedback::NAME_MOST};
+    int fbTyping_ = 0;             // the field with the caret: 1 the message, 2 the name; 0 neither
+    bool fbAttach_ = true;         // Attach debug folder: on at every start
+    enum class FeedbackState { Idle, Sending, Answered };
+    FeedbackState fbState_ = FeedbackState::Idle;
+    int fbStatus_ = 0;             // Answered: the status the service answered with
+    Feedback::DebugOutcome fbDebug_ = Feedback::DebugOutcome::None;   // ...what came of the debug folder
+    int fbDebugStatus_ = 0;        // ...and the status its upload was answered with
+    std::int64_t fbUpSent_ = 0;    // Sending: the debug folder's bytes out, and its size (0: not going up yet)
+    std::int64_t fbUpTotal_ = 0;
+    bool fbCaretOn_ = true;        // the caret's blink
+    bool fbCaretAtEnd_ = false;    // the caret at the end of a line broken inside a word, not at the next one's start
+    float fbGoalX_ = -1.0f;        // the arrows up and down keep to this place across lines
+    float fbScroll_ = 0.0f;        // how far down the message is scrolled
+    float fbNameScroll_ = 0.0f;    // ...and the name to the right
+    bool fbToCaret_ = false;       // the next painting brings the caret into view
+    bool fbDragging_ = false;      // the button held down in a field: the pointer marks
+    DWORD fbClickAt_ = 0;          // the last click in a field: when, where and the how-manieth in a row
+    POINT fbClickPlace_ = {0, 0};
+    int fbClicks_ = 0;
+    char32_t fbHalf_ = 0;          // the first half of a character Windows sends in two
+    // Where the page's pieces were drawn, in the page's pixels
+    Gdiplus::RectF fbTextRect_, fbNameRect_, fbTickRect_, fbSendRect_;
+    // The message's lines as last laid out, and what they were laid out for
+    std::vector<TextLine> fbLines_;
+    unsigned long long fbLinesOf_ = ~0ull;
+    float fbLinesRoom_ = -1.0f, fbLinesSize_ = -1.0f;
+    // A field has the caret and nothing lies over the page: every key is its own
+    bool feedbackTyping() const {
+        return feedbackPageUp() && fbTyping_ != 0 &&
+               !(keysOpen_ || aboutOpen_ || backupOpen_ || whatsNewOpen_ || uexWelcome_.step);
+    }
+    void showFeedbackPage();
+    void leaveFeedbackPage();
+    void drawFeedbackPage(Gdiplus::Graphics& g, int cw, int ch);
+    // A click, the pointer dragged with the button down, the wheel
+    void pressFeedback(HWND hwnd, float px, float py, bool shift);
+    void dragFeedback(HWND hwnd, float px, float py);
+    void wheelFeedback(HWND hwnd, int notches);
+    // A key and a character for the field with the caret; true where the
+    // field took it
+    bool feedbackKey(HWND hwnd, WPARAM key);
+    void feedbackChar(HWND hwnd, WPARAM c);
+    void sendFeedback();
+    // The field with the caret, the message's lines and where a field's text
+    // stands (1 the message, 2 the name)
+    TextField& feedbackField() { return fbTyping_ == 2 ? fbName_ : fbText_; }
+    const std::vector<TextLine>& feedbackLines(Gdiplus::Graphics& g, const Gdiplus::Font& font, float room);
+    Gdiplus::RectF feedbackInside(int field) const;
+    float feedbackPitch() const;
+    // The place in the message, or in the name, nearest to a point of the page
+    size_t feedbackPlaceAt(Gdiplus::Graphics& g, int field, float px, float py, bool& atEnd);
+    // The caret moved or the text changed: shown, and brought into view
+    void feedbackTouched(HWND hwnd, bool edited);
     // What a click on a row of Edit ship does to the head shown, for the
     // Gear page to do the same: a laser put on it (the crafted figure goes
     // aside with the one that leaves, the modules are trimmed to the new
@@ -1822,7 +1962,9 @@ private:
     POINT hoverGrind_ = {-1, -1};
     // 1 system chip, 2 a set, 3 the notice, 4 the finder, 5 a set the same
     // runs pay into, 6 a rank picked, 7 "Open to me", 8 back to the logs,
-    // 9 a pill in the rank line, (outfit << 8) | ladder
+    // 9 a pill in the rank line, (outfit << 8) | ladder, 10 FROM's "Any"
+    // (-1) or an outfit's chip (its place in grindFactionHits_), 11 FROM's
+    // second segment: the chips opened (1) or shut (0)
     struct GrindHit { Gdiplus::RectF rect; int kind; int value; };
     std::vector<GrindHit> grindHits_;
     // The ranks of one ladder, open under its pill: (outfit << 8) | ladder,
@@ -1840,6 +1982,17 @@ private:
     // "Open to me": only the sets with a mission the player is offered at
     // their rank with its outfit
     bool grindOpenOnly_ = false;
+    // FROM, as in the Blueprints window: the outfits the list is held to,
+    // any when empty, more than one at a time. A set one of them feeds
+    // stays, with their missions alone: two pools are fed by several
+    // outfits, the R97's by six. The chips under the row once asked for,
+    // the outfit with the most sets in the list first.
+    std::vector<std::string> grindFactions_;
+    std::vector<std::string> grindFactionHits_;   // what the outfit chips stand for
+    bool grindFactionPick_ = false;
+    // Whether a contract (a CRAFT_SOURCES row) counts under FROM: always
+    // with nothing picked, or with the list held to a card's set
+    bool grindFromHas(int source) const;
     // The player's standing on an outfit's ladder - what the logs say, or
     // the bottom of it with nothing behind it
     Standing standingOn(int faction, int ladder) const;
@@ -1899,8 +2052,9 @@ private:
     void drawGrindWarning(Gdiplus::Graphics& g, int cw, int ch);
 
     // `filtered` false: every set still holding something, whatever the
-    // finder says - for the count the header measures the finder against
-    std::vector<GrindSet> grindSets(bool filtered = true) const;
+    // finder says - for the count the header measures the finder against.
+    // `byOutfit` false: every filter but FROM, for the outfits it offers.
+    std::vector<GrindSet> grindSets(bool filtered = true, bool byOutfit = true) const;
     unsigned grindMask() const;
     int systemIAmIn() const;   // 1 Stanton, 2 Pyro, 3 Nyx, 0 nothing known
     bool createGrind();

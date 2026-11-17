@@ -3,6 +3,9 @@
 #include "DevSwitch.h"
 #include "LoadoutReader.h"
 #include "MiningHardware.h"
+#include "MiningLocations.h"
+#include "PanelFive.h"
+#include "RockScans.h"
 #include "ScanPanel.h"
 #include "TextLineReader.h"
 
@@ -167,7 +170,88 @@ bool qualityOfOre(const std::string& ore, int quality) {
     return bandOf(ore, quality) >= 0;
 }
 
-bool nameContentsByRock(const std::string& rockOre, RockContents& contents) {
+namespace {
+
+// Lines the quality alone leaves to two ores, named by the parts of the rock:
+// each part is one line at the most, at a quality its roll can come to -
+// lowestQualityBand to topQualityBand. A Hephaestanite rock's bulk at 330
+// could be Quartz by its value, but where Quartz has its own line at 522 it
+// is not. Where that still leaves two ways, the rock's weight decides: its
+// kg per SCU is 142.857 times its parts' densities by their shares, the
+// inert rest at 1.0, within a few per cent for each rock read so far, and the
+// bulk named the other ore is an eighth off.
+bool nameByParts(const std::vector<const RockPart*>& parts, const RockContents& contents, double kgPerScu,
+                 std::vector<std::string>& named) {
+    const size_t lines = contents.parts.size();
+    std::vector<std::vector<size_t>> fits(lines);
+    for (size_t i = 0; i < lines; i++) {
+        const RockPartRead& line = contents.parts[i];
+        if (line.inert || line.quality == 0) continue;
+        for (size_t p = 0; p < parts.size(); p++) {
+            const int band = bandOf(parts[p]->ore, line.quality);
+            if (band >= 0 && band >= lowestQualityBand(*parts[p]) && band <= topQualityBand(parts[p]->qualityScale)) {
+                fits[i].push_back(p);
+            }
+        }
+        if (fits[i].empty()) return false;
+    }
+    std::vector<std::vector<std::string>> ways;
+    std::vector<bool> taken(parts.size(), false);
+    std::vector<std::string> way(lines);
+    std::function<void(size_t)> place = [&](size_t i) {
+        if (ways.size() > 16) return;
+        if (i == lines) {
+            if (std::find(ways.begin(), ways.end(), way) == ways.end()) ways.push_back(way);
+            return;
+        }
+        if (fits[i].empty()) {   // the inert rest
+            way[i].clear();
+            place(i + 1);
+            return;
+        }
+        for (size_t p : fits[i]) {
+            if (taken[p]) continue;
+            taken[p] = true;
+            way[i] = parts[p]->ore;
+            place(i + 1);
+            taken[p] = false;
+        }
+    };
+    place(0);
+    if (ways.size() == 1) {
+        named = ways[0];
+        return true;
+    }
+    if (ways.empty() || kgPerScu <= 0) return false;
+    // Within 4 % - each ore's rocks shared so far weigh within 1 % of their
+    // parts as a rule, Savrilium's 2 % - and every other way 8 % off at the
+    // least. A small line of 3 % is not told apart that way: it moves the
+    // weight by under 1 %.
+    double best = 1e9, second = 1e9;
+    size_t at = 0;
+    for (size_t w = 0; w < ways.size(); w++) {
+        double density = 0;
+        for (size_t i = 0; i < lines; i++) {
+            density += contents.parts[i].percent / 100.0 * (ways[w][i].empty() ? 1.0 : oreDensity(ways[w][i]));
+        }
+        if (density <= 0) continue;
+        const double off = std::fabs(kgPerScu / (RockScans::KG_PER_SCU_AT_DENSITY_ONE * density) - 1.0);
+        if (off < best) {
+            second = best;
+            best = off;
+            at = w;
+        } else if (off < second) {
+            second = off;
+        }
+    }
+    if (best > 0.04 || second < 0.08) return false;
+    named = ways[at];
+    return true;
+}
+
+}  // namespace
+
+bool nameContentsByRock(const std::string& rockOre, RockContents& contents, double kgPerScu) {
     std::vector<const RockPart*> parts;
     for (int i = 0; i < ROCK_PART_COUNT; i++) {
         if (sameName(ROCK_PARTS[i].rock, rockOre)) parts.push_back(&ROCK_PARTS[i]);
@@ -181,9 +265,12 @@ bool nameContentsByRock(const std::string& rockOre, RockContents& contents) {
     // or a seventh Iron at 664 and the rest inert. So neither the order nor
     // the share says which line is what; the quality does, wherever the
     // rock's ores share no value - all but two kinds: Hephaestanite and
-    // Quartz, each the other's side ore, both begin at 330, and their lists
-    // are read by name. The line without a quality is the inert rest.
+    // Quartz, each the other's side ore, both begin at 330. Their lines at
+    // 330 are named by the parts the other lines took, or by the rock's
+    // weight (nameByParts); failing both, they are read by name. The line
+    // without a quality is the inert rest.
     std::vector<std::string> named(contents.parts.size());
+    bool twoOres = false;
     int rests = 0;
     for (size_t i = 0; i < contents.parts.size(); i++) {
         const RockPartRead& line = contents.parts[i];
@@ -194,12 +281,13 @@ bool nameContentsByRock(const std::string& rockOre, RockContents& contents) {
         for (const RockPart* part : parts) {
             const int band = bandOf(part->ore, line.quality);
             if (band < 0 || band > topQualityBand(part->qualityScale)) continue;
-            if (!named[i].empty() && !sameName(part->ore, named[i])) return false;   // two ores have that value
+            if (!named[i].empty() && !sameName(part->ore, named[i])) twoOres = true;   // two ores have that value
             named[i] = part->ore;
         }
         if (named[i].empty()) return false;
     }
     if (rests > 1) return false;
+    if (twoOres && !nameByParts(parts, contents, kgPerScu, named)) return false;
     for (size_t i = 0; i < contents.parts.size(); i++) {
         contents.parts[i].ore = named[i];
         contents.parts[i].inert = named[i].empty();
@@ -251,6 +339,7 @@ bool contentsHold(RockContents& contents) {
 }
 
 cv::Rect rockContentsRegion(const ScanPanel& panel, const cv::Size& frame) {
+    if (panel.labelGlyph == FIVE_PANEL) return fiveContentsRegion(panel, frame);
     if (panel.labels.x < 0 || panel.labelScale <= 0) return cv::Rect();
     const double u = panel.labelScale;
     const cv::Rect wanted(cv::Point((int)std::lround(panel.labels.x + REGION_LEFT * u), (int)std::lround(panel.labels.y + REGION_TOP * u)),
@@ -264,7 +353,8 @@ namespace {
 // region as white on black, and read off the picture itself. `edge` is the
 // labels' left edge in the region.
 bool readList(const cv::Mat& frame, const cv::Rect& region, const cv::Mat& ink, double u, int edge,
-              const std::string& rockOre, TextLineReader& lines, RockContents& out, const std::string& dumpAs) {
+              const std::string& rockOre, double kgPerScu, TextLineReader& lines, RockContents& out,
+              const std::string& dumpAs) {
     out = RockContents();
     auto done = [&](bool ok, const std::string& why) {
         if (!why.empty()) out.note = why;
@@ -663,7 +753,7 @@ bool readList(const cv::Mat& frame, const cv::Rect& region, const cv::Mat& ink, 
             out.whole = false;
             return false;
         };
-        if (!rockOre.empty() && nameContentsByRock(rockOre, out)) {
+        if (!rockOre.empty() && nameContentsByRock(rockOre, out, kgPerScu)) {
             return done(holds(), "named by the rock's kind" + table);
         }
         for (size_t i = 0; i < list.size(); i++) {
@@ -695,8 +785,90 @@ bool readList(const cv::Mat& frame, const cv::Rect& region, const cv::Mat& ink, 
 
 }  // namespace
 
+namespace {
+
+// A 5.0 panel's list (readFiveList), into the same lines as 4.10's: a line
+// is read where its share and its quality are - or, where the quality is not
+// one of an ore's, where its name says it is the inert rest - and the list
+// ends where the shares add up to the rock. The lines are then named as
+// 4.10's are, by the rock's kind or else by their names; an ore that stands
+// twice stays two lines.
+bool readFiveContents(const cv::Mat& frame, const ScanPanel& panel, const std::string& rockOre,
+                      TextLineReader& lines, RockContents& out, double kgPerScu) {
+    // the rock's kind narrows each quality to the values its ores come in
+    const std::vector<int> values = rockOre.empty() ? std::vector<int>() : fiveQualities(rockOre);
+    const std::vector<FiveListLine> rows = readFiveList(frame, panel, values.empty() ? nullptr : &values);
+    if (rows.empty()) {
+        out.note = "5.0: no lines under the bar";
+        return false;
+    }
+    bool read = true;
+    double sum = 0;
+    std::vector<size_t> taken;
+    for (size_t i = 0; i < rows.size(); i++) {
+        const FiveListLine& row = rows[i];
+        RockPartRead part;
+        part.shareText = row.shareText;
+        part.qualityText = row.qualityText;
+        if (!row.shareSure) {
+            read = false;
+            break;
+        }
+        part.percent = row.share;
+        if (row.qualitySure && row.quality >= 100) {
+            part.quality = row.quality;
+        } else {
+            // the inert rest's 0 is drawn faint and often lost: its name says it
+            if (row.name.area() > 0 && lines.ready()) part.nameText = lines.read(frame(row.name)).text;
+            if (saysInert(part.nameText) || (row.qualitySure && row.quality == 0 && row.dim)) {
+                part.quality = 0;
+                part.inert = true;
+            } else {
+                part.quality = -1;
+                read = false;
+            }
+        }
+        out.parts.push_back(part);
+        taken.push_back(i);
+        sum += part.percent;
+        if (sumIsTheRock(sum, out.parts.size()) || sum > 100.006) break;
+    }
+    if (out.parts.empty()) {
+        out.note = "5.0: no share read";
+        return false;
+    }
+    if (!read) {
+        contentsHold(out);
+        out.whole = false;
+        out.note = "5.0: a line did not read";
+        return false;
+    }
+    auto holds = [&]() {
+        if (!contentsHold(out)) return false;
+        if (rockOre.empty() || contentsFitRock(rockOre, out)) return true;
+        out.whole = false;
+        return false;
+    };
+    if (!rockOre.empty() && nameContentsByRock(rockOre, out, kgPerScu)) {
+        out.note = "5.0: named by the rock's kind";
+        return holds();
+    }
+    for (size_t i = 0; i < out.parts.size(); i++) {
+        RockPartRead& part = out.parts[i];
+        if (part.inert) continue;
+        const cv::Rect name = rows[taken[i]].name;
+        if (name.area() <= 0 || !lines.ready()) continue;
+        part.nameText = lines.read(frame(name)).text;
+        if (!saysInert(part.nameText)) part.ore = snapOreName(part.nameText);
+    }
+    out.note = "5.0: names read";
+    return holds();
+}
+
+}  // namespace
+
 bool readRockContents(const cv::Mat& frame, const ScanPanel& panel, const std::string& rockOre,
-                      TextLineReader& lines, RockContents& out) {
+                      TextLineReader& lines, RockContents& out, double kgPerScu) {
     out = RockContents();
     const auto started = std::chrono::steady_clock::now();
     auto done = [&](bool ok) {
@@ -707,6 +879,7 @@ bool readRockContents(const cv::Mat& frame, const ScanPanel& panel, const std::s
         out.note = "no label column";
         return done(false);
     }
+    if (panel.labelGlyph == FIVE_PANEL) return done(readFiveContents(frame, panel, rockOre, lines, out, kgPerScu));
     const double u = panel.labelScale;
     const cv::Rect region = rockContentsRegion(panel, frame.size());
     if (region.width < 215 * u || region.height < 40 * u) {
@@ -715,7 +888,8 @@ bool readRockContents(const cv::Mat& frame, const ScanPanel& panel, const std::s
     }
     const int edge = panel.labels.x - region.x;
     const char* dump = DEV_ENV("SCMINER_CONTENTS_DUMP");
-    if (readList(frame, region, hudLetteringInk(frame(region), u), u, edge, rockOre, lines, out, dump ? dump : "")) {
+    if (readList(frame, region, hudLetteringInk(frame(region), u), u, edge, rockOre, kgPerScu, lines, out,
+                 dump ? dump : "")) {
         return done(true);
     }
     // Over snow the lettering is the darker of the two: a turret's orange
@@ -729,7 +903,7 @@ bool readRockContents(const cv::Mat& frame, const ScanPanel& panel, const std::s
     cv::Mat negative;
     cv::bitwise_not(frame(region), negative);
     RockContents dark;
-    if (readList(frame, region, hudLetteringInk(negative, u), u, edge, rockOre, lines, dark,
+    if (readList(frame, region, hudLetteringInk(negative, u), u, edge, rockOre, kgPerScu, lines, dark,
                  dump ? std::string(dump) + "_dark" : std::string())) {
         out = dark;
         out.note += "; dark on bright";

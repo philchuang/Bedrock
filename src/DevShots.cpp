@@ -779,6 +779,9 @@ int runScreenshots(const std::string& dir) {
     if (const char* u = DEV_ENV("BEDROCK_SHOT_UPDATE")) {
         if (*u) gui.setUpdateStatus(std::atoi(u), "4.9.2", "something worth having", 42);
     }
+    // The rail's Feedback entry, which only a build with the service's address
+    // has: here as there, with a game version read and an installation number
+    gui.setFeedback(true, 41003, true);
 
     // Where the pictures are taken: on Monox in Pyro, in a MOLE.
     SCMiner::SignatureAnalyzer analyzer;
@@ -1755,6 +1758,31 @@ int runScreenshots(const std::string& dir) {
             pump();
             shoot(gui.windowHandle(), "site_rock_wont_hold.png");
         }
+        // ...and two rocks no head holds alone, the MOLE's own three not
+        // either: the 68,946 kg savrilium at 60 % of 30 October, held by
+        // three Helix II on passive modules between them, and a made-up one
+        // of 90 t at 75 %, held only while Surge runs
+        {
+            SCMiner::RockStats sav = rock;
+            sav.ore = "SAVRILIUM (ORE)";
+            sav.mass = 68946;
+            sav.resistance = 60;
+            sav.instability = 633.47f;
+            sav.scu = 57.69f;
+            sav.distance = 0;
+            gui.updateRock(sav);
+            pump();
+            shoot(gui.windowHandle(), "rock_together_passive.png");
+            sav.mass = 90000;
+            sav.resistance = 75;
+            sav.instability = 702.0f;
+            sav.scu = 75.3f;
+            gui.updateRock(sav);
+            pump();
+            shoot(gui.windowHandle(), "rock_together_surge.png");
+            gui.updateRock(rock);
+            pump();
+        }
 
         // The rock in the compact overlay, which is the window that is up
         // from the seat: the MOLE on the tin rock, close in; then a
@@ -1795,6 +1823,30 @@ int runScreenshots(const std::string& dir) {
         gui.updateRock(rock);
         pump();
         shoot(gui.windowHandle(), "overlay_rock_short.png");
+        // ...and the Prospector's Helix I crafted (+28.84 %), on a made-up
+        // quantainium of 21,000 kg at 67 % that its Focus III and Rieger-C3
+        // do not hold: the answer is the same head with two Deluge, not a
+        // new one with two Surge
+        {
+            SCMiner::MiningLoadout craftedOne = helixOne;
+            craftedOne.craftedPower = 28.84f;
+            gui.setHeadForShot(0, craftedOne);
+            SCMiner::RockStats q = rock;
+            q.mass = 21000;
+            q.resistance = 67;
+            q.instability = 18.6f;
+            q.scu = 20.4f;
+            gui.updateRock(q);
+            pump();
+            shoot(gui.windowHandle(), "overlay_rock_crafted.png");
+            gui.toggleOverlayMode();
+            pump();
+            shoot(gui.windowHandle(), "rock_suggest_crafted.png");
+            gui.toggleOverlayMode();
+            gui.setHeadForShot(0, helixOne);
+            gui.updateRock(rock);
+            pump();
+        }
         gui.toggleOverlayMode();
         pump();
         // A MOLE on three Arbor MH2s at a gold rock of high resistance: all
@@ -1818,6 +1870,19 @@ int runScreenshots(const std::string& dir) {
             gui.toggleOverlayMode();
             pump();
             shoot(gui.windowHandle(), "overlay_rock_mole_suggest.png");
+            // ...and the savrilium no head holds alone: the overlay names the
+            // three that hold it together
+            {
+                SCMiner::RockStats sav = gold;
+                sav.ore = "SAVRILIUM (ORE)";
+                sav.mass = 68946;
+                sav.resistance = 60;
+                sav.instability = 633.47f;
+                sav.scu = 57.69f;
+                gui.updateRock(sav);
+                pump();
+                shoot(gui.windowHandle(), "overlay_rock_together.png");
+            }
             gold.mass = 12000;
             gold.resistance = 60;
             gui.updateRock(gold);
@@ -1945,10 +2010,9 @@ int runScreenshots(const std::string& dir) {
             const SCMiner::MiningModule* focusThree = SCMiner::moduleById("passive_focus_mk3");
             const int fltrXl = (int)(SCMiner::moduleById("passive_fltr_mk3") - SCMiner::MINING_MODULES);
             const int boreMax = (int)(SCMiner::gadgetById("thcn_boremax") - SCMiner::MINING_GADGETS);
-            // the lists not there yet - and UEX asked for them, the page being up
+            // the lists not there yet
             gui.railPickForShot(Rail::Gear);
             pump();
-            std::cout << "  the Gear page wants UEX's lists: " << (gui.gearListsWanted() ? "yes" : "NO") << std::endl;
             shoot(gui.windowHandle(), "gear_loading.png");
             // ...not to be had, and none kept
             gui.setGearShops(nullptr, "Server responded 503");
@@ -1960,6 +2024,19 @@ int runScreenshots(const std::string& dir) {
             gui.gearStateForShot(0, "");
             pump();
             shoot(gui.windowHandle(), "gear_heads.png");
+            // ...the pointer on the Helix II's i: its figures, what it helps
+            // with and what it costs, the game's words - then on the last
+            // head's, the card above it
+            const int arborTwo = (int)(SCMiner::laserById("grin_arbor_s2") - SCMiner::MINING_LASERS);
+            const bool helixInfo = gui.pointGearForShot(10, helixTwo);
+            pump();
+            shoot(gui.windowHandle(), "gear_heads_info.png");
+            const bool arborInfo = gui.pointGearForShot(10, arborTwo);
+            pump();
+            shoot(gui.windowHandle(), "gear_heads_info_last.png");
+            gui.pointGearForShot(-1, 0);
+            pump();
+            std::cout << "  a head's i under the pointer: " << (helixInfo && arborInfo ? "yes" : "NO I") << std::endl;
             int fitPieces = 0;
             for (int kind : {1, 2, 3, 4, 8}) {
                 for (int value = 0; value < 64; value++) {
@@ -1997,6 +2074,26 @@ int runScreenshots(const std::string& dir) {
             pump();
             std::cout << "  the modules: " << gui.gearHeadForShot() << std::endl;
             shoot(gui.windowHandle(), "gear_modules.png");
+            // ...the pointer on an active module's i (Brandt: its uses and
+            // how long each runs over its effects), a passive one's (Deluge,
+            // made, not bought) and one far down the list (Overrun: the card
+            // above it)
+            const auto moduleAt = [](const char* id) {
+                return (int)(SCMiner::moduleById(id) - SCMiner::MINING_MODULES);
+            };
+            const bool brandtInfo = gui.pointGearForShot(10, moduleAt("active_brandt"));
+            pump();
+            shoot(gui.windowHandle(), "gear_modules_info.png");
+            const bool delugeInfo = gui.pointGearForShot(10, moduleAt("passive_deluge"));
+            pump();
+            shoot(gui.windowHandle(), "gear_modules_info_passive.png");
+            const bool overrunInfo = gui.pointGearForShot(10, moduleAt("passive_overrun"));
+            pump();
+            shoot(gui.windowHandle(), "gear_modules_info_last.png");
+            gui.pointGearForShot(-1, 0);
+            pump();
+            std::cout << "  a module's i under the pointer: "
+                      << (brandtInfo && delugeInfo && overrunInfo ? "yes" : "NO I") << std::endl;
             // ...three notches of the wheel further down
             SendMessageW(gui.windowHandle(), WM_MOUSEWHEEL, MAKEWPARAM(0, (WORD)(short)(-3 * WHEEL_DELTA)), 0);
             pump();
@@ -2429,6 +2526,48 @@ int runScreenshots(const std::string& dir) {
         shoot(gui.windowHandle(), "main_page_datarunner_empty.png");
         gui.railPickForShot(SCMiner::MinerGUI::RailItem::Scan);
         pump();
+        // The Feedback page, as the rail opens it: empty, the debug folder
+        // ticked as at every start; a message of three lines and a name
+        // typed; the same with the tick off; the debug folder going up; sent,
+        // the name still there; sent and the debug folder not, the service
+        // having refused it; and one the service could not be reached for.
+        // The page's state is set and nothing is sent or picked: the run
+        // gives the window no way to send.
+        {
+            namespace F = SCMiner::Feedback;
+            const std::wstring message = L"The rock panel reads nothing from the MOLE's pilot seat.\n"
+                                         L"Since 4.10.3, the turrets are fine.\nSnapshot taken with Ctrl+Alt+S.";
+            const std::int64_t mb = 1024 * 1024;
+            gui.railPickForShot(SCMiner::MinerGUI::RailItem::Feedback);
+            gui.feedbackForShot(L"", L"", 1, 0, 0);
+            pump();
+            shoot(gui.windowHandle(), "main_page_feedback.png");
+            gui.feedbackForShot(message, L"Stonecutter", 2, 0, 0);
+            pump();
+            shoot(gui.windowHandle(), "main_page_feedback_typed.png");
+            gui.feedbackForShot(message, L"Stonecutter", 2, 0, 0);
+            gui.feedbackDebugForShot(false, F::DebugOutcome::None, 0, 0, 0);
+            pump();
+            shoot(gui.windowHandle(), "main_page_feedback_untick.png");
+            gui.feedbackForShot(message, L"Stonecutter", 1, 1, 0);
+            gui.feedbackDebugForShot(true, F::DebugOutcome::None, 0, 12 * mb + mb / 3, 28 * mb + mb / 2);
+            pump();
+            shoot(gui.windowHandle(), "main_page_feedback_upload.png");
+            gui.feedbackForShot(L"", L"Stonecutter", 1, 2, 201);
+            gui.feedbackDebugForShot(true, F::DebugOutcome::Sent, 201, 0, 0);
+            pump();
+            shoot(gui.windowHandle(), "main_page_feedback_sent.png");
+            gui.feedbackForShot(L"", L"Stonecutter", 1, 2, 201);
+            gui.feedbackDebugForShot(true, F::DebugOutcome::Refused, 0, 0, 0);
+            pump();
+            shoot(gui.windowHandle(), "main_page_feedback_sent_nodebug.png");
+            gui.feedbackForShot(message, L"Stonecutter", 1, 2, 0);
+            pump();
+            shoot(gui.windowHandle(), "main_page_feedback_failed.png");
+            gui.feedbackForShot(L"", L"", 1, 0, 0);
+            gui.railPickForShot(SCMiner::MinerGUI::RailItem::Scan);
+            pump();
+        }
         // The foot while Bedrock reads a terminal by itself, as at Levski's
         // cargo office on 29 October 2026: no row held still yet; 4 of the
         // 14 wares the log listed for its BUY list; 24 rows of LOCAL MARKET
@@ -2711,6 +2850,82 @@ int runScreenshots(const std::string& dir) {
         pump();
         if (gui.plannerHandle()) shoot(gui.plannerHandle(), "planner_place_suit.png", true);
         std::cout << "ore finder suits: " << (listed ? "Aberdeen's card" : "ABERDEEN NOT LISTED") << std::endl;
+    }
+    // ...and the left column turned round, By place: on the player's own
+    // system with the place they are at picked (Stanton, Daymar); over all
+    // systems, longer than the column - the pick in view, then the wheel at
+    // the list's end; Nyx's few; and opened again after the player has
+    // moved on to Pyro IV, on there. Then back on the list of ores, and the
+    // player back at Monox.
+    {
+        gui.setCurrentSystem("Stanton");
+        gui.setPlace("Stanton - Daymar", "Daymar");
+        const bool tab = gui.pointInPlannerForShot(18, "place", true);
+        gui.pointInPlannerForShot(-1, "", false);
+        pump();
+        if (gui.plannerHandle()) shoot(gui.plannerHandle(), "planner_by_place.png", true);
+        const bool stanton = gui.plannerSystemForShot() == "STANTON" && gui.plannerPlaceForShot() == "Daymar" &&
+                             !gui.pointInPlannerForShot(17, "Pyro IV", false);
+        gui.pointInPlannerForShot(1, "ALL", true);
+        const bool allTop = gui.pointInPlannerForShot(17, "Daymar", false) &&
+                            !gui.pointInPlannerForShot(17, "Keeger Belt", false);
+        gui.pointInPlannerForShot(-1, "", false);
+        pump();
+        if (gui.plannerHandle()) shoot(gui.plannerHandle(), "planner_by_place_all.png", true);
+        gui.wheelPlannerForShot(true, -20);
+        const bool allEnd = gui.plannerPlaceScrollForShot() > 0 &&
+                            gui.pointInPlannerForShot(17, "Keeger Belt", false) &&
+                            !gui.pointInPlannerForShot(17, "Hurston", false);
+        gui.pointInPlannerForShot(-1, "", false);
+        pump();
+        if (gui.plannerHandle()) shoot(gui.plannerHandle(), "planner_by_place_all_end.png", true);
+        // ...the wheel over the card leaves the list where it is
+        const int before = gui.plannerPlaceScrollForShot();
+        gui.wheelPlannerForShot(false, 3);
+        const bool cardWheel = gui.plannerPlaceScrollForShot() == before;
+        gui.pointInPlannerForShot(17, "Keeger Belt", true);
+        gui.pointInPlannerForShot(1, "NYX", true);
+        gui.pointInPlannerForShot(-1, "", false);
+        pump();
+        if (gui.plannerHandle()) shoot(gui.plannerHandle(), "planner_by_place_nyx.png", true);
+        const bool nyx = gui.plannerPlaceForShot() == "Keeger Belt";
+        // shut and opened again where nothing has changed: Nyx stays
+        gui.togglePlanner();
+        gui.togglePlanner();
+        const bool kept = gui.plannerSystemForShot() == "NYX" && gui.plannerPlaceForShot() == "Keeger Belt";
+        // ...and after the player has moved on
+        gui.togglePlanner();
+        gui.setCurrentSystem("Pyro");
+        gui.setPlace("Pyro - Pyro IV", "Pyro IV");
+        gui.togglePlanner();
+        gui.pointInPlannerForShot(-1, "", false);
+        pump();
+        if (gui.plannerHandle()) shoot(gui.plannerHandle(), "planner_by_place_moved.png", true);
+        const bool moved = gui.plannerSystemForShot() == "PYRO" && gui.plannerPlaceForShot() == "Pyro IV";
+        // ...an ore of the place's card: its places, the list of places
+        // staying beside them; its tab back on the place
+        gui.pointInPlannerForShot(0, "Stileron", true);
+        const bool oreCard = gui.plannerPlaceForShot().empty() && gui.pointInPlannerForShot(17, "Pyro IV", false);
+        gui.pointInPlannerForShot(18, "place", true);
+        const bool backOnPlace = gui.plannerPlaceForShot() == "Pyro IV";
+        gui.pointInPlannerForShot(18, "ore", true);
+        const bool ores = gui.pointInPlannerForShot(0, "Laranite", false) &&
+                          !gui.pointInPlannerForShot(17, "Pyro IV", false);
+        gui.pointInPlannerForShot(1, "ALL", true);
+        gui.pointInPlannerForShot(-1, "", false);
+        gui.setPlace("Pyro - Monox", analyzer.placeFilter());
+        pump();
+        std::cout << "ore finder by place: " << (tab ? "tab" : "NO TAB") << ", "
+                  << (stanton ? "Stanton and Daymar picked" : "NOT ON STANTON/DAYMAR") << ", "
+                  << (allTop ? "all with Daymar in view" : "ALL NOT ON DAYMAR") << ", "
+                  << (allEnd ? "wheel to the end" : "WHEEL DID NOT SCROLL") << ", "
+                  << (cardWheel ? "card's wheel apart" : "CARD'S WHEEL MOVED THE LIST") << ", "
+                  << (nyx ? "Nyx keeps the pick" : "NYX LOST THE PICK") << ", "
+                  << (kept ? "kept when reopened" : "NOT KEPT ON REOPENING") << ", "
+                  << (moved ? "moved on to Pyro IV" : "NOT ON PYRO IV AFTER MOVING") << ", "
+                  << (oreCard ? "ore card unmarked" : "ORE CARD MARKED A PLACE") << ", "
+                  << (backOnPlace ? "tab back on the place" : "TAB NOT BACK ON THE PLACE") << ", "
+                  << (ores ? "back to ores" : "NOT BACK TO ORES") << std::endl;
     }
     // ...and an ore the player has traded: their own deals under what a rock
     // of it holds - bought refined for a recipe, sold as it came out of the
@@ -3196,6 +3411,24 @@ int runScreenshots(const std::string& dir) {
     if (gui.grindHandle()) shoot(gui.grindHandle(), "grind_open_only.png", true);
     gui.grindOpenOnlyForShot(false);
     pump();
+    // ...FROM's outfits, none picked yet
+    gui.grindFromForShot({}, true);
+    pump();
+    if (gui.grindHandle()) shoot(gui.grindHandle(), "grind_from.png", true);
+    // ...and one picked, the chips shut: its sets alone
+    gui.grindFromForShot({"Headhunters"}, false);
+    pump();
+    if (gui.grindHandle()) shoot(gui.grindHandle(), "grind_from_picked.png", true);
+    gui.grindFromForShot({}, false);
+    pump();
+    // The R97's pool is fed by six outfits: picked by one of them, the set
+    // stays, and its rows name that outfit's missions alone
+    for (const char* outfit : {"Eckhart Security", "Vaughn", "Headhunters"}) {
+        const std::string wrong = gui.grindFromCheckForShot(outfit);
+        std::cout << (wrong.empty() ? "[PASS]" : "[FAIL]") << " FROM " << outfit
+                  << " keeps the sets it feeds, with its own missions" << (wrong.empty() ? "" : ": " + wrong)
+                  << std::endl;
+    }
     // ...a set of an outfit whose rank was set by hand
     for (int i = 0; i < SCMiner::CRAFT_SOURCE_COUNT; i++) {
         const SCMiner::CraftSource& src = SCMiner::CRAFT_SOURCES[i];

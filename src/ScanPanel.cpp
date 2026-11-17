@@ -1,5 +1,6 @@
 #include "ScanPanel.h"
 #include "DevSwitch.h"
+#include "PanelFive.h"
 #include "PanelGlyphs.h"
 #include "PanelFace.h"
 #include "PanelShapes.h"
@@ -1607,6 +1608,15 @@ const PanelLayout COCKPIT_PANEL{'K', "cockpit", SHAPE_VALUE_DX, SHAPE_ROW_PITCH,
 // for it.
 const PanelLayout COCKPIT_LONG_PANEL{'P', "cockpit long", 115.05, 24.73, 9.68, 38.0, 35.0,
                                      false, 0.0, 0.0, 0.0, 0.0, SHAPE_SCU_LAST_CENTRE, SHAPE_SCU_BOTTOM};
+// ...and that seat since 4.10.3, its labels written larger (see
+// SHAPE_COCKPIT_LABELS_4103, 78 wide). Its places measured against that
+// column on three screenshots at 2,560 x 1,440: the figures 114.8 right of the
+// labels' edge, the rows 25 apart, the mass's bottom 8.6 below the MASS
+// label's top - from 7.3 to 9.6 as the canopy the HUD is drawn on tilts it.
+// Its volume's last numeral stands 179.4 right of the labels' edge and 125.5
+// below, four units left of the Prospector's. Not pinned, as above.
+const PanelLayout COCKPIT_4103_PANEL{'Q', "cockpit 4.10.3", 114.8, 25.0, 8.6, 39.0, 35.0,
+                                     false, 0.0, 0.0, 0.0, 0.0, 179.4, 125.5};
 
 // ...and which of them a label column's shape stands for.
 const PanelLayout& layoutOf(char glyph) {
@@ -1614,6 +1624,7 @@ const PanelLayout& layoutOf(char glyph) {
            : glyph == 'W' ? TURRET_LONG_PANEL
            : glyph == 'K' ? COCKPIT_PANEL
            : glyph == 'P' ? COCKPIT_LONG_PANEL
+           : glyph == 'Q' ? COCKPIT_4103_PANEL
            : glyph == 'G' ? GOLEM_PANEL
            : glyph == 'H' ? GOLEM_LONG_PANEL
            : glyph == 'M' ? LONG_PANEL
@@ -2364,6 +2375,45 @@ ShapeRow readShapeRow(const cv::Mat& grey, const cv::Point& leftBottom, double s
     return row;
 }
 
+// The volume: "COMP.  21.30 SCU", right-aligned against SCU, so its last
+// numeral sits at the same place whatever its length. Tried from the
+// longest it can be down: started one numeral too far right, 21.30 reads
+// as a perfectly good 1.30, but started too far left the first cell is
+// empty and the reading fails. `labels` in the coordinates of `scuInk`,
+// the white ink the volume is written in; `others` the other white inks,
+// for the turret's numerals.
+float volumeEndingAt(const cv::Mat& scuInk, const std::function<const cv::Mat&(int)>* others,
+                     const cv::Point& labels, double s, const PanelLayout& layout, const PanelFont& font,
+                     double lastCentre, ShapeRow& found) {
+    for (int whole = 3; whole >= 1; whole--) {
+        const double firstCentre = lastCentre - font.advance - font.stopAdvance - font.advance * (whole - 1);
+        const cv::Point leftBottom(labels.x + (int)std::lround((firstCentre - font.firstCentre) * s),
+                                   labels.y + (int)std::lround(layout.scuBottom * s));
+        ShapeRow scu = readShapeRow(scuInk, leftBottom, s, 2, font);
+        // ...in the turret's numerals: in each white ink, the clearest
+        // reading kept, as for its figures (never dark on bright: the white
+        // figures turned over read a bright ground as figures)
+        if (!font.clustered && others) {
+            for (int which : {5, 1}) {
+                ShapeRow other = readShapeRow((*others)(which), leftBottom, s, 2, font);
+                if (!other.placed) continue;
+                if (!scu.placed || other.worst + other.lead > scu.worst + scu.lead) scu = other;
+            }
+        }
+        if (!scu.placed || scu.text.find('.') != (size_t)whole) continue;
+        // ...and a shorter reading only when nothing stands before it: a 5
+        // too faint to match over the ice still lifts off the ground, and
+        // without it 50.03 was 0.03
+        const cv::Rect before((int)std::lround(labels.x + (firstCentre - font.advance - 4.5) * s),
+                              leftBottom.y - (int)std::lround(font.digitH * s), (int)std::lround(9 * s),
+                              (int)std::lround(font.digitH * s));
+        if (whole < 3 && contrastIn(scuInk, before, scu.ground) >= scu.lift * 0.55f) return -1;
+        found = scu;
+        return faceTwoPlaces(scu.text, true);
+    }
+    return -1;
+}
+
 // Whether a figure's strokes are green or red rather than white. The HUD adds
 // its light to what is behind it, and white added to anything is white: all
 // three channels run up to the top. Green added to the blue of a bright sky
@@ -2594,6 +2644,36 @@ void throttlePanelSearch(bool throttled) {
 }
 
 namespace {
+int g_panelGeneration = [] {
+    const char* set = DEV_ENV("BEDROCK_PANEL_GENERATION");
+    return set ? std::atoi(set) : 0;
+}();
+}  // namespace
+
+void setPanelGeneration(int generation) {
+    g_panelGeneration = generation;
+}
+
+int panelGeneration() {
+    return g_panelGeneration;
+}
+
+namespace {
+bool g_panelToneMapped = [] {
+    const char* set = DEV_ENV("BEDROCK_PANEL_HDR");
+    return set && std::atoi(set) != 0;
+}();
+}  // namespace
+
+void setPanelToneMapped(bool toneMapped) {
+    g_panelToneMapped = toneMapped;
+}
+
+bool panelToneMapped() {
+    return g_panelToneMapped;
+}
+
+namespace {
 bool readPanelByShapeInk(const cv::Mat& frame, const cv::Mat& bgr, int ink, ScanPanel& panel);
 }
 
@@ -2742,14 +2822,28 @@ double orangeBar(char glyph) {
     // looked for at (four pilot-seat snapshots and the turret, Golem and
     // Prospector benches). A bar between the two rather than on top of the
     // good readings; and a column alone still reads nothing - the figures
-    // have to be found where it says they are.
-    if (glyph == 'P') return 0.72;
+    // have to be found where it says they are. The same for its larger
+    // letters since 4.10.3.
+    if (glyph == 'P' || glyph == 'Q') return 0.72;
     return glyph == 'K' ? 0.80 : 0.85;
 }
 
 // How well the short Golem column must match for the long one to be looked
 // for in its place: the long labels match it at 0.65 and better
 constexpr double GOLEM_LONG_NEAR = 0.55;
+
+// The ink the Golem's lettering is looked for in. An SDR capture has it
+// amber (6, see channelGrey). An HDR desktop's picture, tone mapped in the
+// app (ToneMap.h), has it orange - 172/108/49 over dark ground, snapshots of
+// 16 November 2026 - which amber sees at 13 of 255 and red over blue at 123:
+// there the column is looked for in red over blue (4), the orange pass's own
+// ink. In amber the column was found in none of those five snapshots. Not
+// seen yet off an HDR desktop: the lettering over red rock or in the
+// amber-lit cockpit, where red over blue serves an SDR capture badly (129
+// against 91, see channelGrey).
+int golemInk() {
+    return g_panelToneMapped ? 4 : 6;
+}
 
 LabelColumn findOrangeColumn(const cv::Mat& ink, const cv::Mat& bgr, int rows, bool everywhere) {
     LabelColumn& last = g_orangeLast;
@@ -2769,9 +2863,10 @@ LabelColumn findOrangeColumn(const cv::Mat& ink, const cv::Mat& bgr, int rows, b
         const cv::Rect near = cv::Rect(last.labels.x - (int)std::lround(160 * s), last.labels.y - (int)std::lround(110 * s),
                                        (int)std::lround(380 * s), (int)std::lround(300 * s)) & frame;
         if (near.width > 60 && near.height > 80) {
-            // the Golem's column in its own ink, amber
-            const bool golem = last.glyph == 'G' || last.glyph == 'H';
-            const cv::Mat nearInk = golem ? channelGrey(bgr(near), 6) : ink(near);
+            // the Golem's column in its own ink: amber, or on an HDR desktop
+            // the orange pass's
+            const bool amber = (last.glyph == 'G' || last.glyph == 'H') && golemInk() == 6;
+            const cv::Mat nearInk = amber ? channelGrey(bgr(near), 6) : ink(near);
             column = findLabelColumn(nearInk, {s}, nullptr, std::string(1, last.glyph));
             column.labels += near.tl();
             column.tracked = column.score >= TRACKED_MIN;
@@ -2783,7 +2878,10 @@ LabelColumn findOrangeColumn(const cv::Mat& ink, const cv::Mat& bgr, int rows, b
     // on the bench. Each column is almost always at about one size - 1.53 to
     // 1.57 in the turrets, 0.92 to 0.95 in the pilot seat - which the fine
     // search about the best place widens by six per cent; the Golem's HUD is
-    // drawn in the world and comes in anywhere from 1.15 to 1.8. The searches
+    // drawn in the world and comes in anywhere from 1.15 to 1.8. Since 4.10.3
+    // the turret's panel is drawn smaller, and how much smaller goes with the
+    // screen's shape: 1.30 to 1.35 at 5,120 x 1,440 (1.53 to 1.59 before),
+    // 1.08 at 2,560 x 1,440 (1.35 before). The searches
     // run on the band brought down to where a column is twenty pixels wide,
     // so all of them together cost a look without a panel a few milliseconds.
     static int wideTries = 0;
@@ -2797,23 +2895,26 @@ LabelColumn findOrangeColumn(const cv::Mat& ink, const cv::Mat& bgr, int rows, b
         // sits at 0.93 one look and 0.95 the next as the rock drifts, and
         // the one-size pass at 0.93 misses the other one.
         const bool allSizes = true;
+        // (twelve per cent apart, as the fine search reaches six either way)
         const std::vector<double> turretSizes =
-            allSizes ? std::vector<double>{1.44 * r, 1.54 * r, 1.64 * r} : std::vector<double>{1.54 * r};
+            allSizes ? std::vector<double>{1.02 * r, 1.14 * r, 1.27 * r, 1.44 * r, 1.54 * r, 1.64 * r}
+                     : std::vector<double>{1.54 * r};
         const std::vector<double> cockpitSizes =
             allSizes ? std::vector<double>{0.86 * r, 0.92 * r, 0.98 * r, 1.05 * r} : std::vector<double>{0.93 * r};
         // the turret's labels short (a language pack's) or written out (the game's own)
         StageClock* tw = new StageClock(where.width == frame.width ? "  orange: T W (everywhere)" : "  orange: T W");
         LabelColumn turret = findLabelColumn(ink(where), turretSizes, nullptr, "TW");
         delete tw;
-        // the pilot seat's labels short (a language pack's) or written out
-        StageClock* kc = new StageClock("  orange: K P");
-        LabelColumn cockpit = findLabelColumn(ink(where), cockpitSizes, nullptr, "KP");
+        // the pilot seat's labels short (a language pack's) or written out -
+        // before 4.10.3 or since, when they are written larger
+        StageClock* kc = new StageClock("  orange: K P Q");
+        LabelColumn cockpit = findLabelColumn(ink(where), cockpitSizes, nullptr, "KPQ");
         delete kc;
         turret.labels += where.tl();
         cockpit.labels += where.tl();
         if (turret.score > column.score) column = turret;
         if (cockpit.score > column.score) column = cockpit;
-        // ...and the Golem's, in amber, at the sizes its HUD comes in
+        // ...and the Golem's, in its own ink, at the sizes its HUD comes in
         // ...six per cent apart, as the fine search reaches three either way:
         // at 1.5 and 1.7 a column at 1.63 falls between them
         // - for the picture's height as it is now: sizes made once would stay at
@@ -2821,11 +2922,13 @@ LabelColumn findOrangeColumn(const cv::Mat& ink, const cv::Mat& bgr, int rows, b
         // screen
         const std::vector<double> golemSizes{1.15 * r, 1.22 * r, 1.29 * r, 1.37 * r, 1.45 * r,
                                              1.54 * r, 1.63 * r, 1.73 * r, 1.83 * r};
-        StageClock* amberClock = new StageClock("  orange: amber image");
-        const cv::Mat amber = channelGrey(bgr(where), 6);
-        delete amberClock;
+        cv::Mat lettering = ink(where);
+        if (golemInk() == 6) {
+            StageClock amberClock("  orange: amber image");
+            lettering = channelGrey(bgr(where), 6);
+        }
         StageClock* gClock = new StageClock("  orange: G");
-        LabelColumn golem = findLabelColumn(amber, golemSizes, nullptr, "G");
+        LabelColumn golem = findLabelColumn(lettering, golemSizes, nullptr, "G");
         delete gClock;
         // ...and with the game's own labels written out, where the short
         // column was found: MASS: and the first letters of the other two are
@@ -2835,7 +2938,7 @@ LabelColumn findOrangeColumn(const cv::Mat& ink, const cv::Mat& bgr, int rows, b
         // on the screen.
         if (golem.score >= GOLEM_LONG_NEAR) {
             StageClock hClock("  orange: H near G");
-            LabelColumn longer = labelColumnNear(amber, golem, 'H');
+            LabelColumn longer = labelColumnNear(lettering, golem, 'H');
             longer.glyph = 'H';
             if (longer.score > golem.score) golem = longer;
         }
@@ -2857,10 +2960,22 @@ bool readPanelByShapeInk(const cv::Mat& frame, const cv::Mat& bgr, int ink, Scan
     // costs a third of a second on a 5120 x 1440 frame, and the app, which
     // looks every second and a half with nothing on screen most of the time,
     // tries that only every fourth look - every fortieth once it has read one.
-    static double knownScale = 0;
-    static double sureScale = 0;
-    static cv::Point lastLabels(-1, -1);
-    static int looksSinceWide = 1000;
+    // Kept apart for the white panels and the orange ones: a MOLE turret's
+    // panel read at 1.30 taught the white search that size, and the
+    // Prospector's white panel at 1.0 after it was looked for at 1.30 alone,
+    // and at the other sizes only every fortieth look.
+    struct SizeMemory {
+        double known = 0, sure = 0;
+        cv::Point last{-1, -1};
+        int looksSinceWide = 1000;
+        int unplaced = 0;
+    };
+    static SizeMemory memory[2];
+    SizeMemory& mine = memory[ink == 4 ? 1 : 0];
+    double& knownScale = mine.known;
+    double& sureScale = mine.sure;
+    cv::Point& lastLabels = mine.last;
+    int& looksSinceWide = mine.looksSinceWide;
     const bool everywhere = takeEverywhereTurn();
     const cv::Rect screen(0, 0, bgr.cols, bgr.rows);
     cv::Rect inkRegion = everywhere ? screen : hudBand(bgr.size());
@@ -2981,6 +3096,7 @@ bool readPanelByShapeInk(const cv::Mat& frame, const cv::Mat& bgr, int ink, Scan
                                 : column.glyph == 'W' ? &TURRET_LONG_PANEL
                                 : column.glyph == 'K' ? &COCKPIT_PANEL
                                 : column.glyph == 'P' ? &COCKPIT_LONG_PANEL
+                                : column.glyph == 'Q' ? &COCKPIT_4103_PANEL
                                 : column.glyph == 'G' ? &GOLEM_PANEL
                                 : column.glyph == 'H' ? &GOLEM_LONG_PANEL
                                                       : &SHORT_PANEL;
@@ -3130,7 +3246,7 @@ bool readPanelByShapeInk(const cv::Mat& frame, const cv::Mat& bgr, int ink, Scan
     // The size is learned from a look that was sure of its figures, or from
     // any placed look while none is known; labels found at a size where the
     // figures will not place three looks running mean the size is wrong.
-    static int unplaced = 0;
+    int& unplaced = mine.unplaced;
     panel.labels = column.labels;
     panel.labelScale = column.scale;
     panel.labelGlyph = column.glyph;
@@ -3156,8 +3272,8 @@ bool readPanelByShapeInk(const cv::Mat& frame, const cv::Mat& bgr, int ink, Scan
     g_panelSpot.labels = column.labels;
     g_panelSpot.scale = column.scale;
     g_panelSpot.glyph = column.glyph;
-    // the Golem's columns are found in amber
-    g_panelSpot.ink = column.glyph == 'G' || column.glyph == 'H' ? 6 : ink;
+    // the Golem's columns are found in an ink of their own (golemInk)
+    g_panelSpot.ink = column.glyph == 'G' || column.glyph == 'H' ? golemInk() : ink;
     // a column read under its bar is followed from here like one found over it
     if (ink == 4 && trial) g_orangeLast = column;
     panel.stats.mass = faceWhole(mass.text);
@@ -3192,42 +3308,22 @@ bool readPanelByShapeInk(const cv::Mat& frame, const cv::Mat& bgr, int ink, Scan
     // (the Golem's volume stands where it is not known, and is not read)
     if (layout->scuLastCentre <= 0) return sure;
     StageClock scuClock("scu");
-    // The volume: "COMP.  21.30 SCU", right-aligned against SCU, so its last
-    // numeral sits at the same place whatever its length. Tried from the
-    // longest it can be down: started one numeral too far right, 21.30 reads
-    // as a perfectly good 1.30, but started too far left the first cell is
-    // empty and the reading fails.
+    // the volume is written in white on the MOLE too, beside orange labels
+    const cv::Mat& scuInk = ink == 4 ? inkImage(0) : darkest;
+    const std::function<const cv::Mat&(int)> scuOthers = [&](int which) -> const cv::Mat& { return inkImage(which); };
     auto volumeEndingAt = [&](double lastCentre, ShapeRow& found) -> float {
-        for (int whole = 3; whole >= 1; whole--) {
-            const double firstCentre = lastCentre - font.advance - font.stopAdvance - font.advance * (whole - 1);
-            const cv::Point leftBottom(column.labels.x + (int)std::lround((firstCentre - font.firstCentre) * s),
-                                       column.labels.y + (int)std::lround(layout->scuBottom * s));
-            // the volume is written in white on the MOLE too, beside orange labels
-            const cv::Mat& scuInk = ink == 4 ? inkImage(0) : darkest;
-            ShapeRow scu = readShapeRow(scuInk, leftBottom, s, 2, font);
-            // ...in the turret's numerals: in each white ink, the clearest
-            // reading kept, as for its figures (never dark on bright: the white
-            // figures turned over read a bright ground as figures)
-            if (!font.clustered) {
-                for (int which : {5, 1}) {
-                    ShapeRow other = readShapeRow(inkImage(which), leftBottom, s, 2, font);
-                    if (!other.placed) continue;
-                    if (!scu.placed || other.worst + other.lead > scu.worst + scu.lead) scu = other;
-                }
-            }
-            if (!scu.placed || scu.text.find('.') != (size_t)whole) continue;
-            // ...and a shorter reading only when nothing stands before it: a 5
-            // too faint to match over the ice still lifts off the ground, and
-            // without it 50.03 was 0.03
-            const cv::Rect before((int)std::lround(column.labels.x + (firstCentre - font.advance - 4.5) * s),
-                                  leftBottom.y - (int)std::lround(font.digitH * s),
-                                  (int)std::lround(9 * s), (int)std::lround(font.digitH * s));
-            if (whole < 3 && contrastIn(scuInk, before, scu.ground) >= scu.lift * 0.55f) return -1;
-            found = scu;
-            return faceTwoPlaces(scu.text, true);
-        }
-        return -1;
+        return SCMiner::volumeEndingAt(scuInk, &scuOthers, column.labels, s, *layout, font, lastCentre, found);
     };
+    // (SCMINER_SCU_PROBE: every shift tried, for measuring one)
+    if (DEV_ENV("SCMINER_SCU_PROBE")) {
+        std::cout << "PROBE mass " << panel.stats.mass << " glyph " << layout->labels << " scale " << s << ":";
+        for (int tenth = -30; tenth <= 200; tenth += 5) {
+            ShapeRow at;
+            const float v = volumeEndingAt(layout->scuLastCentre - tenth / 10.0, at);
+            if (v > 0) std::cout << " " << tenth / 10.0 << "=" << at.text << "/" << at.worst << "/" << at.lead;
+        }
+        std::cout << std::endl;
+    }
     ShapeRow scu;
     const float read = volumeEndingAt(layout->scuLastCentre, scu);
     // ...and held against the mass: a volume no rock of this mass has is a
@@ -3238,26 +3334,47 @@ bool readPanelByShapeInk(const cv::Mat& frame, const cv::Mat& bgr, int ink, Scan
         panel.note += " s [" + scu.trace + "]";
         return sure;
     }
-    if (read > 0) return sure;
+    // A volume read there that does not fit the mass is a misreading, and
+    // in the MOLE's pilot seat it is the place that is off: on his 5,120 x
+    // 1,440 screen the last numeral stood 176.0 to 178.6 right of the
+    // labels' edge, where the 2,560 x 1,440 screenshots had it at 179.4, and
+    // read there 14.98 came back with its 9 and 8 clear by 0.018. So the
+    // places further left below are tried after it as well; the thousandths
+    // are not - an m does not stand where a numeral was read.
+    const bool misfit = read > 0;
+    if (misfit && layout != &COCKPIT_4103_PANEL) return sure;
     // Under one SCU in thousandths, "364.01m SCU": the m stands between the
     // last numeral and SCU, so every numeral stands an m's width further
     // left. Taken only where the mass says it is a thousandth of an SCU.
-    // (SCMINER_SCU_PROBE: every shift tried, for measuring one)
-    if (DEV_ENV("SCMINER_SCU_PROBE")) {
-        std::cout << "PROBE mass " << panel.stats.mass << " glyph " << layout->labels << " scale " << s << ":";
-        for (int tenth = 20; tenth <= 200; tenth += 5) {
-            ShapeRow at;
-            const float v = volumeEndingAt(layout->scuLastCentre - tenth / 10.0, at);
-            if (v > 0) std::cout << " " << tenth / 10.0 << "=" << at.text << "/" << at.worst << "/" << at.lead;
+    if (!misfit) {
+        ShapeRow milli;
+        const float thousandths = volumeEndingAt(layout->scuLastCentre - SHAPE_M_SHIFT, milli);
+        const float small = volumeOfMass(thousandths, panel.stats.mass, true, false);
+        if (small > 0) {
+            panel.stats.scu = small;
+            panel.note += " s m [" + milli.trace + "]";
+            return sure;
         }
-        std::cout << std::endl;
     }
-    ShapeRow milli;
-    const float thousandths = volumeEndingAt(layout->scuLastCentre - SHAPE_M_SHIFT, milli);
-    const float small = volumeOfMass(thousandths, panel.stats.mass, true, false);
-    if (small > 0) {
-        panel.stats.scu = small;
-        panel.note += " s m [" + milli.trace + "]";
+    // Since 4.10.3 the Prospector's volume stood 2 to 5.5 further left than
+    // this on a 5,120 x 1,440 screen (54.65 SCU, 16 November 2026). A little
+    // further left is tried - never right, where a numeral too few reads as a
+    // volume all the same (21.30 as 1.30).
+    for (const double shift : {2.5, 5.0}) {
+        ShapeRow moved;
+        float v = volumeOfMass(volumeEndingAt(layout->scuLastCentre - shift, moved), panel.stats.mass, false, false);
+        const bool inThousandths = v <= 0 && !misfit;
+        if (inThousandths) {
+            v = volumeOfMass(volumeEndingAt(layout->scuLastCentre - SHAPE_M_SHIFT - shift, moved), panel.stats.mass,
+                             true, false);
+        }
+        if (v > 0) {
+            panel.stats.scu = v;
+            char at[24];
+            std::snprintf(at, sizeof(at), " s%s -%.1f [", inThousandths ? " m" : "", shift);
+            panel.note += at + moved.trace + "]";
+            break;
+        }
     }
     return sure;
 }
@@ -3299,7 +3416,10 @@ double glanceBar(const PanelSpot& spot) {
 
 double glanceAtPanelSpot(const PanelSpot& spot, const cv::Mat& window) {
     if (!spot.known || window.empty()) return -1;
-    const cv::Mat ink = channelGrey(asBgr(window), spot.ink);
+    // (the Golem's column in the ink it has in this picture, whichever the
+    // spot was kept with: a desktop can have changed between SDR and HDR)
+    const int in = spot.glyph == 'G' || spot.glyph == 'H' ? golemInk() : spot.ink;
+    const cv::Mat ink = channelGrey(asBgr(window), in);
     // one size, and the fine search's six per cent either way about it
     const LabelColumn column = findLabelColumnOf(ink, {spot.scale}, spot.glyph, nullptr);
     return column.score;
@@ -3346,13 +3466,14 @@ bool PanelSteadier::add(const ScanPanel& look, RockStats& rock) {
     // all pinned and the growing panel's are not: believing every size
     // outright shows 7140 for nine frames at 1080 lines.
     if (!look.found) return false;
-    // What counts as the same size. The pilot seat's written-out labels give
+    // What counts as the same size. The pilot seat's written-out labels, the
+    // ones before 4.10.3 and the larger ones since, give
     // their size to four per cent either way from one look to the next -
     // 0.92 to 1.00 over a rock that did not move - and nothing pins it: no
     // SCU place is known for them. At four per cent, the rock after one that
     // settled at 0.998 waited five looks at 0.94 - seven seconds. For them
     // eight per cent is the same size; for every other column, four.
-    const double same = look.labelGlyph == 'P' ? 0.08 : 0.04;
+    const double same = look.labelGlyph == 'P' || look.labelGlyph == 'Q' ? 0.08 : 0.04;
     // ...and a size a quarter or more away is another HUD altogether - the
     // MOLE's turret's panel at 1.54 after its pilot seat's at 0.93 - not the
     // panel growing in or the HUD swaying: five looks there would keep the
@@ -3788,6 +3909,59 @@ std::vector<std::pair<char, float>> shapeNumerals(const PanelFigure& figure) {
     return out;
 }
 
+// How many numerals a white figure holds, counted off its ink rather than
+// read: from its first lit column to its last, in the font's advances. A
+// numeral is six units wide and nine apart, a 1 two units, so n numerals
+// span from 2 + 9 (n - 1) to 6.3 + 9 (n - 1) units and the count rounds
+// clear of the next. In the darkest channel, where the coloured fringes the
+// MOLE's pilot seat draws its figures with (blue left, red right, 17
+// November 2026) drop out with the orange labels. 0 where the box does not
+// say it clearly: too little between the figure and its ground, the figure
+// not starting at the box's left edge, or anything lit after it.
+int numeralsInBox(const cv::Mat& bgr, const cv::Rect& box, double advance, cv::Rect* ink = nullptr) {
+    const cv::Rect safe = box & cv::Rect(0, 0, bgr.cols, bgr.rows);
+    if (advance < 3 || safe.width < advance * 4 || safe.height < 4) return 0;
+    const cv::Mat grey = channelGrey(bgr(safe), 0);
+    std::vector<float> column(safe.width, 0.0f);
+    for (int y = 0; y < grey.rows; y++) {
+        const float* p = grey.ptr<float>(y);
+        for (int x = 0; x < grey.cols; x++) column[x] = (std::max)(column[x], p[x]);
+    }
+    std::vector<float> sorted = column;
+    std::sort(sorted.begin(), sorted.end());
+    const float ground = sorted[sorted.size() / 10];
+    const float peak = sorted[sorted.size() * 97 / 100];
+    if (peak - ground < 50.0f) return 0;
+    const float bar = ground + 0.45f * (peak - ground);
+    int first = -1, last = -1;
+    for (int x = 0; x < (int)column.size(); x++) {
+        if (column[x] < bar) continue;
+        if (first < 0) {
+            if (x > advance * 1.5) return 0;
+            first = last = x;
+            continue;
+        }
+        if (x - last > advance) return 0;
+        last = x;
+    }
+    if (first < 0 || (int)column.size() - 1 - last < advance) return 0;
+    if (ink) {
+        // ...and the rows its ink stands in
+        int top = -1, bottom = -1;
+        for (int y = 0; y < grey.rows; y++) {
+            const float* p = grey.ptr<float>(y);
+            for (int x = first; x <= last; x++) {
+                if (p[x] < bar) continue;
+                if (top < 0) top = y;
+                bottom = y;
+                break;
+            }
+        }
+        *ink = cv::Rect(safe.x + first, safe.y + (std::max)(0, top), last - first + 1, (std::max)(1, bottom - top + 1));
+    }
+    return (int)std::lround((last - first + 1 - 0.48 * advance) / advance) + 1;
+}
+
 }  // namespace
 
 std::string oreByLine(const cv::Mat& frame, const cv::Rect& row, TextLineReader& lines) {
@@ -3824,6 +3998,93 @@ std::string oreByLine(const cv::Mat& frame, const cv::Rect& row, TextLineReader&
     return lastOre;
 }
 
+namespace {
+
+// readPanelRows, with the numerals the mass's box shows (numeralsInBox) - 0
+// where that is not known - and the mass's row cut where its ink ends, to
+// read it once more where the whole row read another count
+bool readRowsHeld(const cv::Mat& frame, TextLineReader& lines, const std::array<cv::Rect, 4>& rows,
+                  const std::array<cv::Rect, 3>& values, ScanPanel& panel, int massNumerals,
+                  const cv::Rect& massTight);
+
+// How sure the second reader must be of the volume's line to be taken with
+// nothing beside it; with the shapes reading the same volume it is LINE_SURE
+constexpr double LINE_VOLUME_ALONE = 0.90;
+
+// The volume, "33.38 SCU" at the right of the COMPOSITION row, read by line
+// as well, for a look the second reader read: in the MOLE's pilot seat on
+// his 5,120 x 1,440 HDR screen most looks go that way, and of 88 looks on 17
+// November 2026 (13:46:52 to 13:49:23) 7 carried the SCU. The word SCU is
+// the gate, as MASS: is for the mass, and the figure has to be two places
+// and nothing more; it is held against the mass, and against the shapes
+// read at the same place: taken where they read the same volume, or where
+// they read none that fits and the line is sure of itself.
+void volumeByLine(const cv::Mat& frame, TextLineReader& lines, const PanelLayout& layout, const cv::Point& labels,
+                  double s, ScanPanel& panel) {
+    const PanelFont& font = layout.font ? *layout.font : PROSPECTOR_FONT;
+    const double tall = font.digitH * s;
+    const int pad = (std::max)(2, (int)std::lround(tall * 0.55));
+    const int bottom = labels.y + (int)std::lround(layout.scuBottom * s);
+    // from left of a volume of three whole numerals to past the U of SCU
+    const int left = labels.x + (int)std::lround((layout.scuLastCentre - 50) * s);
+    const int right = labels.x + (int)std::lround((layout.scuLastCentre + 38) * s);
+    const cv::Rect row = cv::Rect(left, bottom - (int)std::lround(tall) - pad, right - left,
+                                  (int)std::lround(tall) + 2 * pad);
+    if (row.x <= 0 || row.y <= 0 || row.x + row.width >= frame.cols || row.y + row.height >= frame.rows) return;
+    const cv::Mat bgr = asBgr(frame);
+    const TextLineReader::Line line = lines.read(bgr(row));
+    std::string tight;
+    for (char c : line.text) {
+        if (c != ' ') tight += (char)std::toupper((unsigned char)c);
+    }
+    char note[160];
+    float read = -1;
+    if (line.mean >= LINE_SURE && tight.size() > 3 && tight.compare(tight.size() - 3, 3, "SCU") == 0) {
+        read = faceTwoPlaces(tight.substr(0, tight.size() - 3), true);
+    }
+    const float volume = volumeOfMass(read, panel.stats.mass, false, false);
+    if (volume <= 0) {
+        std::snprintf(note, sizeof(note), "; lines: no volume in '%.24s' (%.2f)", line.text.c_str(), line.mean);
+        panel.note += note;
+        return;
+    }
+    // The shapes at the same place, in the darkest channel about it: where
+    // the layout says, then a little further left, as the shape reader tries
+    // it (see readPanelByShapeInk)
+    const cv::Rect about = cv::Rect(labels.x + (int)std::lround((layout.scuLastCentre - 75) * s),
+                                    bottom - (int)std::lround(30 * s), (int)std::lround(140 * s),
+                                    (int)std::lround(45 * s)) &
+                           cv::Rect(0, 0, frame.cols, frame.rows);
+    float theirs = -1;
+    if (about.width > 0 && about.height > 0) {
+        const cv::Mat darkest = channelGrey(bgr(about), 0);
+        for (const double shift : {0.0, 2.5, 5.0}) {
+            ShapeRow found;
+            const float v = volumeOfMass(volumeEndingAt(darkest, nullptr, labels - about.tl(), s, layout, font,
+                                                        layout.scuLastCentre - shift, found),
+                                         panel.stats.mass, false, false);
+            if (v > 0) {
+                theirs = v;
+                break;
+            }
+        }
+    }
+    const bool agreed = theirs > 0 && std::fabs(theirs - volume) < 0.005f;
+    static const double alone =
+        DEV_ENV("SCMINER_VOLUME_ALONE") ? std::atof(DEV_ENV("SCMINER_VOLUME_ALONE")) : LINE_VOLUME_ALONE;
+    if (!agreed && (theirs > 0 || line.mean < alone)) {
+        std::snprintf(note, sizeof(note), "; lines: %.2f SCU (%.2f) where the shapes read %.2f", volume, line.mean,
+                      theirs);
+        panel.note += note;
+        return;
+    }
+    panel.stats.scu = volume;
+    std::snprintf(note, sizeof(note), "; lines: %.2f SCU (%.2f)%s", volume, line.mean, agreed ? ", the shapes too" : "");
+    panel.note += note;
+}
+
+}  // namespace
+
 bool readPanelByLines(const cv::Mat& frame, TextLineReader& lines, ScanPanel& panel) {
     const std::vector<cv::Rect> found = panelFigureLines(panel, frame.size());
     if (found.size() != 4) return false;
@@ -3851,11 +4112,54 @@ bool readPanelByLines(const cv::Mat& frame, TextLineReader& lines, ScanPanel& pa
                              rows[r + 1].height) &
                     cv::Rect(0, 0, frame.cols, frame.rows);
     }
-    return readPanelRows(frame, lines, rows, values, panel);
+    // The mass's numerals counted off its ink: the second reader reads the
+    // pilot seat's figures with their coloured fringes, and now and then a
+    // fringe as a numeral of its own - 11,294 as 111,294 and 112,943, 8,966
+    // as 89,667 (17 November 2026, 3 of 52 line looks). From two units left
+    // of where the layout starts the figure, so a first numeral a pixel
+    // early is not cut. In that seat only: over the turret's, the Golem's
+    // and the Prospector's recordings the count was off where the line was
+    // right, on 18 of 6,700 bench frames (the turret's 1,042 kg counted as
+    // five numerals).
+    const PanelFont& font = layout.font ? *layout.font : PROSPECTOR_FONT;
+    const int massLeft = at - (int)std::lround(2 * s);
+    const cv::Rect massBox =
+        cv::Rect(massLeft, rows[1].y, (std::max)(1, rows[1].x + rows[1].width - massLeft), rows[1].height) &
+        cv::Rect(0, 0, frame.cols, frame.rows);
+    cv::Rect massInk;
+    const int massNumerals =
+        &layout == &COCKPIT_4103_PANEL ? numeralsInBox(asBgr(frame), massBox, font.advance * s, &massInk) : 0;
+    // ...and the row about where that ink stands, cut a numeral past its
+    // end, for reading it once more where the whole row read another count
+    // (his snapshot 13:49:20: 111,294 off the whole row)
+    cv::Rect massTight;
+    if (massNumerals > 0 && massInk.area() > 0) {
+        const int right = (std::min)(rows[1].x + rows[1].width,
+                                     massInk.x + massInk.width + (int)std::lround(font.advance * s));
+        const int pad = (std::max)(2, (int)std::lround(font.digitH * s * 0.55));
+        massTight = cv::Rect(rows[1].x, massInk.y - pad, right - rows[1].x, massInk.height + 2 * pad);
+    }
+    if (DEV_ENV("SCMINER_PANELLINES_TRACE")) {
+        std::cerr << "  [lines] mass box " << massBox << " numerals " << massNumerals << " ink " << massInk
+                  << " row again " << massTight << std::endl;
+    }
+    if (!readRowsHeld(frame, lines, rows, values, panel, massNumerals, massTight)) return false;
+    // ...and its volume, in the pilot seat of 4.10.3 (see volumeByLine)
+    if (&layout == &COCKPIT_4103_PANEL) {
+        volumeByLine(frame, lines, layout, trusted ? panel.labels : panel.tryLabels, s, panel);
+    }
+    return true;
 }
 
 bool readPanelRows(const cv::Mat& frame, TextLineReader& lines, const std::array<cv::Rect, 4>& rows,
                    const std::array<cv::Rect, 3>& values, ScanPanel& panel) {
+    return readRowsHeld(frame, lines, rows, values, panel, 0, cv::Rect());
+}
+
+namespace {
+bool readRowsHeld(const cv::Mat& frame, TextLineReader& lines, const std::array<cv::Rect, 4>& rows,
+                  const std::array<cv::Rect, 3>& values, ScanPanel& panel, int massNumerals,
+                  const cv::Rect& massTight) {
     if (!lines.ready()) return false;
     for (size_t i = 1; i < rows.size(); i++) {
         if (rows[i].width < 24 || rows[i].height < 8) return false;
@@ -3891,7 +4195,39 @@ bool readPanelRows(const cv::Mat& frame, TextLineReader& lines, const std::array
         panel.note += note;
         return false;
     }
-    const float mass = lineWhole(figures[0]);
+    float mass = lineWhole(figures[0]);
+    // ...as many numerals as its box shows (numeralsInBox), where it shows
+    // that clearly; a mass with a thousands separator is not counted. Read
+    // with another count, the row is read once more cut where the ink ends.
+    auto numerals = [](const std::string& text) {
+        int n = 0;
+        for (char c : text) n += c >= '0' && c <= '9' ? 1 : 0;
+        return n;
+    };
+    if (massNumerals > 0 && mass > 0 && figures[0].find(',') == std::string::npos &&
+        numerals(figures[0]) != massNumerals) {
+        const std::string whole = figures[0];
+        bool again = false;
+        if (massTight.width >= 24 && massTight.height >= 8) {
+            const TextLineReader::Line line = lines.read(bgr(massTight & cv::Rect(0, 0, bgr.cols, bgr.rows)));
+            ms += line.ms;
+            if (DEV_ENV("SCMINER_PANELLINES_TRACE")) {
+                std::cerr << "  [lines] mass again " << massTight << " read '" << line.text << "' mean " << line.mean
+                          << std::endl;
+            }
+            std::string figure;
+            again = line.mean >= LINE_SURE && labelledFigure(line.text, "MASS", figure) &&
+                    figure.find(',') == std::string::npos && numerals(figure) == massNumerals && lineWhole(figure) > 0;
+            if (again) {
+                figures[0] = figure;
+                mass = lineWhole(figure);
+            }
+        }
+        std::snprintf(note, sizeof(note), "; lines: mass '%.12s' has %d numerals where its box holds %d%s",
+                      whole.c_str(), numerals(whole), massNumerals, again ? ", read again" : "");
+        panel.note += note;
+        if (!again) return false;
+    }
     float resistance = -1, instability = -1;
     if (mass > 0) {
         if (figureOf(2, "RES", figures[1])) resistance = facePercent(figures[1]);
@@ -3988,6 +4324,7 @@ bool readPanelRows(const cv::Mat& frame, TextLineReader& lines, const std::array
     panel.note += note;
     return true;
 }
+}  // namespace
 
 ScanPanel readScanPanel(const cv::Mat& frame, OCREngine& ocr, GlyphReader* glyphs, TextLineReader* lines) {
     // SCMINER_FACE for the bench only: 0 the old reader, 1 the face alone,
@@ -4026,6 +4363,18 @@ ScanPanel readScanPanel(const cv::Mat& frame, OCREngine& ocr, GlyphReader* glyph
         if (panel.stats.ore.empty() && lines && !noLines) panel.stats.ore = oreByLine(frame, panel.oreRow, *lines);
         panel.figuresRead = 3 + (panel.stats.ore.empty() ? 0 : 1);
     };
+    // A 5.0 game: its panel has a reader of its own, and only that one
+    // looks. The readers below misread 5.0's panel (1130 kg and 1 % off one
+    // that says 61 %), and the 5.0 reader is not let near a 4.10 panel.
+    if (g_panelGeneration >= 5) {
+        ScanPanel five;
+        if (readPanelFive(frame, five, lines)) {
+            const int figures = five.figuresRead;
+            if (five.found) nameTheOre(five);
+            five.figuresRead = figures + (five.stats.ore.empty() ? 0 : 1);
+        }
+        return five;
+    }
     // where the face reader is to look, when the shapes found the labels
     cv::Rect faceNear;
     // ...and the shapes' own look, for when the face reader finds nothing
