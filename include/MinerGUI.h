@@ -374,6 +374,18 @@ public:
     };
     static LoadoutFile readLoadoutFile(std::istream& in);
     static void writeLoadoutFile(std::ostream& out, const LoadoutFile& file);
+    // Whether the Edit ship card has the keys: its crafted % or its title
+    // being typed, or one of its lists down (a module slot's, the laser
+    // head's). processMessages hands every key to the window then - no
+    // shortcut, and no IsDialogMessage, which makes Esc IDCANCEL and closes
+    // Bedrock instead of the list. Public for the self-test.
+    static bool editShipTakesKeys(bool cardOpen, bool craftedEditing, bool nameEditing, int moduleListSlot,
+                                  bool laserListOpen);
+    // A row of Edit ship's module list: what the module does, in the words
+    // and order of the Gear page's i (moduleEffects), the parts joined by
+    // "  \u00B7  ", led by Active for one that is fired. Public for the
+    // self-test.
+    static std::wstring moduleListWords(const MiningModule& m);
     // Trims heads to what a ship can fly: its number of hardpoints, heads
     // that fit them, no more modules than slots
     static void fitHeads(const MiningShip& ship, std::vector<MiningLoadout>& heads);
@@ -1768,14 +1780,11 @@ private:
     size_t feedbackPlaceAt(Gdiplus::Graphics& g, int field, float px, float py, bool& atEnd);
     // The caret moved or the text changed: shown, and brought into view
     void feedbackTouched(HWND hwnd, bool edited);
-    // What a click on a row of Edit ship does to the head shown, for the
-    // Gear page to do the same: a laser put on it (the crafted figure goes
-    // aside with the one that leaves, the modules are trimmed to the new
-    // one's slots), a module added where a slot is free, one taken off (a
-    // right-click there). The caller stores the head and saves.
+    // A laser put on the head shown, picked in Edit ship's list: the
+    // crafted figure goes aside with the one that leaves, the modules are
+    // packed and trimmed to the new one's slots. The caller stores the head
+    // and saves.
     void putHeadLaser(const MiningLaser* laser);
-    bool addHeadModule(const MiningModule* module);
-    void takeHeadModule(const MiningModule* module);
     // The module fields are three slots. `module` null empties that slot.
     void setSlotModule(int slot, const MiningModule* module);
     // A click while the ship's list is down: a fit picked, a new one added
