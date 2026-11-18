@@ -742,6 +742,24 @@ int runSelfTest() {
                                    ", Brandt" + brandtSays + ")");
         }
 
+        // ...and Edit ship's module list says the same of a module, in the
+        // same words and order, the parts joined by "  ·  ", an active one
+        // led by Active
+        {
+            using SCMiner::MinerGUI;
+            const std::wstring dot = L"  \u00B7  ";
+            const std::wstring torrent = MinerGUI::moduleListWords(*SCMiner::moduleById("passive_torrent_mk3"));
+            const std::wstring surge = MinerGUI::moduleListWords(*SCMiner::moduleById("active_surge"));
+            const std::wstring overrun = MinerGUI::moduleListWords(*SCMiner::moduleById("passive_overrun"));
+            allPassed &= check(torrent == L"+45 % Optimal charge rate" + dot + L"-1 % Optimal charge window" &&
+                                   surge == L"Active" + dot + L"+50 % Laser power" + dot + L"-15.5 % Resistance" + dot +
+                                                L"+10 % Instability" &&
+                                   overrun == L"-24.8 % Resistance" + dot + L"+2 % Laser power" + dot +
+                                                  L"-15 % Extraction power",
+                               "Edit ship's module list words a module as the Gear page's i does: Torrent III, Surge "
+                               "and Overrun");
+        }
+
         // Figures no rock can have, and the panel's first picture of a rock
         // the game has not finished scanning - each one off his panels
         {
@@ -7072,6 +7090,23 @@ int runSelfTest() {
             }
         }
 
+        // Edit ship has the keys while one of its lists is down, so Esc
+        // closes the list: past processMessages IsDialogMessage would make
+        // it IDCANCEL and close Bedrock (the laser head's list did so). With
+        // nothing down or typed into, Esc goes on as before.
+        {
+            using SCMiner::MinerGUI;
+            const bool laserList = MinerGUI::editShipTakesKeys(true, false, false, -1, true);
+            const bool moduleList = MinerGUI::editShipTakesKeys(true, false, false, 2, false);
+            const bool typed = MinerGUI::editShipTakesKeys(true, true, false, -1, false) &&
+                               MinerGUI::editShipTakesKeys(true, false, true, -1, false);
+            const bool idle = !MinerGUI::editShipTakesKeys(true, false, false, -1, false) &&
+                              !MinerGUI::editShipTakesKeys(false, false, false, -1, false);
+            allPassed &= check(laserList && moduleList && typed && idle,
+                               "Edit ship keeps the keys while its laser head's or a module's list is down, so Esc "
+                               "closes the list and not Bedrock");
+        }
+
         // loadout.txt: one [ship] section per fit, the player's own ships.
         // Older files read as fits named after their ship - the one-ship file
         // with no section, and one section per kind of ship - and two
@@ -7119,6 +7154,32 @@ int runSelfTest() {
                               std::abs(back.fits[1].heads[0].craftedPower - 12.5f) < 0.001f &&
                               back.fits[0].heads[0].modules.size() == 2;
             allPassed &= check(both, "two Prospectors of one's own come back with their names, hulls and heads");
+            // A slot emptied in Edit ship before a fitted one stays empty
+            // through the file (module=none); a Bedrock of before finds no
+            // module by that name, skips it and reads the rest packed
+            {
+                MinerGUI::LoadoutFile gap;
+                MinerGUI::ShipFit mole;
+                mole.ship = SCMiner::shipById("mole");
+                mole.name = "Gap";
+                SCMiner::MiningLoadout left;
+                left.laser = SCMiner::laserById("grin_arbor_s2");
+                left.modules = {nullptr, SCMiner::moduleById("passive_torrent_mk3")};
+                mole.heads = {left};
+                gap.fits.push_back(mole);
+                std::ostringstream text;
+                MinerGUI::writeLoadoutFile(text, gap);
+                std::istringstream again(text.str());
+                const MinerGUI::LoadoutFile read = MinerGUI::readLoadoutFile(again);
+                const bool kept = read.fits.size() == 1 && !read.fits[0].heads.empty() &&
+                                  read.fits[0].heads[0].modules.size() == 2 && !read.fits[0].heads[0].modules[0] &&
+                                  read.fits[0].heads[0].modules[1] == left.modules[1];
+                allPassed &= check(kept && left.modules[1] &&
+                                       text.str().find("module=none\nmodule=passive_torrent_mk3\n") != std::string::npos &&
+                                       SCMiner::moduleById("none") == nullptr,
+                                   "a slot emptied before a fitted one stays empty through loadout.txt (module=none, "
+                                   "which a Bedrock of before skips)");
+            }
             std::istringstream twice("[prospector]\nname=Rock Cracker\n[prospector]\nname=rock cracker\n");
             const MinerGUI::LoadoutFile same = MinerGUI::readLoadoutFile(twice);
             allPassed &= check(same.fits.size() == 2 && same.fits[0].name == "Rock Cracker" &&
